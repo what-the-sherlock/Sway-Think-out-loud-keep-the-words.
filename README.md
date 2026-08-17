@@ -373,27 +373,48 @@ tests/                       pure functions, store/tracker, CLI, config, injecti
 
 ## Packaging (Phase 5)
 
-Freezes `flow` into a self-contained Windows build that needs no Python install:
+Freezes Flow into a self-contained Windows build that needs no Python install:
 
 ```powershell
 uv pip install -e ".[build]"
+python scripts/build_logo_asset.py   # only if the source artwork changed
+python scripts/build_app_icon.py     # only if the mark/palette changed
 pyinstaller packaging/flow.spec
-dist\flow\flow.exe run
 ```
 
-`--onedir` (not `--onefile`): a background dictation app should start in well
-under a second, and onefile's self-extraction to a temp directory on every
-launch works against exactly that — `dist\flow\` is the whole shippable unit,
-zip it as-is. `pyinstaller-hooks-contrib` (pulled in by the `build` extra)
-already knows how to collect sounddevice's/soundfile's native libraries and
-pynput's/pystray's per-OS backend modules; `packaging/flow.spec` only adds
-Flow's own package, the example config/env files, and a local override for
-upstream's `webrtcvad` hook (it assumes a distribution name that doesn't match
-`webrtcvad-wheels`, the fork this project actually depends on — see
-`packaging/hooks/hook-webrtcvad.py`). The built exe keeps the console subsystem,
-since `flow config`/`report`/`history`/`dictionary`/`devices` are terminal
-tools; `flow run` still launches fine from one, it just leaves that console
-window open behind the tray icon.
+That produces `dist\flow\`, the whole shippable unit — zip it and hand it to
+someone as-is. It contains two executables sharing one `_internal\` (kept
+tidy on purpose: this is the folder a non-technical recipient opens):
+
+- **`Flow.exe`** — windowed, no console, the one to double-click. Bare
+  invocation defaults to `run`; a missing `GROQ_API_KEY` or any other startup
+  failure is reported through a native message dialog (`flow.gui`,
+  `PlatformAdapter.show_message`) rather than a console line nobody sees. A
+  Win32 mutex (`PlatformAdapter.acquire_single_instance_lock`) stops a second
+  copy from starting — two live instances would mean two open microphones
+  and every dictation typed twice — and shows its own dialog instead.
+- **`flow-cli.exe`** — the console build, for `config`/`report`/`history`/
+  `dictionary`/`devices`/`demo`, which need a real stdout.
+
+`--onedir` (not `--onefile`) for both: a background dictation app should
+start in well under a second, and onefile's self-extraction to a temp
+directory on every launch works against exactly that.
+`pyinstaller-hooks-contrib` (pulled in by the `build` extra) already knows
+how to collect sounddevice's/soundfile's native libraries and pynput's/
+pystray's per-OS backend modules; `packaging/flow.spec` only adds Flow's own
+package and assets, the example config/env files, a Windows version
+resource (so a shared build's file properties identify it), and a local
+override for upstream's `webrtcvad` hook (it assumes a distribution name
+that doesn't match `webrtcvad-wheels`, the fork this project actually
+depends on — see `packaging/hooks/hook-webrtcvad.py`).
+
+**Before sharing a build with someone else:** never bundle your own
+`GROQ_API_KEY` into it — anyone with the files could read it back out, and
+everyone using it would share your free-tier rate limit. Point recipients at
+[console.groq.com/keys](https://console.groq.com/keys) for their own key
+instead; `Flow.exe`'s first-run dialog walks them through where to put it.
+An unsigned build will likely trip Windows SmartScreen on first launch —
+expected for a small unsigned exe, not a sign anything is wrong.
 
 ## Tests
 

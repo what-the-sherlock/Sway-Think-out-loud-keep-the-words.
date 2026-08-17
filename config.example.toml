@@ -1,0 +1,102 @@
+# Flow configuration. Copy to config.toml and edit; every value shown is the
+# default, so an empty file behaves identically.
+#
+# Precedence: environment variables > this file > defaults.
+# Any option can be overridden as FLOW_<SECTION>_<OPTION>, e.g.
+#   FLOW_LATENCY_ENABLED=0   FLOW_LOGGING_LEVEL=DEBUG
+#
+# Secrets never live here. GROQ_API_KEY belongs in .env (see .env.example).
+
+# Where the latency database and log file live.
+# Default: %LOCALAPPDATA%\Flow on Windows, $XDG_DATA_HOME/flow elsewhere.
+# data_dir = "D:/Whisper flow clone/.flow"
+
+[logging]
+level = "INFO"              # DEBUG, INFO, WARNING, ERROR, CRITICAL
+file_enabled = true         # write a rotating log to <data_dir>/flow.log
+file_max_bytes = 1000000
+file_backup_count = 3
+
+[latency]
+enabled = true
+# db_path = "D:/Whisper flow clone/.flow/latency.db"   # default: <data_dir>/latency.db
+retention_days = 30         # 0 disables pruning
+queue_size = 1024           # bounded; records are dropped, never blocked
+batch_size = 64             # runs written per transaction
+
+[audio]
+# device = "USB Microphone"   # substring match; see `flow devices`. default: system default
+sample_rate = 16000          # webrtcvad-supported: 8000, 16000, 32000, 48000
+channels = 1                 # mono only
+ring_seconds = 60            # max single recording length the ring buffer can hold
+blocksize_frames = 0         # 0 lets PortAudio choose the most efficient block size
+vad_mode = 2                 # webrtcvad aggressiveness, 0 (least) to 3 (most)
+vad_frame_ms = 30            # 10, 20, or 30 only
+vad_padding_ms = 200         # speech-adjacent silence kept on each side of the trimmed clip
+# Audio kept from just BEFORE the hotkey press, so starting to speak as you
+# press doesn't clip the first syllable. The mic is always recording into the
+# ring buffer, so this is free; the VAD trims it off again when it was silent.
+preroll_ms = 300
+
+[hotkey]
+key = "ctrl_r"                # hold to dictate; see flow.hotkey.KNOWN_KEYS for valid names
+min_hold_ms = 200             # holds shorter than this are treated as an accidental tap
+command_key = "shift_r"       # hold with text selected to run a voice command; "" disables commands
+
+[groq]
+base_url = "https://api.groq.com"
+timeout_s = 15.0
+connect_timeout_s = 5.0
+max_retries = 1               # transient network errors and 5xx only; 429s are never retried
+# language = "en"             # ISO-639-1 hint; unset lets Whisper auto-detect
+
+[cleanup]
+enabled = true                 # false pastes the raw transcript, like Phase 1
+# Groq retired llama-3.1-8b-instant; it now 404s, which took the whole
+# cleanup stage down. gpt-oss-20b replaces it on the same free tier.
+model = "openai/gpt-oss-20b"
+temperature = 0.0              # 0.0-2.0; 0.0 keeps the rewrite deterministic
+skip_min_words = 8             # transcripts shorter than this with no filler words skip the LLM
+# "low" measured ~2x faster than the model default for identical rewrites.
+# "" sends no reasoning_effort (for models that don't support it).
+reasoning_effort = "low"
+max_output_tokens = 2048       # ceiling so a runaway generation can't blow the latency budget
+skip_when_unconfident = true   # bypass the LLM when Whisper itself was unsure of the transcript
+
+[dictionary]
+enabled = true                 # inject the personal dictionary into Whisper's prompt
+max_prompt_chars = 200         # caps how much of the dictionary is sent per request
+
+[streaming]
+# Off by default on measured evidence: Groq's whisper-large-v3-turbo returns
+# in ~190ms whether the clip is 2 seconds or 23, so chunking removes almost
+# no tail latency while costing 2-4x the audio requests against the 2000/day
+# free-tier budget. Turn on only if your own measurements differ.
+enabled = false                # false always uses a single whole-clip request, like Phase 1
+chunk_seconds = 5.0            # length of each background chunk sent while still speaking
+overlap_seconds = 1.0          # shared between consecutive chunks/tail, for boundary dedup
+poll_interval_s = 0.2          # how often the background worker checks whether a chunk is due
+
+[commands]
+model = "openai/gpt-oss-20b"
+temperature = 0.2              # 0.0-2.0; low keeps the rewrite close to the instruction
+selection_timeout_s = 0.3      # how long to wait for the Ctrl+C selection-copy round trip
+
+[history]
+enabled = true                 # record dictations/commands for the searchable history window
+retention_days = 90            # 0 disables pruning
+
+[tray]
+enabled = true                 # system tray icon: show history, quit; false runs without one
+
+[paste]
+# How long the clipboard holds the dictated text before the original is put
+# back. 150ms is CLAUDE.md's specified value and is fine for native apps; if
+# you paste into slow Electron apps (Slack, Notion, Teams) and occasionally
+# see the *previous* clipboard contents appear instead, raise this to 400-600.
+# The restore is skipped entirely if the clipboard changed in the meantime,
+# so raising it only ever costs you a longer window of holding the dictation.
+restore_delay_ms = 150
+
+[overlay]
+enabled = true                # the always-on-top pill window; false runs headless

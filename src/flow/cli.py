@@ -1,0 +1,387 @@
+"""Command-line entry point.
+
+`demo`/`report`/`config` are Phase 0's measurement harness. `run` is the
+actual app: hold the hotkey, speak, release, and cleaned-up text (Phase 2:
+llama-3.1-8b-instant strips filler words and fixes grammar, in a style
+chosen per focused app -- Phase 3) is pasted at the cursor, or hold the
+command hotkey with text selected to apply a spoken instruction to it
+(Phase 5). `devices` lists microphones for [audio].device. `dictionary`
+manages the personal dictionary (Phase 3) that biases transcription toward
+proper nouns and jargon. `history` lists/searches recorded dictations and
+commands (Phase 5) from the terminal; the tray icon's "Show History" opens
+the same data in a searchable window while `flow run` is active.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from collections.abc import Sequence
+from pathlib import Path
+
+from flow import APP_NAME, __version__
+from flow.config import Config, load_config
+from flow.errors import AudioError, FlowError, LatencyStoreError
+from flow.latency.report import format_table, summarize
+from flow.latency.store import LatencyStore
+from flow.latency.tracker import LatencyTracker
+from flow.logging_setup import configure_logging
+from flow.pipeline.stub import STUB_STAGES, StubPipeline
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_DEMO_RUNS = 20
+_DEFAULT_REPORT_LIMIT = 100
+_DEFAULT_HISTORY_LIMIT = 50
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="flow",
+        description=f"{APP_NAME} - local voice dictation with LLM cleanup.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--config", type=Path, metavar="PATH", help="path to a config.toml")
+    parser.add_argument("--data-dir", type=Path, metavar="PATH", help="override the data directory")
+    parser.add_argument(
+        "--log-level",
+        metavar="LEVEL",
+        help="override [logging].level (DEBUG, INFO, WARNING, ERROR)",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    demo = sub.add_parser(
+        "demo",
+        help="run the stub pipeline and print a latency table",
+        description=(
+            "Runs fake dictations through the real latency tracker. Phase 0's "
+            "proof that measurement works before any feature exists."
+        ),
+    )
+    demo.add_argument(
+        "-n", "--runs", type=int, default=_DEFAULT_DEMO_RUNS, help="number of fake dictations"
+    )
+    demo.add_argument("--seed", type=int, default=1234, help="RNG seed for reproducible timings")
+    demo.add_argument(
+        "--fail-rate",
+        type=float,
+        default=0.0,
+        metavar="P",
+        help="probability [0-1] that a run fails, to exercise the error path",
+    )
+    demo.set_defaults(handler=_cmd_demo)
+
+    report = sub.add_parser(
+        "report",
+        help="print the latency table from recorded history",
+    )
+    group = report.add_mutually_exclusive_group()
+    group.add_argument(
+        "-n",
+        "--last",
+        type=int,
+        default=_DEFAULT_REPORT_LIMIT,
+        metavar="N",
+        help=f"summarise the last N runs (default {_DEFAULT_REPORT_LIMIT})",
+    )
+    group.add_argument("--all", action="store_true", help="summarise every recorded run")
+    report.add_argument(
+        "--since-hours", type=float, metavar="H", help="only include runs from the last H hours"
+    )
+    report.set_defaults(handler=_cmd_report)
+
+    show = sub.add_parser("config", help="print the resolved configuration")
+    show.set_defaults(handler=_cmd_config)
+
+    run = sub.add_parser(
+        "run",
+        help="run Flow: hold the hotkey, speak, release to paste the transcript",
+    )
+    run.set_defaults(handler=_cmd_run)
+
+    devices = sub.add_parser("devices", help="list available microphones for [audio].device")
+    devices.set_defaults(handler=_cmd_devices)
+
+    dictionary = sub.add_parser(
+        "dictionary",
+        help="manage the personal dictionary used to bias transcription",
+        description=(
+            "Terms added here are injected into Whisper's prompt to bias "
+            "transcription toward proper nouns and jargon it would otherwise "
+            "mishear (Phase 3)."
+        ),
+    )
+    dict_sub = dictionary.add_subparsers(dest="dict_command", required=True)
+
+    dict_add = dict_sub.add_parser("add", help="add one or more terms")
+    dict_add.add_argument("terms", nargs="+", metavar="TERM")
+    dict_add.set_defaults(handler=_cmd_dictionary_add)
+
+    dict_remove = dict_sub.add_parser("remove", help="remove one or more terms")
+    dict_remove.add_argument("terms", nargs="+", metavar="TERM")
+    dict_remove.set_defaults(handler=_cmd_dictionary_remove)
+
+    dict_list = dict_sub.add_parser("list", help="list every term")
+    dict_list.set_defaults(handler=_cmd_dictionary_list)
+
+    history = sub.add_parser(
+        "history",
+        help="search or list past dictations and voice commands",
+        description=(
+            "Every successful dictation and voice command is recorded "
+            "(Phase 5) so it can be found again -- see also the searchable "
+            "history window on the tray icon's 'Show History' menu item."
+        ),
+    )
+    history_sub = history.add_subparsers(dest="history_command", required=True)
+
+    history_list = history_sub.add_parser("list", help="list history entries, newest first")
+    history_list.add_argument(
+        "-n", "--last", type=int, default=_DEFAULT_HISTORY_LIMIT, metavar="N", help="show at most N entries"
+    )
+    history_list.add_argument("-q", "--search", metavar="QUERY", help="only entries containing QUERY")
+    history_list.add_argument(
+        "--kind", choices=["dictation", "command"], help="only entries of this kind"
+    )
+    history_list.set_defaults(handler=_cmd_history_list)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if getattr(args, "handler", None) is None:
+        parser.print_help()
+        return 0
+
+    try:
+        config = _load(args)
+        configure_logging(config, force_level=args.log_level)
+        return args.handler(args, config)
+    except FlowError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+def _load(args: argparse.Namespace) -> Config:
+    env = dict(os.environ)
+    if args.data_dir is not None:
+        env["FLOW_DATA_DIR"] = str(args.data_dir)
+    return load_config(config_file=args.config, env=env)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def _cmd_demo(args: argparse.Namespace, config: Config) -> int:
+    if args.runs < 1:
+        print("error: --runs must be at least 1", file=sys.stderr)
+        return 2
+    if not 0.0 <= args.fail_rate <= 1.0:
+        print("error: --fail-rate must be between 0 and 1", file=sys.stderr)
+        return 2
+
+    expected_s = sum((s.min_ms + s.max_ms) / 2 for s in STUB_STAGES) * args.runs / 1000.0
+    print(
+        f"Running {args.runs} stub dictation(s) (~{expected_s:.0f}s), "
+        f"recording to {config.latency_db_path}",
+        file=sys.stderr,
+    )
+
+    started = time.perf_counter()
+    with LatencyTracker.from_config(config) as tracker:
+        if not tracker.enabled:
+            print("error: latency tracking is disabled in config", file=sys.stderr)
+            return 2
+        pipeline = StubPipeline(tracker, seed=args.seed, fail_rate=args.fail_rate)
+        succeeded, failed = pipeline.run(args.runs)
+        if not tracker.flush(timeout=10.0):
+            print("warning: latency records may not have been fully written", file=sys.stderr)
+
+        try:
+            with LatencyStore.open(config.latency_db_path) as store:
+                runs = store.fetch_runs(limit=args.runs)
+        except LatencyStoreError as exc:
+            # The tracker already logged why and degraded; the pipeline itself
+            # ran fine. Only the table — this command's whole point — is lost.
+            print(f"error: pipeline ran, but timings could not be read back: {exc}", file=sys.stderr)
+            return 1
+
+    elapsed = time.perf_counter() - started
+    print(
+        f"Completed {succeeded} succeeded / {failed} failed in {elapsed:.1f}s\n",
+        file=sys.stderr,
+    )
+    print(format_table(summarize(runs), title="Stub pipeline latency"))
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace, config: Config) -> int:
+    if not config.latency_db_path.exists():
+        print(
+            f"error: no latency database at {config.latency_db_path}; run 'flow demo' first",
+            file=sys.stderr,
+        )
+        return 1
+
+    since = None
+    if args.since_hours is not None:
+        if args.since_hours <= 0:
+            print("error: --since-hours must be positive", file=sys.stderr)
+            return 2
+        since = time.time() - args.since_hours * 3600.0
+
+    limit = None if args.all else max(1, args.last)
+    with LatencyStore.open(config.latency_db_path) as store:
+        runs = store.fetch_runs(limit=limit, since=since)
+        total = store.count_runs()
+
+    window = "all runs" if args.all else f"newest {limit}"
+    if since is not None:
+        window += f" within {args.since_hours:g}h"
+    print(format_table(summarize(runs), title=f"Stage latency ({window}; {total} recorded overall)"))
+    return 0
+
+
+def _cmd_config(args: argparse.Namespace, config: Config) -> int:
+    del args
+    for key, value in config.redacted_dict().items():
+        if isinstance(value, dict):
+            print(f"{key}:")
+            for sub_key, sub_value in value.items():
+                print(f"  {sub_key} = {sub_value}")
+        else:
+            print(f"{key} = {value}")
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace, config: Config) -> int:
+    del args
+    # Imported lazily so `flow demo`/`report`/`config` never pay for
+    # importing sounddevice/pynput/httpx just to answer a Phase 0 question.
+    from flow.engine import Engine
+
+    if not config.groq_api_key:
+        print(
+            "error: GROQ_API_KEY is not set (copy .env.example to .env and fill it in)",
+            file=sys.stderr,
+        )
+        return 2
+
+    tracker = LatencyTracker.from_config(config)
+    engine = Engine(config, tracker)
+    try:
+        engine.start()
+        print(f"Flow is running. Hold {config.hotkey.key} to dictate. Ctrl+C to quit.", file=sys.stderr)
+        engine.run_overlay()
+    finally:
+        engine.stop()
+        tracker.close()
+    return 0
+
+
+def _cmd_devices(args: argparse.Namespace, config: Config) -> int:
+    del args, config
+    # Imported lazily; see _cmd_run.
+    from flow.audio.capture import list_input_devices
+
+    try:
+        devices = list_input_devices()
+    except AudioError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if not devices:
+        print("no input devices found", file=sys.stderr)
+        return 1
+    for line in devices:
+        print(line)
+    return 0
+
+
+def _cmd_dictionary_add(args: argparse.Namespace, config: Config) -> int:
+    from flow.dictionary import DictionaryStore
+
+    with DictionaryStore.open(config.dictionary_db_path) as store:
+        added = store.add_many(args.terms)
+        total = len(store.list_terms())
+    print(f"added {added} new term(s); {total} total", file=sys.stderr)
+    return 0
+
+
+def _cmd_dictionary_remove(args: argparse.Namespace, config: Config) -> int:
+    from flow.dictionary import DictionaryStore
+
+    with DictionaryStore.open(config.dictionary_db_path) as store:
+        removed = store.remove_many(args.terms)
+        total = len(store.list_terms())
+    print(f"removed {removed} term(s); {total} remaining", file=sys.stderr)
+    return 0
+
+
+def _cmd_dictionary_list(args: argparse.Namespace, config: Config) -> int:
+    del args
+    from flow.dictionary import DictionaryStore
+
+    with DictionaryStore.open(config.dictionary_db_path) as store:
+        terms = store.list_terms()
+
+    if not terms:
+        print("the dictionary is empty; add terms with 'flow dictionary add'", file=sys.stderr)
+        return 0
+    for term in terms:
+        print(term)
+    return 0
+
+
+def _cmd_history_list(args: argparse.Namespace, config: Config) -> int:
+    if not config.history_db_path.exists():
+        print(
+            f"error: no history database at {config.history_db_path}; "
+            "run 'flow run' and dictate something first",
+            file=sys.stderr,
+        )
+        return 1
+    if args.last < 1:
+        print("error: --last must be at least 1", file=sys.stderr)
+        return 2
+
+    from flow.history import HistoryStore
+
+    with HistoryStore.open(config.history_db_path) as store:
+        entries = store.search(args.search or "", kind=args.kind, limit=args.last)
+
+    if not entries:
+        print("no matching history entries", file=sys.stderr)
+        return 0
+
+    for entry in entries:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
+        preview = _one_line(entry.text, limit=100)
+        if entry.kind == "command" and entry.instruction:
+            print(f"{when}  command     [{_one_line(entry.instruction, limit=40)}] {preview}")
+        else:
+            print(f"{when}  dictation   {preview}")
+    return 0
+
+
+def _one_line(text: str, *, limit: int) -> str:
+    flat = " ".join(text.split())
+    if len(flat) > limit:
+        return flat[: limit - 1] + "…"
+    return flat
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

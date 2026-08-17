@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flow"
+version = "0.1.0"
+description = "Local voice dictation with LLM cleanup"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Every dependency below is justified in a comment, per CLAUDE.md.
+dependencies = [
+    # sounddevice: thin ctypes wrapper around PortAudio. The only maintained,
+    # wheel-distributed way to open a persistent, callback-based audio input
+    # stream on Windows without a C compiler. Its RawInputStream hands the
+    # callback a raw buffer with no numpy dependency of its own, which is
+    # what the allocation-free ring buffer needs.
+    "sounddevice>=0.4.6",
+    # numpy: used directly in flow.audio.flac to view raw PCM bytes as int16
+    # samples before FLAC encoding. Already a transitive dependency of
+    # soundfile; declared directly since we import it ourselves.
+    "numpy>=1.26",
+    # webrtcvad-wheels: WebRTC's VAD, named explicitly in CLAUDE.md ("WebRTC
+    # VAD trim"). The original `webrtcvad` package has no prebuilt wheels for
+    # recent Python/Windows and needs a C compiler; this fork ships the same
+    # bindings with prebuilt wheels.
+    "webrtcvad-wheels>=2.0.10",
+    # soundfile: libsndfile bindings with prebuilt wheels on Windows/macOS/
+    # Linux. The only realistic way to write a real FLAC file for the Groq
+    # upload without shelling out to an external ffmpeg/flac binary.
+    "soundfile>=0.12",
+    # pynput: global hotkey listener and synthetic Ctrl+V. CLAUDE.md
+    # explicitly forbids the `keyboard` package (needs admin on Windows);
+    # pynput does not.
+    "pynput>=1.7",
+    # httpx: the persistent HTTP/2 client CLAUDE.md specifies by name. The
+    # [http2] extra pulls in h2, required for http2=True.
+    "httpx[http2]>=0.27",
+    # pystray: the tray icon and menu CLAUDE.md's Phase 5 asks for. The only
+    # realistic cross-platform way to put an icon in the Windows notification
+    # area / macOS menu bar / Linux app indicator behind one API, matching
+    # flow.platform's isolation goal rather than hand-rolling Shell_NotifyIcon
+    # in ctypes now and a second, unrelated implementation per OS later.
+    "pystray>=0.19",
+    # pillow: pystray's only supported way to hand it an icon image; there is
+    # no stdlib way to construct one that pystray's backends can hand to the
+    # OS on every platform. Also used by flow.branding/flow.overlay to render
+    # the status pill and app icon as a single composited, anti-aliased
+    # image -- tkinter's own canvas primitives have no anti-aliasing at all.
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+# pytest: the only test runner worth the dependency; tests target the pure
+# transcript/format/config functions, per CLAUDE.md.
+dev = ["pytest>=8.0"]
+# pyinstaller: freezes `flow run` into a single Windows .exe (Phase 5) so it
+# can be handed to someone without a Python install. Only needed to build a
+# release, never to run or test the app, hence its own group rather than
+# `dev`. See packaging/flow.spec.
+build = ["pyinstaller>=6.0"]
+
+[project.scripts]
+flow = "flow.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
