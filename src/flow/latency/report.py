@@ -25,10 +25,33 @@ class StageStats:
     percentiles: tuple[float, ...]
     mean: float
     maximum: float
+    #: Runs this stage *could* have appeared in (the sampled, successful runs).
+    #: ``count < sampled`` means the stage is absent from some runs, which is
+    #: never the same thing as it having taken 0 ms -- see :meth:`partial`.
+    sampled: int = 0
 
     @property
     def p50(self) -> float:
         return self.percentiles[0]
+
+    @property
+    def partial(self) -> bool:
+        """True when this stage was not measured in every sampled run.
+
+        Two very different things produce this, and the table cannot tell them
+        apart on its own, so it flags rather than guesses:
+
+        * the stage did not exist yet when the older runs were recorded (every
+          stage added in D0 does this to pre-D0 rows), or
+        * the stage genuinely did not run (cleanup skipped by the heuristic,
+          merge on a non-streamed run, selection on a plain dictation).
+
+        Either way the percentiles describe only the ``count`` runs that have
+        the stage, which is the honest reading. What must never happen is a
+        missing stage being folded in as a zero, which would drag every
+        percentile toward zero and quietly flatter the numbers.
+        """
+        return 0 < self.count < self.sampled
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,13 +86,14 @@ def percentile(values: Sequence[float], q: float) -> float:
     return ordered[min(rank, len(ordered)) - 1]
 
 
-def _stats(name: str, values: Sequence[float]) -> StageStats:
+def _stats(name: str, values: Sequence[float], sampled: int = 0) -> StageStats:
     return StageStats(
         name=name,
         count=len(values),
         percentiles=tuple(percentile(values, q) for q in PERCENTILES),
         mean=sum(values) / len(values),
         maximum=max(values),
+        sampled=sampled,
     )
 
 
@@ -93,15 +117,18 @@ def summarize(runs: Sequence[RunRecord]) -> Summary:
         for timing in run.stages:
             by_stage.setdefault(str(timing.stage), []).append(timing.duration_ms)
 
+    sampled = len(successful)
     stages = tuple(
-        _stats(name, by_stage[name]) for name in sorted(by_stage, key=_sort_key) if by_stage[name]
+        _stats(name, by_stage[name], sampled)
+        for name in sorted(by_stage, key=_sort_key)
+        if by_stage[name]
     )
     totals = [run.total_ms for run in successful]
     return Summary(
         run_count=len(runs),
         failed_count=failed,
         stages=stages,
-        total=_stats(TOTAL_ROW, totals) if totals else None,
+        total=_stats(TOTAL_ROW, totals, sampled) if totals else None,
     )
 
 
@@ -137,12 +164,27 @@ def format_table(summary: Summary, *, title: str = "Stage latency") -> str:
         if summary.total is not None and index == len(rows) - 1 and len(rows) > 1:
             lines.append("-" * (sum(widths) + 2 * (len(widths) - 1)))
         lines.append(_join(row, widths))
+
+    # Spell out what a '*' means rather than leaving the reader to infer that a
+    # stage with a low Count was fast. It was not measured -- see
+    # StageStats.partial for the two reasons that happens.
+    partial = [stats for stats in summary.stages if stats.partial]
+    if partial:
+        lines.append("")
+        lines.append(
+            f"* not measured in every run ({summary.sampled_count} sampled); "
+            "percentiles cover only the runs that have the stage, and a"
+        )
+        lines.append(
+            "  missing stage is never counted as 0 ms. Either the stage post-dates"
+            " those runs, or it did not run."
+        )
     return "\n".join(lines)
 
 
 def _row(stats: StageStats) -> list[str]:
     return [
-        stats.name,
+        stats.name + ("*" if stats.partial else ""),
         str(stats.count),
         *(_ms(value) for value in stats.percentiles),
         _ms(stats.mean),

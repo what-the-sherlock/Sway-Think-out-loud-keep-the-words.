@@ -11,6 +11,23 @@ full-jitter backoff (CLAUDE.md). 429s are surfaced immediately with whichever
 specific limit was hit, read from the response headers, and are not
 auto-retried — the free tier's request budget (30/min) is small enough that
 retrying immediately just consumes it faster.
+
+Timing hooks (D0): :meth:`GroqClient.transcribe` and :meth:`GroqClient.cleanup`
+take optional zero-argument callbacks fired the moment the first bytes come
+back — response headers for transcription, the first content delta for
+cleanup. They take plain callables rather than a tracker so this module stays
+unaware of :mod:`flow.latency`; the engine passes closures that close a span.
+Each is invoked at most once per call and never on a retried attempt that
+subsequently fails.
+
+What is deliberately *not* measured here is upload time on its own. httpx
+exposes no hook between "request handed over" and "response headers
+received", so the wire time to push the FLAC up, the queue wait at Groq, and
+the model's own compute are one indivisible number
+(:attr:`~flow.latency.models.Stage.STT_FIRST_BYTE`). Splitting them would
+need a custom transport, which D0 does not justify; the FLAC byte count is
+annotated on the run instead, so payload size can still be correlated
+against that span.
 """
 
 from __future__ import annotations
@@ -20,6 +37,7 @@ import json
 import logging
 import random
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -230,6 +248,7 @@ class GroqClient:
         filename: str = "audio.flac",
         language: str | None = None,
         prompt: str | None = None,
+        on_first_byte: Callable[[], None] | None = None,
     ) -> TranscriptionResult:
         if not audio:
             raise GroqError("cannot transcribe empty audio")
@@ -244,14 +263,22 @@ class GroqClient:
         if prompt:
             data["prompt"] = prompt
 
+        notify_first_byte = _once(on_first_byte)
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._client.post(
+                # stream() rather than post() purely so the arrival of the
+                # response *headers* is observable; the body is read in full
+                # immediately afterwards, so callers see identical behaviour
+                # to the plain POST this replaced.
+                async with self._client.stream(
+                    "POST",
                     TRANSCRIPTION_PATH,
                     data=data,
                     files={"file": (filename, audio, "audio/flac")},
-                )
+                ) as response:
+                    notify_first_byte()
+                    await response.aread()
             except httpx.HTTPError as exc:
                 last_error = exc
                 if attempt < self._max_retries:
@@ -285,6 +312,7 @@ class GroqClient:
         temperature: float = 0.0,
         reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
         max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
+        on_first_token: Callable[[], None] | None = None,
     ) -> CleanupResult:
         """Rewrite ``transcript`` with the cleanup model. Uses Groq's streaming
         chat-completions endpoint (CLAUDE.md: "stream the response") but waits
@@ -312,6 +340,7 @@ class GroqClient:
         if max_output_tokens:
             payload["max_completion_tokens"] = max_output_tokens
 
+        notify_first_token = _once(on_first_token)
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -328,7 +357,7 @@ class GroqClient:
                         await response.aread()
                         raise GroqError(_client_error_message(response))
                     else:
-                        text = await _read_stream_text(response)
+                        text = await _read_stream_text(response, notify_first_token)
                         return CleanupResult(
                             text=text, request_id=response.headers.get("x-request-id")
                         )
@@ -397,6 +426,37 @@ def _parse_confidence(payload: object) -> tuple[float | None, float | None]:
     )
 
 
+def _once(callback: Callable[[], None] | None) -> Callable[[], None]:
+    """Wrap ``callback`` so it fires at most once and can never raise.
+
+    Two reasons this is not just ``callback()`` at the call site. A retried
+    request would otherwise fire it twice, closing an already-closed span and
+    recording a duration that measures the *second* attempt while looking
+    like the first. And a measurement callback that throws must not be able
+    to fail a dictation that was otherwise about to succeed -- CLAUDE.md's
+    rule that instrumentation never takes the app down.
+    """
+    if callback is None:
+        return _noop
+    fired = False
+
+    def fire() -> None:
+        nonlocal fired
+        if fired:
+            return
+        fired = True
+        try:
+            callback()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("latency callback failed; continuing")
+
+    return fire
+
+
+def _noop() -> None:
+    return None
+
+
 def _extract_delta(line: str) -> str | None:
     """Parse one SSE line from a chat-completions stream into its content delta.
 
@@ -424,11 +484,19 @@ def _extract_delta(line: str) -> str | None:
     return content if isinstance(content, str) else None
 
 
-async def _read_stream_text(response: httpx.Response) -> str:
+async def _read_stream_text(
+    response: httpx.Response, on_first_token: Callable[[], None] | None = None
+) -> str:
     chunks: list[str] = []
     async for line in response.aiter_lines():
         content = _extract_delta(line)
         if content:
+            # Fired on the first delta that carries actual text, not on the
+            # first SSE line: the stream opens with role/keep-alive events
+            # that would report a first-token time earlier than any token
+            # really arrived.
+            if not chunks and on_first_token is not None:
+                on_first_token()
             chunks.append(content)
     return "".join(chunks).strip()
 

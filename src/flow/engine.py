@@ -36,6 +36,9 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 
 from flow.audio.capture import AudioCapture
+from flow.analytics import SessionMetrics, pcm_duration_ms, session_metrics
+import webbrowser
+
 from flow.audio.flac import encode_flac
 from flow.audio.ring_buffer import RingBuffer
 from flow.audio.vad import VadTrimmer
@@ -49,9 +52,16 @@ from flow.cleanup import (
 )
 from flow.commands import COMMAND_SYSTEM_PROMPT, build_command_user_message
 from flow.config import Config
+from flow.dashboard.server import DashboardServer, EngineControl
 from flow.dictionary import DictionaryStore, build_prompt_bias
 from flow.errors import DictionaryStoreError, FlowError, HistoryStoreError, PasteBlockedError
-from flow.groq_client import GroqClient, GroqError, GroqRateLimitError, TranscriptionResult
+from flow.groq_client import (
+    WHISPER_MODEL,
+    GroqClient,
+    GroqError,
+    GroqRateLimitError,
+    TranscriptionResult,
+)
 from flow.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 from flow.history_window import HistoryWindow
 from flow.hotkey import KNOWN_KEYS, HotkeyListener
@@ -110,6 +120,14 @@ class _Transcript:
     #: cleanup then leaves the text alone rather than letting a model write a
     #: fluent, confident-sounding rewrite of something it also can't read.
     confident: bool = True
+    #: Durations measured during capture, in milliseconds: ``audio_ms`` is the
+    #: whole held clip, ``speech_ms`` only what survived VAD trimming (the
+    #: basis for WPM and time-saved in :mod:`flow.analytics`). None on paths
+    #: that never measured them — e.g. the streamed tail, where the chunks are
+    #: plain text by the time they merge; the caller recomputes from the ring
+    #: buffer in that case.
+    speech_ms: float | None = None
+    audio_ms: float | None = None
 
 
 class Engine:
@@ -144,6 +162,14 @@ class Engine:
         self._history: HistoryStore | None = None
         self._history_window: HistoryWindow | None = None
         self._tray: TrayIcon | None = None
+        self._dashboard: DashboardServer | None = None
+        #: Whether the hotkeys are armed. The mic stream itself stays open
+        #: either way -- CLAUDE.md requires it to open once and stay open, and
+        #: closing it on pause would reintroduce exactly the open-on-demand
+        #: latency the architecture exists to avoid. Pausing disarms the
+        #: hotkey, so the ring buffer keeps filling and is simply never read.
+        self._listening = True
+        self._listening_lock = threading.Lock()
 
         self._hotkey = HotkeyListener(
             key=KNOWN_KEYS[config.hotkey.key],
@@ -191,7 +217,11 @@ class Engine:
         if self._command_hotkey is not None:
             self._command_hotkey.start()
         if self._config.tray.enabled:
-            self._tray = TrayIcon(on_show_history=self._open_history_window, on_quit=self._overlay.stop)
+            self._tray = TrayIcon(
+                on_show_history=self._open_history_window,
+                on_open_dashboard=self._open_dashboard,
+                on_quit=self._overlay.stop,
+            )
             if not self._tray.start():
                 self._tray = None
         logger.info("Flow ready. Hold %s to dictate.", self._config.hotkey.key)
@@ -229,6 +259,7 @@ class Engine:
             ("hotkey", self._hotkey.stop),
             ("command hotkey", self._stop_command_hotkey),
             ("tray", self._stop_tray),
+            ("dashboard", self._stop_dashboard),
             ("capture", self._capture.stop),
             ("network", self._stop_network),
             ("dictionary", self._stop_dictionary),
@@ -259,6 +290,11 @@ class Engine:
     def _stop_command_hotkey(self) -> None:
         if self._command_hotkey is not None:
             self._command_hotkey.stop()
+
+    def _stop_dashboard(self) -> None:
+        if self._dashboard is not None:
+            self._dashboard.stop()
+            self._dashboard = None
 
     def _stop_tray(self) -> None:
         if self._tray is not None:
@@ -306,7 +342,14 @@ class Engine:
         # next key event, and this thread may block on the network.
         threading.Thread(
             target=self._process,
-            args=(self._start_frame, self._focused_process, session, release_time, held_ms),
+            args=(
+                self._start_frame,
+                self._focused_process,
+                session,
+                release_time,
+                held_ms,
+                self._press_time,
+            ),
             daemon=True,
         ).start()
 
@@ -417,9 +460,25 @@ class Engine:
         session: ChunkStreamer | None,
         release_time: float,
         held_ms: float,
+        press_time: float,
     ) -> None:
         with self._tracker.run({"source": "hotkey"}) as run:
             run.annotate(held_ms=round(held_ms, 1))
+            # Two spans that closed before this recorder existed (D0). The
+            # hold is the user's own speaking time and is not latency to
+            # optimise, but without it the report cannot relate clip length
+            # to anything. Dispatch -- release to this thread being scheduled
+            # -- is pure overhead, and was previously invisible: the tracker's
+            # TOTAL starts here, so it never counted the gap it sits after.
+            run.record(
+                Stage.HOTKEY_HOLD,
+                held_ms,
+                # started_at is wall clock, but press_time is monotonic;
+                # convert by measuring back from now rather than calling
+                # time.time() at press on the hot listener thread.
+                started_at=time.time() - (time.monotonic() - press_time),
+            )
+            run.record(Stage.DISPATCH, (time.monotonic() - release_time) * 1000.0)
             self._run_pipeline(
                 run, lambda: self._run_dictation(start_frame, focused_process, session, run)
             )
@@ -450,11 +509,54 @@ class Engine:
             detail="" if pasted else "elevated window — copied instead",
         )
 
+        # Everything below runs *after* the text is on screen, so none of it
+        # counts against the sub-second budget CLAUDE.md sets.
+        metrics = self._session_metrics(cleaned_text, transcript, start_frame)
+        run.annotate(
+            words=metrics.word_count,
+            wpm=round(metrics.wpm, 1) if metrics.wpm is not None else "",
+            time_saved_s=round(metrics.time_saved_s, 1),
+        )
         self._record_history(
             kind=KIND_DICTATION,
             text=cleaned_text,
             raw_text=transcript.text,
             focused_process=focused_process,
+            run_id=run.id,
+            metrics=metrics,
+            language=transcript.language,
+            status="pasted" if pasted else "clipboard_fallback",
+        )
+
+    def _session_metrics(
+        self, text: str, transcript: _Transcript, start_frame: int
+    ) -> SessionMetrics:
+        """Derive this session's word count, WPM, and time-saved estimate.
+
+        On the streaming path (Phase 4) the transcript carries no measured
+        durations, because no single contiguous clip was ever VAD-trimmed.
+        Rather than report no speaking rate for exactly the long dictations
+        where it matters most, the clip is measured here -- after the paste
+        has already landed, so the extra VAD pass costs the user nothing.
+        A measurement failure yields ``None`` durations and therefore no WPM,
+        which the dashboard renders as "not available" rather than as zero.
+        """
+        speech_ms, audio_ms = transcript.speech_ms, transcript.audio_ms
+        if speech_ms is None:
+            try:
+                pcm = self._ring.read_since(start_frame)
+                trimmed = self._vad.trim(pcm)
+                rate, frame_size = self._config.audio.sample_rate, self._ring.frame_size
+                audio_ms = pcm_duration_ms(len(pcm), rate, frame_size=frame_size)
+                speech_ms = pcm_duration_ms(len(trimmed), rate, frame_size=frame_size)
+            except Exception:  # telemetry must never break a working dictation
+                logger.debug("could not measure speech duration for metrics", exc_info=True)
+                speech_ms, audio_ms = 0.0, 0.0
+        return session_metrics(
+            text,
+            speech_ms=speech_ms or 0.0,
+            audio_ms=audio_ms or 0.0,
+            typing_wpm=self._config.analytics.typing_wpm,
         )
 
     def _inject_with_fallback(self, text: str, run: RunRecorder) -> bool:
@@ -527,6 +629,11 @@ class Engine:
             run.annotate(skipped="no_speech")
             return None
 
+        sample_rate = self._config.audio.sample_rate
+        frame_size = self._ring.frame_size
+        audio_ms = pcm_duration_ms(len(pcm), sample_rate, frame_size=frame_size)
+        speech_ms = pcm_duration_ms(len(trimmed), sample_rate, frame_size=frame_size)
+
         with run.stage(Stage.ENCODE):
             flac_bytes = encode_flac(
                 trimmed, self._config.audio.sample_rate, self._config.audio.channels
@@ -535,9 +642,19 @@ class Engine:
         prompt_bias = self._build_prompt_bias()
         with run.stage(Stage.TRANSCRIBE):
             assert self._groq is not None
+            # Opened here and closed from the network thread when Groq's
+            # response headers land, splitting the transcribe stage into
+            # "waiting for Groq to say anything" and "reading the body".
+            # If the request fails before any response, the span is simply
+            # never closed and therefore never recorded -- not measured,
+            # rather than recorded as the full timeout.
+            first_byte = run.begin(Stage.STT_FIRST_BYTE)
             future = self._network.submit(
                 self._groq.transcribe(
-                    flac_bytes, language=self._config.groq.language, prompt=prompt_bias or None
+                    flac_bytes,
+                    language=self._config.groq.language,
+                    prompt=prompt_bias or None,
+                    on_first_byte=lambda: run.end(first_byte),
                 )
             )
             result = future.result(timeout=self._config.groq.timeout_s + 5.0)
@@ -547,11 +664,17 @@ class Engine:
             language=result.language or "",
             avg_logprob=result.avg_logprob if result.avg_logprob is not None else "",
             confident=result.confident,
+            audio_ms=round(audio_ms, 1),
+            speech_ms=round(speech_ms, 1),
         )
         if not result.text:
             return None
         return _Transcript(
-            text=result.text, language=result.language, confident=result.confident
+            text=result.text,
+            language=result.language,
+            confident=result.confident,
+            speech_ms=speech_ms,
+            audio_ms=audio_ms,
         )
 
     def _transcribe_streamed_tail(self, run: RunRecorder, result: ChunkSessionResult) -> _Transcript | None:
@@ -659,7 +782,7 @@ class Engine:
                 cleaned_text = raw_text
             else:
                 try:
-                    cleaned_text, guardrail = self._request_cleanup(raw_text, style, transcript)
+                    cleaned_text, guardrail = self._request_cleanup(raw_text, style, transcript, run)
                 except (GroqError, TimeoutError) as exc:
                     # The transcript is the user's words and they are already
                     # captured; a cleanup outage must cost them the tidy-up,
@@ -701,7 +824,7 @@ class Engine:
         return ""
 
     def _request_cleanup(
-        self, raw_text: str, style: CleanupStyle, transcript: _Transcript
+        self, raw_text: str, style: CleanupStyle, transcript: _Transcript, run: RunRecorder
     ) -> tuple[str, str]:
         """The cleanup round trip plus its output checks. Returns the text to
         paste and the guardrail reason that rejected the rewrite (``""`` when
@@ -709,6 +832,11 @@ class Engine:
         """
         cfg = self._config.cleanup
         assert self._groq is not None
+        # Time to first *content* token. With reasoning_effort set, a large
+        # share of this stage is the model thinking before it emits anything,
+        # so the split says whether D3 should chase the model's latency or the
+        # length of what it generates.
+        first_token = run.begin(Stage.LLM_FIRST_TOKEN)
         future = self._network.submit(
             self._groq.cleanup(
                 raw_text,
@@ -717,6 +845,7 @@ class Engine:
                 temperature=cfg.temperature,
                 reasoning_effort=cfg.reasoning_effort or None,
                 max_output_tokens=cfg.max_output_tokens or None,
+                on_first_token=lambda: run.end(first_token),
             )
         )
         result = future.result(timeout=self._config.groq.timeout_s + 5.0)
@@ -803,6 +932,84 @@ class Engine:
             focused_process=focused_process,
         )
 
+    # -- dashboard control (Phase 6) ---------------------------------------
+
+    @property
+    def is_listening(self) -> bool:
+        with self._listening_lock:
+            return self._listening
+
+    def set_listening(self, listening: bool) -> None:
+        """Arm or disarm the dictation hotkey.
+
+        Idempotent, and safe to call from the dashboard's HTTP thread:
+        pynput's listener is started and stopped from arbitrary threads
+        already (the tray does the same for the overlay).
+        """
+        with self._listening_lock:
+            if listening == self._listening:
+                return
+            self._listening = listening
+        try:
+            if listening:
+                self._hotkey.start()
+                if self._command_hotkey is not None:
+                    self._command_hotkey.start()
+                self._overlay.set_state(OverlayState.IDLE)
+            else:
+                self._hotkey.stop()
+                if self._command_hotkey is not None:
+                    self._command_hotkey.stop()
+                # IDLE, not ERROR: a pause is a deliberate state, not a
+                # failure, and the overlay auto-clears ERROR back to IDLE
+                # after a few seconds -- which would leave the pill claiming
+                # to be listening while the hotkey was still disarmed. IDLE
+                # renders its detail text as the label, so this reads
+                # "Paused" and stays there until resumed.
+                self._overlay.set_state(OverlayState.IDLE, detail="Paused")
+            logger.info("dictation %s", "resumed" if listening else "paused")
+        except Exception:
+            logger.exception("could not change the listening state")
+
+    def describe(self) -> dict[str, object]:
+        """Live engine facts the databases cannot know, for Settings."""
+        return {
+            "hotkey": self._config.hotkey.key,
+            "command_hotkey": self._config.hotkey.command_key,
+            "microphone": self._config.audio.device or "system default",
+            "sample_rate": f"{self._config.audio.sample_rate} Hz",
+            "transcription_model": WHISPER_MODEL,
+            "cleanup_model": self._config.cleanup.model,
+            "cleanup_enabled": str(self._config.cleanup.enabled),
+            "streaming_enabled": str(self._config.streaming.enabled),
+            "typing_wpm_baseline": str(self._config.analytics.typing_wpm),
+            "data_directory": str(self._config.data_dir),
+        }
+
+    def _open_dashboard(self) -> None:
+        """Start the dashboard server on first use, then open the browser.
+
+        Best-effort, like the tray: a dashboard that fails to start logs and
+        leaves dictation completely unaffected.
+        """
+        try:
+            if self._dashboard is None:
+                server = DashboardServer(
+                    history_db=self._config.history_db_path,
+                    latency_db=self._config.latency_db_path,
+                    typing_wpm=self._config.analytics.typing_wpm,
+                    control=EngineControl(
+                        is_listening=lambda: self.is_listening,
+                        set_listening=self.set_listening,
+                        describe=self.describe,
+                    ),
+                )
+                server.start()
+                self._dashboard = server
+            webbrowser.open(self._dashboard.url)
+        except Exception:
+            logger.exception("could not open the dashboard")
+
     # -- history (Phase 5) -------------------------------------------------
 
     def _record_history(
@@ -813,6 +1020,10 @@ class Engine:
         raw_text: str,
         instruction: str | None = None,
         focused_process: str | None = None,
+        run_id: str | None = None,
+        metrics: SessionMetrics | None = None,
+        language: str | None = None,
+        status: str | None = None,
     ) -> None:
         if self._history is None:
             return
@@ -823,6 +1034,10 @@ class Engine:
                 raw_text=raw_text,
                 instruction=instruction,
                 focused_process=focused_process,
+                run_id=run_id,
+                metrics=metrics,
+                language=language,
+                status=status,
             )
         except HistoryStoreError as exc:
             logger.warning("could not record history entry: %s", exc)

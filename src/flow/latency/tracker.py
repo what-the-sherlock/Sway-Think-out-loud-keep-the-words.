@@ -125,6 +125,47 @@ class RunRecorder:
         )
         return duration_ms
 
+    def record(
+        self,
+        stage: Stage | str,
+        duration_ms: float,
+        *,
+        started_at: float | None = None,
+        ok: bool = True,
+    ) -> None:
+        """Record an already-completed span measured elsewhere.
+
+        Exists for the spans that finish *before* there is a recorder to hold
+        them: the hotkey hold ends at key release, and the release-to-worker
+        dispatch gap ends at the moment the run itself is created. Both are
+        timed by the caller against the same monotonic clock and handed over
+        here, rather than being reconstructed from wall-clock differences.
+
+        ``seq`` is allocated from the same counter as :meth:`begin`, so these
+        sort into the run ahead of everything measured afterwards.
+        """
+        name = str(stage)
+        with self._lock:
+            seq = self._next_seq
+            self._next_seq += 1
+            self._stages.append(
+                StageTiming(
+                    stage=name,
+                    seq=seq,
+                    started_at=time.time() if started_at is None else started_at,
+                    duration_ms=duration_ms,
+                    ok=ok,
+                )
+            )
+        stage_logger.debug(
+            "run=%s stage=%s seq=%d duration_ms=%.2f ok=%s (pre-recorded)",
+            self.id,
+            name,
+            seq,
+            duration_ms,
+            ok,
+        )
+
     @contextmanager
     def stage(self, stage: Stage | str) -> Iterator[_Span]:
         """Time a block of work. Exceptions mark the span failed and propagate."""
