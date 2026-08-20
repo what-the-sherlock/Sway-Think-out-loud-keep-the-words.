@@ -776,22 +776,35 @@ class Engine:
         raw_text = transcript.text
         guardrail = ""
         failure = ""
-        with run.stage(Stage.CLEANUP):
-            skip_reason = self._cleanup_skip_reason(transcript, style)
-            if skip_reason:
-                cleaned_text = raw_text
-            else:
-                try:
+        # The skip decision is measured *outside* the CLEANUP span, and the
+        # span is opened only when the model is actually called (D0).
+        #
+        # It used to wrap both branches, which recorded a ~0.00 ms CLEANUP
+        # span on every skipped utterance. Those zeros then sat in the same
+        # percentile pool as real round trips and halved the reported p50 --
+        # a stage that costs 238 ms when it runs read as 178 ms, and got
+        # cheaper the *better* the skip heuristic worked. Any D3 before/after
+        # comparison built on that would have been meaningless, since
+        # improving the skip rate moves the cleanup percentile without the
+        # model call getting any faster. Skips are already recorded as
+        # `cleanup_skipped` / `cleanup_skip_reason` metadata, which is where
+        # skip-rate analysis belongs.
+        skip_reason = self._cleanup_skip_reason(transcript, style)
+        if skip_reason:
+            cleaned_text = raw_text
+        else:
+            try:
+                with run.stage(Stage.CLEANUP):
                     cleaned_text, guardrail = self._request_cleanup(raw_text, style, transcript, run)
-                except (GroqError, TimeoutError) as exc:
-                    # The transcript is the user's words and they are already
-                    # captured; a cleanup outage must cost them the tidy-up,
-                    # never the dictation. This is deliberately caught here
-                    # rather than in _run_pipeline, which would abandon the
-                    # run and paste nothing at all.
-                    failure = _failure_label(exc)
-                    cleaned_text = raw_text
-                    logger.warning("cleanup unavailable (%s); pasting the raw transcript", exc)
+            except (GroqError, TimeoutError) as exc:
+                # The transcript is the user's words and they are already
+                # captured; a cleanup outage must cost them the tidy-up,
+                # never the dictation. This is deliberately caught here
+                # rather than in _run_pipeline, which would abandon the
+                # run and paste nothing at all.
+                failure = _failure_label(exc)
+                cleaned_text = raw_text
+                logger.warning("cleanup unavailable (%s); pasting the raw transcript", exc)
         skipped = bool(skip_reason)
         self._cleanup_stats.record(skipped)
         run.annotate(

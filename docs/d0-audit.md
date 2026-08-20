@@ -167,11 +167,64 @@ flow run                      # in one window
 python scripts/baseline.py    # in another
 ```
 
-### Pre-D0 reference (75 historical runs already in the DB)
+### Guard against a fake baseline
 
-Not the baseline — these predate the new stages, which is exactly why every
-post-`vad` stage is starred. Included because it is real data about the
-current build and sets expectations:
+`baseline.py` refuses to write a report unless at least 10 runs in the window
+carry a `hotkey_hold` stage, and confirms each clip against the DB as you go
+(`captured 4/20 | hold 2.9s -> short | ok`).
+
+This exists because the first version did not have it: run with `--since 1`
+as a smoke test, it happily re-reported the entire historical database as a
+baseline — epoch timestamp, every row in `unclassified`, zero new dictations —
+and that output was briefly written up as a "pre-D0 reference". A file that
+reads as a baseline but contains no new dictations is the worst possible
+artifact for D3 to diff against. It is now a hard error.
+
+### Pre-D0 analysis (75 historical runs)
+
+Not a baseline and not clip-classified — these predate `hotkey_hold`. But
+they answer two questions D3 would otherwise guess at.
+
+**First: the `cleanup` stage was measuring the wrong thing.** The span used
+to wrap the skip branch as well as the model call, so 13 of 46 recorded
+cleanup spans are 0.00 ms skips. Splitting them:
+
+| | n | p50 | p90 | max |
+|---|---|---|---|---|
+| skipped (0 ms spans) | 14 | 0.0 | 0.0 | 2.2 |
+| real model calls | 32 | **238.0** | **728.5** | **1118.1** |
+| blended (what was reported) | 46 | 178.4 | 625.0 | 1118.1 |
+
+The blend does not just add noise, it inverts the signal: **improving the
+skip rate makes the cleanup percentile drop without the model call getting
+any faster.** A D3 "optimization" that only tightened the heuristic would
+have shown up as a latency win in a stage it never touched. Fixed in this
+phase — the CLEANUP span now opens only when the model is actually called,
+and skips are recorded as `cleanup_skipped` metadata, which is where
+skip-rate analysis belongs.
+
+**Second: cleanup's spread is jitter, not length.** On real model calls
+only, input length vs duration gives **r = +0.385, r² = 0.149** — length
+explains about 15% of the variance. The slowest call (1118 ms) had 260
+input chars; a 888-char input finished in 625 ms.
+
+Per the D3 decision rule, that points at **timeout budget with
+raw-transcript fallback**, not at streaming: the delay is largely *before*
+the first token, so incremental injection would hide it rather than remove
+it. It also argues against R2's incremental injection on cost/benefit
+grounds independently of its D8/D4 collisions.
+
+**Third: the skip heuristic's real rate.** Of the 26 runs carrying a
+`cleanup_skipped` label, 14 skipped — **54%**, not the 33% first reported
+(that figure came from the polluted blend). Reasons: `verbatim_profile` 8,
+`short_and_clean` 5, `low_confidence` 1. Note that 8 of 14 skips are the
+per-app VERBATIM profile, i.e. dictating into a terminal or editor, not the
+heuristic judging the text. The text-based heuristic fires only 5 times in
+26. **Whether the other 12 model calls were earning their keep is the open
+question for D3**, and it is the cheaper lever than streaming: a skip
+removes the whole 238 ms span rather than concealing it.
+
+**Other stages** (unaffected by the above):
 
 ```
 Stage        Count    p50    p90     p99   mean     max
@@ -179,21 +232,18 @@ capture         69    2.8    9.3    36.3    4.0    36.3
 vad             69   10.1   19.2    51.3   10.3    51.3
 encode*         68   31.8   44.7    71.5   27.9    71.5
 transcribe*     68  404.9  557.4   585.7  392.2   585.7
-cleanup*        46  178.4  625.0  1118.1  228.7  1118.1
 inject*         68   17.9   26.5    40.4   17.9    40.4
 TOTAL           69  622.6  885.2  1479.0  599.8  1479.0
 ```
 
-Three things this already says, to be confirmed against the real baseline:
+**`transcribe` is a floor, not a tail.** p50 405 ms, p99 585 ms, max 585 ms —
+an unusually tight distribution. Groq is being consistent. STT cannot be made
+less variable; it can only be made *lower*, and only by changing model. That
+makes D3's three-model benchmark the only lever on the largest single stage,
+and it moves the median rather than the tail.
 
-- **`transcribe` dominates** at ~405 ms p50, roughly two thirds of the budget.
-  `stt_first_byte` will now say how much of that is waiting versus reading.
-- **`cleanup` ran in 46 of 69 runs** — a ~33% skip rate from the existing
-  heuristic — but costs 625 ms at p90 and 1118 ms at p99 when it does run. It
-  is the single largest contributor to tail latency. D3's incremental-injection
-  benchmark (R2) targets exactly this.
-- **p50 total is 623 ms**, inside CLAUDE.md's 1000 ms budget; **p99 is 1479 ms**,
-  outside it. The tail is the problem, not the median.
+**p50 total 623 ms** (inside CLAUDE.md's 1000 ms budget); **p99 1479 ms**
+(outside it). The tail is the problem, and cleanup owns it.
 
 ---
 
@@ -217,6 +267,34 @@ Not found: no missing DLLs, no `_MEIPASS` path bugs (the code uses
 assumptions beyond the deliberate config search.
 
 ---
+
+## 5b. The 6 failed runs (8%)
+
+All six are **the same bug, and it is already fixed**:
+
+```
+TypeError: _Transcript.__init__() got an unexpected keyword argument 'speech_ms'
+```
+
+Every one reached `capture,vad,encode,transcribe` and died constructing the
+result. They span 08-19 21:16 → 08-20 00:32, a single development window
+during CLAUDE.md Phase 6 when `speech_ms`/`audio_ms` were added to the call
+site before the dataclass. The current `_Transcript` has both fields.
+
+**This is not a reliability signal.** No rate limiting, no timeouts, no
+network failures — the 8% is a development artifact sitting in the same
+database as real runs. Two consequences:
+
+- D7's failure-handling design gets no evidence from this data. The genuine
+  failure modes still need to be induced deliberately, as D7 already specifies.
+- **The baseline must be captured on the current build**, and reported
+  separately from history. `baseline.py` does this by construction (it only
+  reads runs after its own start), which is a second reason the empty-report
+  guard matters.
+
+Worth noting for D6: a crash-loop bug of this kind produced six identical
+error strings, which is exactly the case for grouping errors by type rather
+than dumping a log.
 
 ## 6. State of the tree
 

@@ -107,14 +107,34 @@ def classify(run: RunRecord) -> str:
     return "unclassified"  # pragma: no cover - the buckets are gapless
 
 
+def _runs_since(since: float) -> list[RunRecord]:
+    """Every run recorded since ``since``. Opens a short-lived connection each
+    call so it sees the running app's committed writes (the DB is in WAL mode,
+    and the app's writer thread batches, so a long-held reader would miss
+    them)."""
+    config = load_config()
+    db_path = Path(config.latency_db_path)
+    if not db_path.exists():
+        return []
+    with LatencyStore.open(db_path) as store:
+        return store.fetch_runs(since=since)
+
+
 def capture() -> float:
-    """Walk the user through the 20 clips. Returns the capture start time."""
+    """Walk the user through the 20 clips. Returns the capture start time.
+
+    Confirms each clip against the database before moving on, so a hotkey
+    that is not reaching the app is obvious on clip 1 rather than after
+    twenty of them.
+    """
     started = time.time()
     total = sum(clip.count for clip in CLASSES)
     print(f"\nD0 baseline: {total} dictations.")
     print("Flow must already be running in another window. Nothing here touches the mic.")
-    print("Put your cursor in a text field, then follow the prompts.\n")
+    print("Put your cursor in a text field, then follow the prompts.")
+    print("Each clip is confirmed against the database before the next one.\n")
 
+    seen = len(_runs_since(started))
     index = 0
     for clip in CLASSES:
         print(f"--- {clip.name}: {clip.count} clips of about {clip.target_s:g}s each ---")
@@ -122,10 +142,49 @@ def capture() -> float:
         for _ in range(clip.count):
             index += 1
             input(f"  [{index}/{total}] Press Enter, then hold the hotkey and speak... ")
-    print("\nCapture window closed. Reading the database.\n")
+            seen = _await_run(started, seen, index, total)
+    print("\nCapture window closed.\n")
     MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
     MARKER_PATH.write_text(json.dumps({"started": started}), encoding="utf-8")
     return started
+
+
+def _await_run(
+    since: float, seen: int, index: int, total: int, *, timeout_s: float = 25.0
+) -> int:
+    """Wait for one new run to land, and report what it looked like.
+
+    Returns the new run count. On timeout it says so and moves on rather than
+    blocking the capture: a dictation that never reached the app is a real
+    data point about the app, and stalling here would just hide it.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        runs = _runs_since(since)
+        if len(runs) > seen:
+            newest = runs[0]  # fetch_runs is newest-first
+            hold = next(
+                (t.duration_ms for t in newest.stages if str(t.stage) == "hotkey_hold"), None
+            )
+            where = classify(newest)
+            if hold is None:
+                detail = "no hotkey_hold stage -- is this build pre-D0?"
+            else:
+                detail = f"hold {hold / 1000.0:.1f}s -> {where}"
+            status = "ok" if newest.ok else f"FAILED ({newest.error})"
+            print(f"        captured {len(runs)}/{total} | {detail} | {status}")
+            return len(runs)
+        time.sleep(0.25)
+    print(
+        f"        nothing recorded after {timeout_s:.0f}s -- the hotkey may not have"
+        " reached Flow. Continuing."
+    )
+    return seen
+
+
+#: Below this many runs the percentiles are not worth writing down, and a
+#: file that looks like a baseline but is not one is worse than no file.
+MIN_RUNS = 10
 
 
 def report(since: float) -> str:
@@ -140,6 +199,24 @@ def report(since: float) -> str:
         raise SystemExit(
             "no runs recorded in the capture window.\n"
             "Was Flow actually running, and is [latency] enabled in your config?"
+        )
+
+    # Refuse to produce a baseline out of runs that predate the capture.
+    # This is the guard that was missing: `--since 1` happily re-reported the
+    # entire historical database as though it were a fresh capture, epoch
+    # timestamp and all, and every row landed in `unclassified` because none
+    # of them had a hotkey_hold stage. A file that reads as a baseline but
+    # contains no new dictations is the worst possible artifact for D3 to
+    # diff against, so it is now an error rather than a quiet oddity.
+    classified = [run for run in runs if classify(run) != "unclassified"]
+    if len(classified) < MIN_RUNS:
+        raise SystemExit(
+            f"refusing to write a baseline: {len(runs)} run(s) in the window, but only "
+            f"{len(classified)} carry a hotkey_hold stage (need at least {MIN_RUNS}).\n"
+            "\n"
+            "Runs without hotkey_hold predate D0 and cannot be classified by clip length.\n"
+            "If you passed --since, it is probably reaching back before this build.\n"
+            "Run `python scripts/baseline.py` with Flow running to capture a real one."
         )
 
     by_class: dict[str, list[RunRecord]] = {}
