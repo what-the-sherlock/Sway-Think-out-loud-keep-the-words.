@@ -54,6 +54,13 @@ class ClipClass:
     low_s: float
     high_s: float
     prompt: str
+    #: One topic per clip. Deliberately topics to speak about rather than
+    #: lines to read: read-aloud speech has no fillers, no false starts, and
+    #: no self-corrections, so it trips the cleanup skip heuristic far more
+    #: often than real dictation does. A baseline captured by reading would
+    #: understate how often cleanup runs, which is the stage D3 most needs to
+    #: measure. Topics are ordinary work talk for the same reason.
+    topics: tuple[str, ...] = ()
 
 
 CLASSES: tuple[ClipClass, ...] = (
@@ -63,7 +70,16 @@ CLASSES: tuple[ClipClass, ...] = (
         7,
         0.0,
         6.0,
-        "One short sentence. Something you would actually type in a chat window.",
+        "One sentence each. Say it the way you would type it into a chat window.",
+        (
+            "Tell someone you are running late to a meeting.",
+            "Ask a colleague whether they have looked at the pull request yet.",
+            "Say what you had for lunch.",
+            "Reply yes to an invitation, and add one detail.",
+            "Ask someone to send you the link they mentioned.",
+            "Say that a build is failing and you are looking into it.",
+            "Tell someone you will pick this up again tomorrow morning.",
+        ),
     ),
     ClipClass(
         "medium",
@@ -71,7 +87,16 @@ CLASSES: tuple[ClipClass, ...] = (
         7,
         6.0,
         18.0,
-        "Two or three sentences. Explain what you are working on right now.",
+        "Two or three sentences each. Talk, do not read -- pauses and 'um' are wanted.",
+        (
+            "Explain what you are working on in this repo right now.",
+            "Describe the last bug you fixed and what caused it.",
+            "Explain to someone why this app pastes instead of typing.",
+            "Say what you want to have finished by the end of the week.",
+            "Describe how you would explain this project to a non-technical friend.",
+            "Talk about a tool you use every day and one thing you dislike about it.",
+            "Explain what you would do first if the app stopped working tomorrow.",
+        ),
     ),
     ClipClass(
         "long",
@@ -79,7 +104,15 @@ CLASSES: tuple[ClipClass, ...] = (
         6,
         18.0,
         float("inf"),
-        "A full paragraph. Describe a problem and how you would approach it.",
+        "A full paragraph each. Let yourself ramble and correct yourself; that is realistic.",
+        (
+            "Describe a technical problem you have not solved yet, and how you might approach it.",
+            "Walk through how this dictation app works, from key press to text appearing.",
+            "Explain a decision you made recently and the alternatives you rejected.",
+            "Describe your ideal setup for the work you do, and why you do not have it.",
+            "Talk through what you would want built next, after this project is finished.",
+            "Explain something you know well to an imaginary beginner.",
+        ),
     ),
 )
 
@@ -108,16 +141,27 @@ def classify(run: RunRecord) -> str:
 
 
 def _runs_since(since: float) -> list[RunRecord]:
-    """Every run recorded since ``since``. Opens a short-lived connection each
-    call so it sees the running app's committed writes (the DB is in WAL mode,
-    and the app's writer thread batches, so a long-held reader would miss
-    them)."""
+    """Dictation runs recorded since ``since``, newest first.
+
+    Opens a short-lived connection each call so it sees the running app's
+    committed writes (the DB is in WAL mode and the app's writer thread
+    batches, so a long-held reader would miss them).
+
+    **Only ``source=hotkey`` runs count.** The command hotkey writes runs to
+    the same table, and on this machine it fires constantly by accident --
+    the default command key is Right Shift, which people press while typing
+    and talking, producing a stream of ``skipped=empty_selection`` runs with
+    no ``hotkey_hold`` stage. Counting those as baseline clips would advance
+    the capture without a dictation having happened and put unclassifiable
+    rows into the report.
+    """
     config = load_config()
     db_path = Path(config.latency_db_path)
     if not db_path.exists():
         return []
     with LatencyStore.open(db_path) as store:
-        return store.fetch_runs(since=since)
+        runs = store.fetch_runs(since=since)
+    return [run for run in runs if run.metadata.get("source", "hotkey") == "hotkey"]
 
 
 def capture() -> float:
@@ -131,17 +175,23 @@ def capture() -> float:
     total = sum(clip.count for clip in CLASSES)
     print(f"\nD0 baseline: {total} dictations.")
     print("Flow must already be running in another window. Nothing here touches the mic.")
-    print("Put your cursor in a text field, then follow the prompts.")
-    print("Each clip is confirmed against the database before the next one.\n")
+    print("Put your cursor in a text field -- Notepad is fine. NOT a terminal or code")
+    print("editor: those match the VERBATIM profile and skip cleanup entirely, which")
+    print("would leave the baseline with no data on the stage D3 most needs.")
+    print("\nEach prompt is a topic to TALK about, not a line to read. Read-aloud speech")
+    print("has no fillers or false starts and trips the skip heuristic far more than")
+    print("real dictation, so a baseline captured by reading would not match your use.\n")
 
     seen = len(_runs_since(started))
     index = 0
     for clip in CLASSES:
         print(f"--- {clip.name}: {clip.count} clips of about {clip.target_s:g}s each ---")
         print(f"    {clip.prompt}\n")
-        for _ in range(clip.count):
+        for offset in range(clip.count):
             index += 1
-            input(f"  [{index}/{total}] Press Enter, then hold the hotkey and speak... ")
+            topic = clip.topics[offset] if offset < len(clip.topics) else clip.prompt
+            print(f"  [{index}/{total}] {topic}")
+            input("        Press Enter, then hold the hotkey and speak... ")
             seen = _await_run(started, seen, index, total)
     print("\nCapture window closed.\n")
     MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -167,8 +217,14 @@ def _await_run(
                 (t.duration_ms for t in newest.stages if str(t.stage) == "hotkey_hold"), None
             )
             where = classify(newest)
+            skipped = newest.metadata.get("skipped")
             if hold is None:
-                detail = "no hotkey_hold stage -- is this build pre-D0?"
+                detail = "no hotkey_hold stage -- this Flow is running pre-D0 code"
+            elif skipped:
+                # A run landed, but nothing was transcribed: silence, or a
+                # hold too short to count. It is recorded and it advances the
+                # count, but saying "ok" would be a lie.
+                detail = f"hold {hold / 1000.0:.1f}s -> NOTHING CAPTURED ({skipped})"
             else:
                 detail = f"hold {hold / 1000.0:.1f}s -> {where}"
             status = "ok" if newest.ok else f"FAILED ({newest.error})"
