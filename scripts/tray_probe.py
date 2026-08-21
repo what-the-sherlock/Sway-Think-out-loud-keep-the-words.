@@ -95,14 +95,62 @@ def main() -> int:
 
     print(__doc__)
     print("=" * 70)
-    print("Look for a RED SQUARE in the notification area (check the ^ overflow).")
+    print("Look for a RED SQUARE in the notification area.")
+    print("  ** Windows 11 hides NEW tray icons by default -- click the ^ chevron")
+    print("     next to the clock to open the overflow flyout and look there. **")
     print("  1. Right-click it  -> a menu with 'Say hello' and 'Quit' should appear")
     print("  2. Left-click it   -> should print a message line")
     print("  3. Choose Quit     -> this script exits")
     print("Every line below is a message Windows delivered. No lines = none arrived.")
     print("=" * 70, flush=True)
 
-    icon.run()
+    def _setup(icon_arg):
+        """Report whether the icon was actually registered with the shell.
+
+        pystray calls Shell_NotifyIcon and ignores its BOOL return, so a
+        failed NIM_ADD is invisible from Python -- the script keeps running
+        happily with no icon anywhere. Checking it directly is the only way
+        to tell "registered but hidden in the overflow" from "never
+        registered at all", and those need completely different fixes.
+        """
+        icon_arg.visible = True
+        print(f"{_stamp()} icon.visible = {icon_arg.visible}", flush=True)
+        print(f"{_stamp()} window handle = {getattr(icon_arg, '_hwnd', None)}", flush=True)
+
+        try:
+            import ctypes
+
+            from pystray._util import win32
+
+            # Re-issue NIM_MODIFY on the same icon and read the result. If
+            # this is False the shell does not know about our icon at all.
+            ok = win32.Shell_NotifyIcon(
+                win32.NIM_MODIFY,
+                win32.NOTIFYICONDATAW(
+                    cbSize=ctypes.sizeof(win32.NOTIFYICONDATAW),
+                    hWnd=icon_arg._hwnd,
+                    hID=id(icon_arg),
+                    uFlags=win32.NIF_TIP,
+                    szTip="Tray probe (red square)",
+                ),
+            )
+            print(f"{_stamp()} Shell_NotifyIcon(NIM_MODIFY) -> {bool(ok)}", flush=True)
+            if not ok:
+                print(
+                    f"{_stamp()} *** the shell does not have our icon: "
+                    "registration failed, it is not merely hidden ***",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"{_stamp()} the shell HAS our icon. If you cannot see it, it is"
+                    " hidden in the ^ overflow flyout.",
+                    flush=True,
+                )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            print(f"{_stamp()} could not verify registration: {exc!r}", flush=True)
+
+    icon.run(setup=_setup)
 
     print("=" * 70)
     if clicks:
