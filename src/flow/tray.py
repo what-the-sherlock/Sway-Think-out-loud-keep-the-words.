@@ -189,6 +189,7 @@ class TrayIcon:
     # -- menu handlers -----------------------------------------------------
 
     def _handle_toggle_agent(self, icon: Any, item: Any) -> None:
+        logger.info("tray: %s clicked", "Agent enabled")
         del item
         try:
             if self._set_listening is None or self._is_listening is None:
@@ -200,6 +201,7 @@ class TrayIcon:
             logger.exception("could not toggle the agent from the tray")
 
     def _handle_show_history(self, icon: Any, item: Any) -> None:
+        logger.info("tray: %s clicked", "Show History")
         del icon, item
         try:
             self._on_show_history()
@@ -207,6 +209,7 @@ class TrayIcon:
             logger.exception("could not open the history window from the tray")
 
     def _handle_open_dashboard(self, icon: Any, item: Any) -> None:
+        logger.info("tray: %s clicked", "Open Dashboard")
         del icon, item
         try:
             if self._on_open_dashboard is not None:
@@ -215,6 +218,7 @@ class TrayIcon:
             logger.exception("could not open the dashboard from the tray")
 
     def _handle_view_logs(self, icon: Any, item: Any) -> None:
+        logger.info("tray: %s clicked", "View Logs")
         del icon, item
         try:
             if self._on_view_logs is not None:
@@ -223,6 +227,7 @@ class TrayIcon:
             logger.exception("could not open the log file from the tray")
 
     def _handle_quit(self, icon: Any, item: Any) -> None:
+        logger.info("tray: %s clicked", "Quit")
         del item
         try:
             self._on_quit()
