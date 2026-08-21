@@ -40,11 +40,48 @@ def _run(label: str, command: list[str]) -> None:
         raise SystemExit(f"error: {label} failed (exit {result.returncode})")
 
 
+def _refuse_if_running() -> None:
+    """Stop before PyInstaller touches dist/ if Flow is running.
+
+    PyInstaller clears ``dist/flow`` before it builds. Windows locks a running
+    executable, so a build started while Flow is open deletes most of that
+    directory, hits ``PermissionError`` on ``Flow.exe`` itself, and aborts --
+    leaving a half-erased install: no ``flow-cli.exe``, a partially stripped
+    ``_internal``, and, worst of all, no ``.env``. The running app keeps
+    working (it is already mapped into memory), so nothing looks wrong until
+    the next launch fails with "Flow needs a Groq API key".
+
+    Detecting it up front costs one file check and turns a corrupted install
+    into a one-line message. The test is a rename-in-place: Windows refuses
+    to rename a file that is mapped as a running image, while a file merely
+    sitting on disk renames fine and is put straight back.
+    """
+    app = DIST_DIR / "Flow.exe"
+    if not app.is_file():
+        return
+    probe = app.with_suffix(".exe.buildcheck")
+    try:
+        app.rename(probe)
+    except OSError:
+        raise SystemExit(
+            "error: Flow appears to be running, so dist/flow cannot be rebuilt.\n"
+            "\n"
+            "Quit it from its tray icon (right-click > Quit), confirm no Flow.exe\n"
+            "remains in Task Manager > Details, then run this again.\n"
+            "\n"
+            "Refusing to start: PyInstaller would clear dist/flow first and fail\n"
+            "partway, leaving a half-erased install without its .env."
+        ) from None
+    probe.rename(app)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--startup", action="store_true", help="launch Flow at login")
     parser.add_argument("--no-shortcuts", action="store_true", help="skip shortcut creation")
     args = parser.parse_args(argv)
+
+    _refuse_if_running()
 
     _run(
         "Building Flow.exe",

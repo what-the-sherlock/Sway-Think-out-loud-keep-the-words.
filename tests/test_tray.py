@@ -188,3 +188,68 @@ def test_a_failing_callback_does_not_escape_the_handler(fake_pystray) -> None:
 
     item = next(i for i in tray._icon.menu if getattr(i, "text", "") == "Show History")
     item.action(tray._icon, item)  # must swallow, not propagate
+
+
+# -- ghost hygiene and delivery diagnostics ----------------------------------
+
+
+def test_stop_hides_the_icon_before_stopping_the_loop(fake_pystray) -> None:
+    """The orphan-icon guard.
+
+    ``stop()`` alone only posts WM_STOP and leaves removal to the mainloop's
+    cleanup; if that loop is wedged or dead, Windows keeps painting the icon
+    after the process exits. Setting ``visible = False`` issues NIM_DELETE
+    directly, so removal does not depend on a healthy loop. Order matters --
+    hiding after stopping would be too late.
+    """
+    order: list[str] = []
+
+    class _RecordingIcon(_FakeIcon):
+        @property
+        def visible(self):
+            return self._visible
+
+        @visible.setter
+        def visible(self, value):
+            self._visible = value
+            order.append(f"visible={value}")
+
+        def stop(self):
+            order.append("stop")
+            super().stop()
+
+    fake_pystray.Icon = _RecordingIcon
+    tray = _tray()
+    tray.start()
+    tray.stop(timeout=2.0)
+
+    assert order == ["visible=False", "stop"]
+
+
+def test_stop_still_stops_when_hiding_fails(fake_pystray) -> None:
+    """A backend that refuses `visible` must not prevent the loop stopping."""
+
+    class _UnhidableIcon(_FakeIcon):
+        @property
+        def visible(self):
+            return True
+
+        @visible.setter
+        def visible(self, value):
+            raise RuntimeError("backend does not support hiding")
+
+    fake_pystray.Icon = _UnhidableIcon
+    tray = _tray()
+    tray.start()
+    tray.stop(timeout=2.0)
+
+    assert tray._icon.stopped is True
+
+
+def test_notify_probe_is_optional(fake_pystray) -> None:
+    """The fake icon has no ``_on_notify``. Installing the probe must be a
+    silent no-op rather than breaking the tray it exists to diagnose."""
+    tray = _tray()
+    assert tray.start() is True
+    tray.stop(timeout=2.0)
+    assert tray._icon.ran is True

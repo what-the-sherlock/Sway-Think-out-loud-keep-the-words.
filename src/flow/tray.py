@@ -152,11 +152,67 @@ class TrayIcon:
         Wrapped so a backend that dies takes the tray icon down and nothing
         else: the engine holds no reference to this thread's outcome, and
         dictation does not depend on the tray existing.
+
+        The two INFO lines around ``run()`` exist because "is the message loop
+        actually running?" was assumed rather than known while debugging an
+        icon that rendered but ignored every click. Without them, a loop that
+        never starts and a loop that starts but receives nothing look
+        identical from the log.
         """
+        self._install_notify_probe()
+        logger.info("tray: message loop starting")
         try:
             self._icon.run()
         except Exception:
             logger.exception("tray icon loop failed")
+        finally:
+            logger.info("tray: message loop exited")
+
+    def _install_notify_probe(self) -> None:
+        """Log every mouse message Windows delivers to the icon.
+
+        Reaches into pystray's private ``_on_notify`` because there is no
+        public hook, and the question it answers cannot be answered any other
+        way: an icon that receives no messages at all (an orphan left behind
+        by a crashed process, or a failed registration) is indistinguishable
+        from one whose messages are being mis-decoded, and the fixes for
+        those are completely different.
+
+        Entirely optional. If the attribute is missing -- another backend,
+        another pystray version -- this silently does nothing rather than
+        breaking the tray it exists to diagnose.
+        """
+        icon = self._icon
+        original = getattr(icon, "_on_notify", None)
+        if original is None or not callable(original):
+            logger.debug("tray: no _on_notify to probe (backend %s)", type(icon).__name__)
+            return
+
+        def _probe(wparam, lparam):
+            # WM_LBUTTONUP is 0x0202, WM_RBUTTONUP 0x0205. Newer shell
+            # versions pack LOWORD(event)/HIWORD(iconId) into lparam, so the
+            # low word is logged separately -- pystray compares the whole
+            # value, which silently stops matching if that ever applies here.
+            logger.info(
+                "tray: _on_notify wparam=%s lparam=%s (low=0x%04X)",
+                wparam,
+                lparam,
+                lparam & 0xFFFF,
+            )
+            return original(wparam, lparam)
+
+        try:
+            icon._on_notify = _probe
+            # pystray dispatches through a dict built in __init__, so
+            # rebinding the attribute alone is not enough.
+            handlers = getattr(icon, "_message_handlers", None)
+            if isinstance(handlers, dict):
+                for message, handler in list(handlers.items()):
+                    if handler == original:
+                        handlers[message] = _probe
+            logger.debug("tray: notify probe installed")
+        except Exception:
+            logger.debug("tray: could not install the notify probe", exc_info=True)
 
     # -- state -------------------------------------------------------------
 
@@ -235,9 +291,25 @@ class TrayIcon:
             icon.stop()
 
     def stop(self, *, timeout: float = 2.0) -> None:
-        if self._icon is not None:
+        """Remove the icon and stop its loop. Never raises.
+
+        ``visible = False`` first, then ``stop()``. The two are not
+        redundant: the visible setter issues ``Shell_NotifyIcon(NIM_DELETE)``
+        immediately, while ``stop()`` only posts ``WM_STOP`` and leaves the
+        actual removal to the mainloop's own cleanup. If that loop is wedged
+        or already dead, the removal never happens and Windows keeps painting
+        the icon after the process is gone -- an orphan that looks exactly
+        like a working tray icon but ignores every click, which is precisely
+        the confusion this app has already caused once.
+        """
+        icon = self._icon
+        if icon is not None:
             try:
-                self._icon.stop()
+                icon.visible = False
+            except Exception:
+                logger.debug("could not hide the tray icon before stopping", exc_info=True)
+            try:
+                icon.stop()
             except Exception:
                 logger.exception("error stopping the tray icon")
         if self._thread is not None:
