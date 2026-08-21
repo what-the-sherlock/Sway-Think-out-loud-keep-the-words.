@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">F</div>
+      <div class="brand-name">Flow</div>
+    </div>
+
+    <div class="nav-section">Productivity</div>
+    <button class="nav-item" data-view="overview"><span class="ico">◈</span> Overview</button>
+    <button class="nav-item" data-view="activity"><span class="ico">≡</span> Activity <span class="badge" id="nav-activity-count"></span></button>
+    <button class="nav-item" data-view="insights"><span class="ico">◔</span> Insights</button>
+
+    <div class="nav-section">Engine</div>
+    <button class="nav-item" data-view="performance"><span class="ico">⌁</span> Performance <span class="badge" id="nav-health-dot"></span></button>
+    <button class="nav-item" data-view="settings"><span class="ico">⚙</span> Settings</button>
+
+    <div class="sidebar-foot">
+      <button class="mic-toggle" id="mic-toggle" disabled>
+        <span class="dot"></span>
+        <span>
+          <span class="label" id="mic-label">Checking…</span><br>
+          <span class="sub" id="mic-sub">engine status</span>
+        </span>
+      </button>
+    </div>
+  </nav>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="page-title" id="page-title">Overview</div>
+        <div class="page-sub" id="page-sub"></div>
+      </div>
+      <div class="topbar-right" id="topbar-right"></div>
+    </header>
+    <div class="content" id="content"></div>
+  </main>
+</div>
+
+<div class="drawer-scrim" id="drawer-scrim"></div>
+<aside class="drawer" id="drawer" aria-label="Session detail">
+  <div class="drawer-head">
+    <div>
+      <div class="page-title" id="drawer-title">Session</div>
+      <div class="page-sub" id="drawer-sub"></div>
+    </div>
+    <button class="btn" id="drawer-close" style="margin-left:auto">Close</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

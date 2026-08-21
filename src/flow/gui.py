@@ -26,7 +26,7 @@ from collections.abc import Sequence
 
 from flow import APP_NAME
 from flow.errors import FlowError
-from flow.platform import get_platform
+from flow.platform import PlatformAdapter, get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +67,7 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
 
     try:
         if not platform.acquire_single_instance_lock(_INSTANCE_LOCK_NAME):
-            platform.show_message(APP_NAME, _ALREADY_RUNNING_MESSAGE)
-            return 0
+            return _focus_running_instance(platform)
 
         # Only the bare, double-clicked case defaults to `run`; an explicit
         # argument list is passed through untouched so a shortcut with
@@ -104,6 +103,53 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
             error=True,
         )
     return code
+
+
+def _focus_running_instance(platform: PlatformAdapter) -> int:
+    """Second launch: bring the running copy forward instead of starting a rival.
+
+    Silence is the success case. If the running instance comes forward, this
+    process exits without showing anything at all -- a dialog saying "it is
+    already running" on top of the window that just appeared would be noise.
+    A dialog appears only when we could not reach it, which is the case the
+    user actually has to act on.
+    """
+    from flow import instance
+
+    try:
+        from flow.config import load_config
+
+        data_dir = load_config().data_dir
+    except Exception:
+        # A config broken enough to fail loading is reported by the normal
+        # path with its own message; here it just means no focus.
+        logger.debug("could not load config to find the running instance", exc_info=True)
+        platform.show_message(APP_NAME, _ALREADY_RUNNING_MESSAGE)
+        return 0
+
+    info = instance.read(data_dir)
+    if info is None:
+        # Mutex held but nothing advertised: an older build, a still-starting
+        # instance, or one whose dashboard server failed. Not an error.
+        platform.show_message(APP_NAME, _ALREADY_RUNNING_MESSAGE)
+        return 0
+
+    result = instance.request_focus(info)
+    if result is instance.FocusResult.FOCUSED:
+        return 0
+
+    # Alive, advertised, and not answering. Say so plainly and name the
+    # process, but do not kill it: this path also covers a first instance
+    # that is merely busy, and killing that would lose a dictation in
+    # flight. D5's settings pane is where an explicit "restart Flow"
+    # action belongs.
+    platform.show_message(
+        APP_NAME,
+        f"Flow is already running (process {info.pid}), but it is not responding.\n\n"
+        "If it seems stuck, end that process in Task Manager and start Flow again.",
+        error=True,
+    )
+    return 1
 
 
 def _has_api_key() -> bool:

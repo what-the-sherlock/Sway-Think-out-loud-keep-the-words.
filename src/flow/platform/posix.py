@@ -111,6 +111,37 @@ class PosixPlatform:
         """
         return False
 
+    def process_is_running(self, pid: int) -> bool:
+        """Signal 0 probes for existence without delivering anything.
+
+        ``PermissionError`` means the process exists but belongs to another
+        user, which still counts as running.
+        """
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def set_launch_at_login(self, app_name: str, command: str | None) -> bool:
+        """Not implemented: there is no single answer here across desktop
+        environments (systemd user units, XDG autostart, launchd), and
+        guessing wrong would leave an entry the user cannot find to remove.
+        Reported as unsupported so the UI can hide the toggle rather than
+        offer one that silently does nothing."""
+        del app_name, command
+        return False
+
+    def launches_at_login(self, app_name: str) -> bool:
+        del app_name
+        return False
+
     def _run(self, argv: list[str], *, input_text: str | None = None) -> str:
         exe = argv[0]
         if shutil.which(exe) is None:

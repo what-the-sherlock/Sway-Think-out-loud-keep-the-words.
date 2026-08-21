@@ -24,6 +24,7 @@ from pathlib import Path
 
 from flow import APP_NAME, __version__
 from flow.config import Config, load_config
+from flow.platform import get_platform
 from flow.errors import AudioError, FlowError, LatencyStoreError
 from flow.latency.report import format_table, summarize
 from flow.latency.store import LatencyStore
@@ -97,6 +98,19 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("config", help="print the resolved configuration")
     show.set_defaults(handler=_cmd_config)
 
+    startup = sub.add_parser(
+        "startup",
+        help="show or change whether Flow starts automatically at login",
+    )
+    startup_group = startup.add_mutually_exclusive_group()
+    startup_group.add_argument(
+        "--enable", action="store_true", help="start Flow when you log in"
+    )
+    startup_group.add_argument(
+        "--disable", action="store_true", help="stop starting Flow at login"
+    )
+    startup.set_defaults(handler=_cmd_startup)
+
     run = sub.add_parser(
         "run",
         help="run Flow: hold the hotkey, speak, release to paste the transcript",
@@ -127,6 +141,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     dict_list = dict_sub.add_parser("list", help="list every term")
     dict_list.set_defaults(handler=_cmd_dictionary_list)
+
+    dashboard = sub.add_parser(
+        "dashboard",
+        help="open the Flow dashboard in a browser",
+        description=(
+            "Serves the dashboard on loopback and opens it. Standalone: it "
+            "reports the history and latency already recorded, but cannot "
+            "pause or resume dictation, because no engine is attached. To "
+            "control a running engine, use the tray icon's 'Open Dashboard' "
+            "item instead."
+        ),
+    )
+    dashboard.add_argument(
+        "--port", type=int, default=0, metavar="PORT", help="bind a fixed port (default: any free port)"
+    )
+    dashboard.add_argument(
+        "--no-browser", action="store_true", help="print the URL instead of opening a browser"
+    )
+    dashboard.set_defaults(handler=_cmd_dashboard)
 
     history = sub.add_parser(
         "history",
@@ -266,6 +299,47 @@ def _cmd_config(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def _startup_command() -> str | None:
+    """The command line Windows should run at login, or ``None`` if unknown.
+
+    In a frozen build this is ``Flow.exe`` itself. From source there is no
+    single sensible answer -- the venv's python, the module, and the working
+    directory all matter -- and registering a half-guessed command would
+    leave a login entry that fails silently every morning. Better to decline.
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
+    return None
+
+
+def _cmd_startup(args: argparse.Namespace, config: Config) -> int:
+    del config
+    platform = get_platform()
+
+    if not args.enable and not args.disable:
+        state = "enabled" if platform.launches_at_login(APP_NAME) else "disabled"
+        print(f"start at login: {state}")
+        return 0
+
+    if args.disable:
+        ok = platform.set_launch_at_login(APP_NAME, None)
+        print("start at login: disabled" if ok else "could not change the setting")
+        return 0 if ok else 1
+
+    command = _startup_command()
+    if command is None:
+        print(
+            "error: only the packaged build can register itself to start at login.\n"
+            "Running from source, the command to register is ambiguous (which\n"
+            "interpreter, which working directory), so Flow will not guess.",
+            file=sys.stderr,
+        )
+        return 2
+    ok = platform.set_launch_at_login(APP_NAME, command)
+    print(f"start at login: enabled ({command})" if ok else "could not change the setting")
+    return 0 if ok else 1
+
+
 def _cmd_run(args: argparse.Namespace, config: Config) -> int:
     del args
     # Imported lazily so `flow demo`/`report`/`config` never pay for
@@ -285,9 +359,54 @@ def _cmd_run(args: argparse.Namespace, config: Config) -> int:
         engine.start()
         print(f"Flow is running. Hold {config.hotkey.key} to dictate. Ctrl+C to quit.", file=sys.stderr)
         engine.run_overlay()
+    except KeyboardInterrupt:
+        # Ctrl+C from a console run is a normal quit, not a crash. The
+        # `finally` below still performs the full shutdown.
+        logger.info("interrupted; shutting down")
+    except BaseException:
+        # Log before re-raising. flow.gui shows the traceback in a dialog,
+        # but a dialog is transient and the windowed build has no console --
+        # without this, the only durable record of a crash would be whatever
+        # the user managed to read before clicking OK. Logged here rather
+        # than in flow.gui so `python -m flow run` gets it too.
+        logger.exception("Flow stopped with an unhandled error")
+        raise
     finally:
+        # Runs on every path including a crash, which is what keeps a failed
+        # run from leaving the hotkey hooked and the mic held (D1).
         engine.stop()
         tracker.close()
+    return 0
+
+
+def _cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
+    """Serve the dashboard until interrupted.
+
+    Blocks on purpose: the server runs on a daemon thread, so returning
+    immediately would tear it down before the browser finished loading.
+    """
+    import webbrowser
+
+    from flow.dashboard.server import DashboardServer
+
+    server = DashboardServer(
+        history_db=config.history_db_path,
+        latency_db=config.latency_db_path,
+        typing_wpm=config.analytics.typing_wpm,
+        port=args.port,
+    )
+    url = server.start()
+    print(f"Flow dashboard: {url}", file=sys.stderr)
+    print("Press Ctrl+C to stop.", file=sys.stderr)
+    if not args.no_browser:
+        webbrowser.open(url)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
     return 0
 
 

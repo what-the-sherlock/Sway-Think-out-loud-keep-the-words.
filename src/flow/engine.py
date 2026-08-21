@@ -65,6 +65,7 @@ from flow.groq_client import (
 from flow.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 from flow.history_window import HistoryWindow
 from flow.hotkey import KNOWN_KEYS, HotkeyListener
+from flow import instance
 from flow.inject import TextInjector
 from flow.latency.models import Stage
 from flow.latency.tracker import LatencyTracker, RunRecorder
@@ -74,7 +75,7 @@ from flow.platform import PlatformAdapter, get_platform
 from flow.profiles import CleanupStyle, style_for_process
 from flow.selection import SelectionReader
 from flow.streaming import ChunkSessionResult, ChunkStreamer, max_overlap_words, stitch_transcripts
-from flow.tray import TrayIcon
+from flow.tray import TrayIcon, TrayState
 
 logger = logging.getLogger(__name__)
 
@@ -220,10 +221,17 @@ class Engine:
             self._tray = TrayIcon(
                 on_show_history=self._open_history_window,
                 on_open_dashboard=self._open_dashboard,
+                on_view_logs=self._open_logs,
                 on_quit=self._overlay.stop,
+                is_listening=lambda: self.is_listening,
+                set_listening=self.set_listening,
             )
             if not self._tray.start():
                 self._tray = None
+        # Advertise before announcing readiness: a second launch racing the
+        # first would otherwise find no instance file and show the "already
+        # running" dialog instead of focusing us.
+        self._publish_instance()
         logger.info("Flow ready. Hold %s to dictate.", self._config.hotkey.key)
         if self._command_hotkey is not None:
             logger.info("Hold %s with text selected to run a voice command.", self._config.hotkey.command_key)
@@ -259,6 +267,7 @@ class Engine:
             ("hotkey", self._hotkey.stop),
             ("command hotkey", self._stop_command_hotkey),
             ("tray", self._stop_tray),
+            ("instance file", self._withdraw_instance),
             ("dashboard", self._stop_dashboard),
             ("capture", self._capture.stop),
             ("network", self._stop_network),
@@ -291,6 +300,11 @@ class Engine:
         if self._command_hotkey is not None:
             self._command_hotkey.stop()
 
+    def _withdraw_instance(self) -> None:
+        """Remove the advertisement before the port goes away, so a launch
+        racing this shutdown never finds a file pointing at a dead socket."""
+        instance.withdraw(self._config.data_dir)
+
     def _stop_dashboard(self) -> None:
         if self._dashboard is not None:
             self._dashboard.stop()
@@ -301,6 +315,53 @@ class Engine:
             self._tray.stop()
 
     # -- history window (Phase 5): opened from the tray, shown on the Tk thread
+
+    #: Overlay state -> tray state. The two surfaces answer different
+    #: questions -- the overlay is what the user watches mid-dictation, the
+    #: tray answers "is it even on?" when no overlay is showing -- but they
+    #: must never disagree, so every transition goes through _set_ui_state.
+    _TRAY_STATE_FOR: dict[OverlayState, TrayState] = {
+        OverlayState.IDLE: TrayState.IDLE,
+        OverlayState.RECORDING: TrayState.LISTENING,
+        OverlayState.THINKING: TrayState.PROCESSING,
+        OverlayState.ERROR: TrayState.ERROR,
+    }
+
+    def _set_ui_state(self, state: OverlayState, *, detail: str = "") -> None:
+        """Drive the overlay and the tray icon together.
+
+        A paused engine always shows DISABLED in the tray regardless of the
+        overlay state it was given. set_listening deliberately puts the
+        overlay into IDLE-with-detail rather than ERROR when pausing (see
+        there for why), and without this override the tray would inherit that
+        IDLE and claim to be armed while the hotkey was disarmed.
+        """
+        self._overlay.set_state(state, detail=detail) if detail else self._overlay.set_state(state)
+        if self._tray is None:
+            return
+        tray_state = self._TRAY_STATE_FOR.get(state, TrayState.IDLE)
+        if not self.is_listening:
+            tray_state = TrayState.DISABLED
+        self._tray.set_state(tray_state)
+
+    def _open_logs(self) -> None:
+        """Open the log file in whatever the OS uses for .log files.
+
+        Best-effort and non-blocking. The point is that "View Logs" in the
+        tray beats telling a user to find %LOCALAPPDATA% by hand, which is
+        the only other option in a build with no console.
+        """
+        path = self._config.log_file_path
+        try:
+            if not path.exists():
+                # An empty log is a confusing thing to open; say so instead.
+                self._platform.show_message(
+                    APP_NAME, f"No log file yet.\n\nIt will appear at:\n{path}"
+                )
+                return
+            webbrowser.open(path.as_uri())
+        except Exception:
+            logger.exception("could not open the log file")
 
     def _open_history_window(self) -> None:
         """Called from the tray icon's own thread; never touches Tk directly."""
@@ -325,7 +386,7 @@ class Engine:
         # the user is dictating into; PlatformAdapter guarantees this never
         # raises, so no try/except is needed on this hot path.
         self._focused_process = self._platform.focused_process_name()
-        self._overlay.set_state(OverlayState.RECORDING)
+        self._set_ui_state(OverlayState.RECORDING)
         self._stream_session = self._start_streaming() if self._config.streaming.enabled else None
 
     def _on_release(self) -> None:
@@ -335,12 +396,13 @@ class Engine:
         if not should_process(held_ms, self._config.hotkey.min_hold_ms):
             if session is not None:
                 session.stop(timeout=0.5)
-            self._overlay.set_state(OverlayState.IDLE)
+            self._set_ui_state(OverlayState.IDLE)
             return
-        self._overlay.set_state(OverlayState.THINKING)
+        self._set_ui_state(OverlayState.THINKING)
         # Hand off immediately: the listener thread must stay free for the
         # next key event, and this thread may block on the network.
         threading.Thread(
+            name="flow-dictation",
             target=self._process,
             args=(
                 self._start_frame,
@@ -388,14 +450,19 @@ class Engine:
         self._command_press_time = time.monotonic()
         self._command_start_frame = preroll_start_frame(self._ring.mark(), self._preroll_frames)
         self._command_focused_process = self._platform.focused_process_name()
-        self._overlay.set_state(OverlayState.RECORDING)
+        self._set_ui_state(OverlayState.RECORDING)
         selection_ready = threading.Event()
         self._selection_ready = selection_ready
         self._selected_text = ""
         # The Ctrl+C round trip can take tens of milliseconds waiting on the
         # target app; hand it off immediately so the listener thread stays
         # free, same reasoning as the dictation hotkey's release handoff.
-        threading.Thread(target=self._capture_selection, args=(selection_ready,), daemon=True).start()
+        threading.Thread(
+            target=self._capture_selection,
+            args=(selection_ready,),
+            name="flow-selection",
+            daemon=True,
+        ).start()
 
     def _capture_selection(self, ready: threading.Event) -> None:
         try:
@@ -409,10 +476,11 @@ class Engine:
     def _on_command_release(self) -> None:
         held_ms = (time.monotonic() - self._command_press_time) * 1000.0
         if not should_process(held_ms, self._config.hotkey.min_hold_ms):
-            self._overlay.set_state(OverlayState.IDLE)
+            self._set_ui_state(OverlayState.IDLE)
             return
-        self._overlay.set_state(OverlayState.THINKING)
+        self._set_ui_state(OverlayState.THINKING)
         threading.Thread(
+            name="flow-command",
             target=self._process_command,
             args=(self._command_start_frame, self._command_focused_process, self._selection_ready),
             daemon=True,
@@ -439,19 +507,19 @@ class Engine:
                 detail += f" ({exc.limit_type})"
             if exc.retry_after_s is not None:
                 detail += f" — retry in {exc.retry_after_s:.0f}s"
-            self._overlay.set_state(OverlayState.ERROR, detail=detail)
+            self._set_ui_state(OverlayState.ERROR, detail=detail)
         except TimeoutError as exc:
             run.mark_failed(exc)
             logger.error("%s timed out: %s", label, exc)
-            self._overlay.set_state(OverlayState.ERROR, detail="timed out")
+            self._set_ui_state(OverlayState.ERROR, detail="timed out")
         except (GroqError, FlowError) as exc:
             run.mark_failed(exc)
             logger.error("%s failed: %s", label, exc)
-            self._overlay.set_state(OverlayState.ERROR, detail="failed")
+            self._set_ui_state(OverlayState.ERROR, detail="failed")
         except Exception as exc:  # never let a bug hang the app with the mic hot
             run.mark_failed(exc)
             logger.exception("unexpected %s failure", label)
-            self._overlay.set_state(OverlayState.ERROR, detail="failed")
+            self._set_ui_state(OverlayState.ERROR, detail="failed")
 
     def _process(
         self,
@@ -497,14 +565,14 @@ class Engine:
     ) -> None:
         transcript = self._transcribe(start_frame, run, session)
         if not transcript:
-            self._overlay.set_state(OverlayState.IDLE)
+            self._set_ui_state(OverlayState.IDLE)
             return
 
         cleaned_text = self._clean_up(transcript, run, focused_process)
 
         with run.stage(Stage.INJECT):
             pasted = self._inject_with_fallback(cleaned_text, run)
-        self._overlay.set_state(
+        self._set_ui_state(
             OverlayState.IDLE if pasted else OverlayState.ERROR,
             detail="" if pasted else "elevated window — copied instead",
         )
@@ -901,12 +969,12 @@ class Engine:
             selected_text = self._selected_text
         if not selected_text:
             run.annotate(skipped="empty_selection")
-            self._overlay.set_state(OverlayState.ERROR, detail="nothing selected")
+            self._set_ui_state(OverlayState.ERROR, detail="nothing selected")
             return
 
         instruction = self._transcribe_single_shot(start_frame, run)
         if not instruction:
-            self._overlay.set_state(OverlayState.IDLE)
+            self._set_ui_state(OverlayState.IDLE)
             return
 
         with run.stage(Stage.COMMAND):
@@ -931,7 +999,7 @@ class Engine:
 
         with run.stage(Stage.INJECT):
             pasted = self._inject_with_fallback(transformed, run)
-        self._overlay.set_state(
+        self._set_ui_state(
             OverlayState.IDLE if pasted else OverlayState.ERROR,
             detail="" if pasted else "elevated window — copied instead",
         )
@@ -968,7 +1036,7 @@ class Engine:
                 self._hotkey.start()
                 if self._command_hotkey is not None:
                     self._command_hotkey.start()
-                self._overlay.set_state(OverlayState.IDLE)
+                self._set_ui_state(OverlayState.IDLE)
             else:
                 self._hotkey.stop()
                 if self._command_hotkey is not None:
@@ -979,7 +1047,7 @@ class Engine:
                 # to be listening while the hotkey was still disarmed. IDLE
                 # renders its detail text as the label, so this reads
                 # "Paused" and stays there until resumed.
-                self._overlay.set_state(OverlayState.IDLE, detail="Paused")
+                self._set_ui_state(OverlayState.IDLE, detail="Paused")
             logger.info("dictation %s", "resumed" if listening else "paused")
         except Exception:
             logger.exception("could not change the listening state")
@@ -999,27 +1067,78 @@ class Engine:
             "data_directory": str(self._config.data_dir),
         }
 
+    def _ensure_dashboard(self) -> DashboardServer | None:
+        """Start the loopback server if it is not already up. Never raises.
+
+        Started eagerly at :meth:`start` rather than on the first tray click,
+        because D1's second-launch focus needs a port to advertise from the
+        moment the app is running -- a user who double-clicks the icon again
+        has not necessarily opened the dashboard first.
+        """
+        if self._dashboard is not None:
+            return self._dashboard
+        try:
+            server = DashboardServer(
+                history_db=self._config.history_db_path,
+                latency_db=self._config.latency_db_path,
+                typing_wpm=self._config.analytics.typing_wpm,
+                control=EngineControl(
+                    is_listening=lambda: self.is_listening,
+                    set_listening=self.set_listening,
+                    describe=self.describe,
+                    focus=self._focus_from_second_launch,
+                ),
+            )
+            server.start()
+        except Exception:
+            logger.exception("could not start the dashboard server")
+            return None
+        self._dashboard = server
+        return server
+
+    def _publish_instance(self) -> None:
+        """Advertise this instance so a second launch can focus it."""
+        server = self._ensure_dashboard()
+        if server is None:
+            logger.info("no dashboard server; a second launch will show a dialog instead")
+            return
+        instance.publish(
+            self._config.data_dir,
+            port=server.port,
+            token=server.token,
+            url=server.url,
+        )
+
+    def _focus_from_second_launch(self) -> None:
+        """Someone double-clicked Flow while it was already running.
+
+        Runs on the dashboard's HTTP thread. Opening the dashboard is the
+        most useful interpretation of "show me the app": the tray icon is
+        already visible, so simply raising that would look like nothing
+        happened.
+        """
+        logger.info("second launch asked us to come forward")
+        try:
+            self._open_dashboard()
+        except Exception:
+            logger.exception("could not come forward for a second launch")
+
     def _open_dashboard(self) -> None:
-        """Start the dashboard server on first use, then open the browser.
+        """Open the dashboard in the browser, starting the server if needed.
 
         Best-effort, like the tray: a dashboard that fails to start logs and
         leaves dictation completely unaffected.
+
+        D2 replaces the ``webbrowser.open`` here with a pywebview window; the
+        server and its URL stay exactly as they are (see PRODUCTION_BRIEF.md,
+        where the loopback transport is a decided point rather than an open
+        one).
         """
+        server = self._ensure_dashboard()
+        if server is None:
+            return
         try:
-            if self._dashboard is None:
-                server = DashboardServer(
-                    history_db=self._config.history_db_path,
-                    latency_db=self._config.latency_db_path,
-                    typing_wpm=self._config.analytics.typing_wpm,
-                    control=EngineControl(
-                        is_listening=lambda: self.is_listening,
-                        set_listening=self.set_listening,
-                        describe=self.describe,
-                    ),
-                )
-                server.start()
-                self._dashboard = server
-            webbrowser.open(self._dashboard.url)
+            webbrowser.open(server.url)
         except Exception:
             logger.exception("could not open the dashboard")
 

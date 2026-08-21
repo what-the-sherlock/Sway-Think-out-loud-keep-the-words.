@@ -21,14 +21,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
+from flow.analytics import SessionMetrics, count_words
 from flow.errors import HistoryStoreError
 
 logger = logging.getLogger(__name__)
 
 #: Bump together with a migration in ``_migrate``.
-SCHEMA_VERSION = 1
+#: v2 adds the product-layer columns: the ``run_id`` join key into
+#: latency.db, the derived per-session metrics (see :mod:`flow.analytics`),
+#: and the corrections table.
+SCHEMA_VERSION = 2
 
-_SCHEMA = """
+_SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS history_entries (
     id              TEXT    PRIMARY KEY,
     created_at      REAL    NOT NULL,
@@ -40,6 +44,33 @@ CREATE TABLE IF NOT EXISTS history_entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_history_created_at ON history_entries(created_at);
+"""
+
+#: v1 -> v2. Every ADD COLUMN is nullable with no default, so existing rows
+#: keep working and simply report "not available" for the metrics that were
+#: never measured for them -- which is the honest answer, not zero.
+_MIGRATION_V2 = """
+ALTER TABLE history_entries ADD COLUMN run_id TEXT;
+ALTER TABLE history_entries ADD COLUMN word_count INTEGER;
+ALTER TABLE history_entries ADD COLUMN character_count INTEGER;
+ALTER TABLE history_entries ADD COLUMN audio_ms REAL;
+ALTER TABLE history_entries ADD COLUMN speech_ms REAL;
+ALTER TABLE history_entries ADD COLUMN wpm REAL;
+ALTER TABLE history_entries ADD COLUMN time_saved_s REAL;
+ALTER TABLE history_entries ADD COLUMN language TEXT;
+ALTER TABLE history_entries ADD COLUMN status TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_history_run_id ON history_entries(run_id);
+
+CREATE TABLE IF NOT EXISTS corrections (
+    id         TEXT PRIMARY KEY,
+    entry_id   TEXT REFERENCES history_entries(id) ON DELETE CASCADE,
+    original   TEXT NOT NULL,
+    corrected  TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_corrections_original ON corrections(original);
 """
 
 #: [history].kind values.
@@ -63,6 +94,21 @@ class HistoryEntry:
     #: The spoken instruction, for a command entry only.
     instruction: str | None = None
     focused_process: str | None = None
+    #: Joins to ``runs.id`` in latency.db, giving this entry its full stage
+    #: breakdown. ``None`` for entries written before schema v2.
+    run_id: str | None = None
+    #: Derived metrics, computed once at record time by
+    #: :func:`flow.analytics.session_metrics` because they depend on audio the
+    #: app deliberately does not keep. ``None`` means "never measured" and
+    #: must be rendered as such, never as zero.
+    word_count: int | None = None
+    character_count: int | None = None
+    audio_ms: float | None = None
+    speech_ms: float | None = None
+    wpm: float | None = None
+    time_saved_s: float | None = None
+    language: str | None = None
+    status: str | None = None
 
 
 class HistoryStore:
@@ -120,9 +166,33 @@ class HistoryStore:
             )
         if version == SCHEMA_VERSION:
             return
-        # v0 -> v1 is initial creation. Future migrations append here.
-        self._conn.executescript(_SCHEMA)
+        # Migrations run in order from whatever version this database is at.
+        # executescript manages its own transaction per call; each step is
+        # idempotent (IF NOT EXISTS) except the ALTERs, which only run on the
+        # one version step that introduces them.
+        if version < 1:
+            self._conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            self._conn.executescript(_MIGRATION_V2)
+            self._backfill_v2_counts()
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _backfill_v2_counts(self) -> None:
+        """Recover the v2 metrics that are derivable from data already stored.
+
+        Word and character counts come straight from the saved text, so old
+        entries can report them truthfully. Speaking rate and time saved
+        cannot: both need the clip's speech duration, which pre-v2 builds
+        never recorded and which cannot be reconstructed from text. Those stay
+        NULL, and the dashboard shows them as unavailable -- inventing a
+        plausible-looking number for them is exactly the failure mode this
+        product must not have.
+        """
+        rows = self._conn.execute("SELECT id, text FROM history_entries").fetchall()
+        self._conn.executemany(
+            "UPDATE history_entries SET word_count = ?, character_count = ? WHERE id = ?",
+            [(count_words(row["text"]), len(row["text"]), row["id"]) for row in rows],
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -147,6 +217,10 @@ class HistoryStore:
         instruction: str | None = None,
         focused_process: str | None = None,
         created_at: float | None = None,
+        run_id: str | None = None,
+        metrics: "SessionMetrics | None" = None,
+        language: str | None = None,
+        status: str | None = None,
     ) -> HistoryEntry:
         """Record one dictation or command. Returns the stored entry."""
         entry = HistoryEntry(
@@ -157,13 +231,24 @@ class HistoryStore:
             raw_text=raw_text,
             instruction=instruction,
             focused_process=focused_process,
+            run_id=run_id,
+            word_count=metrics.word_count if metrics else None,
+            character_count=metrics.character_count if metrics else None,
+            audio_ms=metrics.audio_ms if metrics else None,
+            speech_ms=metrics.speech_ms if metrics else None,
+            wpm=metrics.wpm if metrics else None,
+            time_saved_s=metrics.time_saved_s if metrics else None,
+            language=language,
+            status=status,
         )
         try:
             with self._lock:
                 self._conn.execute(
                     "INSERT INTO history_entries"
-                    " (id, created_at, kind, text, raw_text, instruction, focused_process)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " (id, created_at, kind, text, raw_text, instruction, focused_process,"
+                    "  run_id, word_count, character_count, audio_ms, speech_ms, wpm,"
+                    "  time_saved_s, language, status)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entry.id,
                         entry.created_at,
@@ -172,6 +257,15 @@ class HistoryStore:
                         entry.raw_text,
                         entry.instruction,
                         entry.focused_process,
+                        entry.run_id,
+                        entry.word_count,
+                        entry.character_count,
+                        entry.audio_ms,
+                        entry.speech_ms,
+                        entry.wpm,
+                        entry.time_saved_s,
+                        entry.language,
+                        entry.status,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -258,6 +352,57 @@ class HistoryStore:
             raise HistoryStoreError(f"could not count history entries: {exc}") from exc
 
 
+    # -- corrections -----------------------------------------------------
+
+    def add_correction(
+        self,
+        *,
+        original: str,
+        corrected: str,
+        entry_id: str | None = None,
+        created_at: float | None = None,
+    ) -> str:
+        """Record that ``original`` was fixed to ``corrected``. Returns the id.
+
+        Recorded explicitly (from the session detail view) rather than
+        inferred: Flow cannot see what the user edits after the paste lands
+        in another application, and guessing from clipboard activity would
+        manufacture data the dashboard then presents as measured fact.
+        """
+        correction_id = uuid.uuid4().hex
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO corrections (id, entry_id, original, corrected, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        correction_id,
+                        entry_id,
+                        original,
+                        corrected,
+                        time.time() if created_at is None else created_at,
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise HistoryStoreError(f"could not record correction: {exc}") from exc
+        return correction_id
+
+    def frequent_corrections(self, *, limit: int = 20) -> list[tuple[str, str, int]]:
+        """``(original, corrected, count)`` triples, most-corrected first --
+        the raw material for the "add all to dictionary" suggestion.
+        """
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT original, corrected, COUNT(*) AS n FROM corrections"
+                    " GROUP BY original, corrected ORDER BY n DESC, original ASC LIMIT ?",
+                    (max(0, limit),),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise HistoryStoreError(f"could not read corrections: {exc}") from exc
+        return [(row["original"], row["corrected"], int(row["n"])) for row in rows]
+
+
 def _escape_like(text: str) -> str:
     """Escape SQLite LIKE metacharacters so a search term is matched literally."""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -272,6 +417,15 @@ def _row_to_entry(row: sqlite3.Row) -> HistoryEntry:
         raw_text=row["raw_text"],
         instruction=row["instruction"],
         focused_process=row["focused_process"],
+        run_id=row["run_id"],
+        word_count=row["word_count"],
+        character_count=row["character_count"],
+        audio_ms=row["audio_ms"],
+        speech_ms=row["speech_ms"],
+        wpm=row["wpm"],
+        time_saved_s=row["time_saved_s"],
+        language=row["language"],
+        status=row["status"],
     )
 
 

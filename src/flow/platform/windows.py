@@ -71,6 +71,8 @@ _kernel32.QueryFullProcessImageNameW.argtypes = [
 _kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.GetExitCodeProcess.restype = wintypes.BOOL
 _kernel32.GetCurrentProcess.argtypes = []
 _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
 _advapi32.OpenProcessToken.argtypes = [
@@ -98,6 +100,10 @@ _MB_ICONINFORMATION = 0x00000040
 _MB_SETFOREGROUND = 0x00010000
 _MB_TOPMOST = 0x00040000
 _ERROR_ALREADY_EXISTS = 183
+#: GetExitCodeProcess returns this while a process is still running.
+_STILL_ACTIVE = 259
+#: HKCU key Windows runs at every interactive logon.
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 #: Holds the single-instance mutex for the process lifetime. A mutex is
 #: released when its last handle closes, so this reference must outlive the
@@ -356,6 +362,72 @@ class WindowsPlatform:
         except OSError:
             logger.debug("could not acquire the single-instance lock", exc_info=True)
             return True
+
+
+    # -- D1: instance liveness and launch-at-login -------------------------
+
+    def process_is_running(self, pid: int) -> bool:
+        """Whether ``pid`` is live, via ``OpenProcess``.
+
+        Fails closed. ``OpenProcess`` succeeding is not quite sufficient on
+        its own -- a handle can still be opened to a process that has exited
+        but whose object is kept alive by an outstanding handle -- so the
+        exit code is checked too: ``STILL_ACTIVE`` means genuinely running.
+        """
+        if pid <= 0:
+            return False
+        handle = None
+        try:
+            handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            code = wintypes.DWORD()
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == _STILL_ACTIVE
+        except OSError:
+            logger.debug("could not test whether pid %d is running", pid, exc_info=True)
+            return False
+        finally:
+            if handle:
+                _kernel32.CloseHandle(handle)
+
+    def set_launch_at_login(self, app_name: str, command: str | None) -> bool:
+        """Write or delete this app's ``HKCU\\...\\Run`` value.
+
+        HKCU rather than HKLM on purpose: HKLM needs administrator rights,
+        which CLAUDE.md's "no admin" rule rules out, and a dictation tool is
+        a per-user thing anyway.
+        """
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                if command is None:
+                    try:
+                        winreg.DeleteValue(key, app_name)
+                    except FileNotFoundError:
+                        pass  # already absent; the requested state is the state
+                else:
+                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, command)
+            return True
+        except OSError:
+            logger.warning("could not update launch-at-login for %s", app_name, exc_info=True)
+            return False
+
+    def launches_at_login(self, app_name: str) -> bool:
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_QUERY_VALUE
+            ) as key:
+                value, _kind = winreg.QueryValueEx(key, app_name)
+        except OSError:
+            return False
+        return bool(value)
 
 
 __all__ = ["WindowsPlatform"]

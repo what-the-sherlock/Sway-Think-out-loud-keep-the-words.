@@ -52,12 +52,37 @@ def mark_image(size: int, color: tuple[int, int, int, int] = (255, 255, 255, 255
     return solid
 
 
+#: Mark colour per tray state (D1). Keyed by :class:`~flow.tray.TrayState`'s
+#: string values, but typed as plain ``str`` so branding stays importable
+#: without pulling in the tray (and its pystray dependency).
+#:
+#: The whole mark is tinted rather than a status dot being added in a corner:
+#: a notification-area icon is drawn at 16px, where a corner dot is about four
+#: pixels and effectively invisible. ``disabled`` uses the muted idle grey
+#: rather than a fifth accent, so "paused" reads as absence of colour rather
+#: than as another status hue competing with the four real ones.
+_STATE_COLORS: dict[str, tuple[int, int, int]] = {
+    "idle": INK,
+    "listening": ACCENT_RECORDING,
+    "processing": ACCENT_THINKING,
+    "error": ACCENT_ERROR,
+    "disabled": ACCENT_IDLE,
+}
+
+
 @lru_cache(maxsize=16)
-def app_badge_image(size: int, *, corner_ratio: float = 0.32) -> Image.Image:
+def app_badge_image(
+    size: int, *, corner_ratio: float = 0.32, state: str | None = None
+) -> Image.Image:
     """A square app badge: a rounded-corner tile in :data:`SURFACE_RAISED`
-    with the mark centered on it, in :data:`INK`. Used everywhere the app
-    needs one static icon rather than a live-rendered overlay frame -- the
-    tray icon and window title-bar icons.
+    with the mark centered on it. Used everywhere the app needs one static
+    icon rather than a live-rendered overlay frame -- the tray icon and
+    window title-bar icons.
+
+    ``state`` tints the mark to show engine status in the notification area
+    (see :data:`_STATE_COLORS`). ``None``, and any unrecognised value, gives
+    the neutral :data:`INK` mark -- an unknown state must still render an
+    icon, since the alternative is no tray icon at all.
 
     Rendered at 4x and downsampled for anti-aliased edges: ``ImageDraw``'s
     primitives are hard-edged at native resolution, which reads as cheap at
@@ -71,7 +96,8 @@ def app_badge_image(size: int, *, corner_ratio: float = 0.32) -> Image.Image:
     ImageDraw.Draw(canvas).rounded_rectangle(
         (0, 0, big - 1, big - 1), radius=round(big * corner_ratio), fill=(*SURFACE_RAISED, 255)
     )
-    mark = mark_image(round(big * 0.62), color=(*INK, 255))
+    color = _STATE_COLORS.get(state or "", INK)
+    mark = mark_image(round(big * 0.62), color=(*color, 255))
     canvas.alpha_composite(mark, ((big - mark.width) // 2, (big - mark.height) // 2))
     return canvas.resize((size, size), Image.LANCZOS)
 

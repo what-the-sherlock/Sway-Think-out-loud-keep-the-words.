@@ -287,6 +287,20 @@ class HistoryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalyticsConfig:
+    """The productivity numbers the dashboard reports. See flow.analytics.
+
+    ``typing_wpm`` is an *assumption*, not a measurement: it is the baseline
+    the time-saved estimate compares dictation against. It lives in config
+    precisely so the user can set it to their own typing speed, and anything
+    derived from it must be labelled an estimate in the UI.
+    """
+
+    #: Baseline typing speed for the time-saved estimate, in words per minute.
+    typing_wpm: float = 45.0
+
+
+@dataclass(frozen=True, slots=True)
 class TrayConfig:
     """The system tray icon and menu (Phase 5). See flow.tray.
 
@@ -328,6 +342,7 @@ class Config:
     streaming: StreamingConfig
     commands: CommandsConfig
     history: HistoryConfig
+    analytics: AnalyticsConfig
     tray: TrayConfig
     paste: PasteConfig
     overlay: OverlayConfig
@@ -363,6 +378,7 @@ class Config:
             ("streaming", StreamingConfig, self.streaming),
             ("commands", CommandsConfig, self.commands),
             ("history", HistoryConfig, self.history),
+            ("analytics", AnalyticsConfig, self.analytics),
             ("tray", TrayConfig, self.tray),
             ("paste", PasteConfig, self.paste),
             ("overlay", OverlayConfig, self.overlay),
@@ -585,6 +601,8 @@ def _validate(config: Config) -> None:
         raise ConfigError("[logging].file_backup_count must be >= 0")
     if config.latency.retention_days < 0:
         raise ConfigError("[latency].retention_days must be >= 0")
+    if config.analytics.typing_wpm <= 0:
+        raise ConfigError("[analytics].typing_wpm must be > 0")
     if config.latency.queue_size < 1:
         raise ConfigError("[latency].queue_size must be >= 1")
     if config.latency.batch_size < 1:
@@ -711,6 +729,7 @@ def load_config(
         "streaming": StreamingConfig,
         "commands": CommandsConfig,
         "history": HistoryConfig,
+        "analytics": AnalyticsConfig,
         "tray": TrayConfig,
         "paste": PasteConfig,
         "overlay": OverlayConfig,
@@ -749,6 +768,9 @@ def load_config(
         ),
         commands=_build_section(CommandsConfig, table.get("commands") or {}, merged_env, "commands"),
         history=_build_section(HistoryConfig, table.get("history") or {}, merged_env, "history"),
+        analytics=_build_section(
+            AnalyticsConfig, table.get("analytics") or {}, merged_env, "analytics"
+        ),
         tray=_build_section(TrayConfig, table.get("tray") or {}, merged_env, "tray"),
         paste=_build_section(PasteConfig, table.get("paste") or {}, merged_env, "paste"),
         overlay=_build_section(OverlayConfig, table.get("overlay") or {}, merged_env, "overlay"),
@@ -759,6 +781,7 @@ def load_config(
 
 
 __all__ = [
+    "AnalyticsConfig",
     "AudioConfig",
     "CleanupConfig",
     "CommandsConfig",

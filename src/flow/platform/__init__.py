@@ -65,6 +65,27 @@ class PlatformAdapter(Protocol):
         ``True`` (fails open, allowing the launch) if locking is unsupported
         or errors, since refusing to start is the worse failure."""
 
+    def process_is_running(self, pid: int) -> bool:
+        """Whether ``pid`` names a live process.
+
+        Used to decide whether ``instance.json`` still describes a running
+        instance (:mod:`flow.instance`). Fails **closed** -- returns ``False``
+        when it cannot tell -- which is the opposite of most adapter methods
+        here and deliberate: a wrong ``True`` means sending this instance's
+        auth token to whatever process now holds that recycled port, while a
+        wrong ``False`` costs only the focus nicety."""
+
+    def set_launch_at_login(self, app_name: str, command: str | None) -> bool:
+        """Register or clear a login-time launch for ``app_name``.
+
+        ``command`` is the command line to run, or ``None`` to remove the
+        entry. Returns whether the change was applied. Best-effort: never
+        raises, since a settings toggle must not be able to crash the app."""
+
+    def launches_at_login(self, app_name: str) -> bool:
+        """Whether a login-time launch is currently registered. ``False`` when
+        unsupported or unreadable."""
+
     def paste_likely_blocked(self) -> bool:
         """True only when the caller can be confident a synthetic paste
         (:meth:`send_paste`) would silently do nothing -- e.g. the foreground
