@@ -146,6 +146,18 @@ class TrayIcon:
         self._thread.start()
         return True
 
+    def _run(self) -> None:
+        """The pystray loop, on its own thread.
+
+        Wrapped so a backend that dies takes the tray icon down and nothing
+        else: the engine holds no reference to this thread's outcome, and
+        dictation does not depend on the tray existing.
+        """
+        try:
+            self._icon.run()
+        except Exception:
+            logger.exception("tray icon loop failed")
+
     # -- state -------------------------------------------------------------
 
     def set_state(self, state: TrayState) -> None:
