@@ -111,6 +111,29 @@ class PosixPlatform:
         """
         return False
 
+    def open_url(self, url: str) -> bool:
+        """``webbrowser`` first, then ``xdg-open``/``open`` directly."""
+        import webbrowser
+
+        try:
+            if webbrowser.open(url):
+                return True
+        except Exception:
+            pass
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        if shutil.which(opener) is None:
+            return False
+        try:
+            subprocess.Popen(
+                [opener, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except OSError:
+            return False
+        return True
+
     def process_is_running(self, pid: int) -> bool:
         """Signal 0 probes for existence without delivering anything.
 

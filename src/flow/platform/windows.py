@@ -364,7 +364,57 @@ class WindowsPlatform:
             return True
 
 
-    # -- D1: instance liveness and launch-at-login -------------------------
+    # -- D1: opening a URL, instance liveness, launch-at-login -------------
+
+    def open_url(self, url: str) -> bool:
+        """Three mechanisms, each logged, because this failed silently once.
+
+        ``webbrowser.open`` is first because it honours the user's configured
+        browser. It returns ``False`` (never raises) when it cannot find one,
+        and in a frozen windowed build that is a real possibility, so
+        ``os.startfile`` -- the Win32 shell association, which is what
+        ``WindowsDefault`` wraps anyway but reached directly -- is tried
+        next. ``cmd /c start`` is the last resort for the case where the
+        shell association exists but ``startfile`` refuses the URL.
+
+        Every attempt logs at DEBUG and the overall failure logs at WARNING,
+        so "nothing happened" can never again be indistinguishable from
+        "never tried".
+        """
+        import webbrowser
+
+        try:
+            if webbrowser.open(url):
+                logger.debug("opened %s via webbrowser", url)
+                return True
+            logger.debug("webbrowser.open found no browser for %s", url)
+        except Exception:
+            logger.debug("webbrowser.open raised for %s", url, exc_info=True)
+
+        try:
+            os.startfile(url)  # noqa: S606 - a loopback URL we constructed
+            logger.debug("opened %s via os.startfile", url)
+            return True
+        except OSError:
+            logger.debug("os.startfile could not open %s", url, exc_info=True)
+
+        try:
+            import subprocess
+
+            # DETACHED_PROCESS: this runs from the tray thread of a windowed
+            # build with no console, and inheriting a null console handle is
+            # what makes the naive version fail. `start` needs the empty
+            # first argument, which it treats as the window title.
+            subprocess.Popen(  # noqa: S602 - fixed argv, no shell interpolation of url
+                ["cmd", "/c", "start", "", url],
+                creationflags=0x00000008 | 0x08000000,  # DETACHED | NO_WINDOW
+                close_fds=True,
+            )
+            logger.debug("opened %s via cmd start", url)
+            return True
+        except Exception:
+            logger.warning("could not open %s in a browser by any method", url, exc_info=True)
+        return False
 
     def process_is_running(self, pid: int) -> bool:
         """Whether ``pid`` is live, via ``OpenProcess``.

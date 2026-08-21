@@ -65,6 +65,16 @@ class PlatformAdapter(Protocol):
         ``True`` (fails open, allowing the launch) if locking is unsupported
         or errors, since refusing to start is the worse failure."""
 
+    def open_url(self, url: str) -> bool:
+        """Open ``url`` in the user's default browser. ``True`` if something
+        was launched.
+
+        Not just ``webbrowser.open``: that returns ``False`` rather than
+        raising when it cannot find a browser, so a caller who ignores the
+        result gets a silent no-op -- which is exactly how "Open Dashboard"
+        appeared to do nothing at all. Implementations must try more than one
+        mechanism and must never raise."""
+
     def process_is_running(self, pid: int) -> bool:
         """Whether ``pid`` names a live process.
 

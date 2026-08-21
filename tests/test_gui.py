@@ -84,9 +84,31 @@ def test_explicit_arguments_are_passed_through_untouched(
 # -- single instance ---------------------------------------------------------
 
 
-def test_second_instance_exits_cleanly_with_an_explanation(monkeypatch: pytest.MonkeyPatch):
+def _blocked_second_launch(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """A second launch that cannot take the lock, isolated from the machine.
+
+    ``data_dir`` is redirected at a tmp_path: without this the test reads the
+    *real* ``%LOCALAPPDATA%\\Flow\\instance.json``, so it passes or fails
+    depending on whether the developer happens to have Flow running -- which
+    is exactly how this test first broke.
+    """
     fake = FakePlatform(lock_available=False)
     monkeypatch.setattr(gui, "get_platform", lambda: fake)
+
+    from flow import instance as instance_module
+
+    class _Config:
+        data_dir = tmp_path
+
+    monkeypatch.setattr("flow.config.load_config", lambda *a, **k: _Config())
+    return fake, instance_module
+
+
+def test_second_instance_with_no_advertisement_explains_itself(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """No instance.json: an older first instance, or one still starting."""
+    fake, _ = _blocked_second_launch(monkeypatch, tmp_path)
     calls = _patch_cli(monkeypatch, 0)
 
     # Exit code 0, not an error: a second launch is a user mistake, not a
@@ -96,6 +118,54 @@ def test_second_instance_exits_cleanly_with_an_explanation(monkeypatch: pytest.M
     title, text, is_error = fake.messages[0]
     assert "already running" in text.lower()
     assert is_error is False
+
+
+def test_second_instance_that_focuses_the_first_says_nothing_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """Silence is the success case.
+
+    The first instance has come forward, so a dialog on top of it saying
+    "already running" would be pure noise.
+    """
+    fake, instance_module = _blocked_second_launch(monkeypatch, tmp_path)
+    calls = _patch_cli(monkeypatch, 0)
+
+    info = instance_module.InstanceInfo(pid=4321, port=5000, token="t", url="http://x")
+    monkeypatch.setattr(instance_module, "read", lambda *a, **k: info)
+    monkeypatch.setattr(
+        instance_module, "request_focus", lambda *a, **k: instance_module.FocusResult.FOCUSED
+    )
+
+    assert gui.main_windowed([]) == 0
+    assert calls == []
+    assert fake.messages == []
+
+
+def test_second_instance_reports_an_unresponsive_first_instance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """Alive and advertised but not answering: the one case the user must act
+    on, so it is an error dialog naming the process -- and never a silent
+    kill, since this also covers a first instance merely busy mid-dictation.
+    """
+    fake, instance_module = _blocked_second_launch(monkeypatch, tmp_path)
+    calls = _patch_cli(monkeypatch, 0)
+
+    info = instance_module.InstanceInfo(pid=4321, port=5000, token="t", url="http://x")
+    monkeypatch.setattr(instance_module, "read", lambda *a, **k: info)
+    monkeypatch.setattr(
+        instance_module,
+        "request_focus",
+        lambda *a, **k: instance_module.FocusResult.UNRESPONSIVE,
+    )
+
+    assert gui.main_windowed([]) == 1
+    assert calls == []
+    title, text, is_error = fake.messages[0]
+    assert "4321" in text
+    assert "not responding" in text.lower()
+    assert is_error is True
 
 
 def test_the_instance_lock_is_taken_before_anything_else(

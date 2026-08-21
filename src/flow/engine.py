@@ -35,9 +35,9 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 
+from flow import APP_NAME, instance
 from flow.audio.capture import AudioCapture
 from flow.analytics import SessionMetrics, pcm_duration_ms, session_metrics
-import webbrowser
 
 from flow.audio.flac import encode_flac
 from flow.audio.ring_buffer import RingBuffer
@@ -65,7 +65,6 @@ from flow.groq_client import (
 from flow.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 from flow.history_window import HistoryWindow
 from flow.hotkey import KNOWN_KEYS, HotkeyListener
-from flow import instance
 from flow.inject import TextInjector
 from flow.latency.models import Stage
 from flow.latency.tracker import LatencyTracker, RunRecorder
@@ -359,7 +358,7 @@ class Engine:
                     APP_NAME, f"No log file yet.\n\nIt will appear at:\n{path}"
                 )
                 return
-            webbrowser.open(path.as_uri())
+            self._platform.open_url(path.as_uri())
         except Exception:
             logger.exception("could not open the log file")
 
@@ -1136,11 +1135,29 @@ class Engine:
         """
         server = self._ensure_dashboard()
         if server is None:
+            self._platform.show_message(
+                APP_NAME,
+                "The dashboard could not start.\n\n"
+                f"Details are in:\n{self._config.log_file_path}",
+                error=True,
+            )
             return
-        try:
-            webbrowser.open(server.url)
-        except Exception:
-            logger.exception("could not open the dashboard")
+        # Logged before the attempt, so "the menu item did nothing" can be
+        # told apart from "the browser refused to open" in the log alone.
+        logger.info("opening the dashboard at %s", server.url)
+        if self._platform.open_url(server.url):
+            return
+        # Every mechanism failed. The server is running and reachable, so the
+        # URL is still useful -- show it rather than leaving the click looking
+        # like it did nothing. D2 removes this path entirely by rendering the
+        # dashboard in its own window instead of a browser.
+        self._platform.show_message(
+            APP_NAME,
+            "Flow could not open your browser.\n\n"
+            "The dashboard is running. Copy this address into a browser:\n\n"
+            f"{server.url}",
+            error=True,
+        )
 
     # -- history (Phase 5) -------------------------------------------------
 
