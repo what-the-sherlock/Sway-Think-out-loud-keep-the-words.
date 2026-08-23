@@ -192,6 +192,7 @@ const state = {
   insightsTab: 'usage',
   settingsTab: 'general',
   snippetQuery: '',
+  dictScope: 'all',
   lastDeleted: null,
 };
 
@@ -403,34 +404,82 @@ views.history = {
 views.dictionary = {
   async load() { state.dictionary = await api('/api/dictionary'); },
   render() {
-    const terms = state.dictionary.terms || [];
+    const entries = state.dictionary.entries || [];
     if (!state.dictionary.available) {
       return `<h1 class="page-title">Dictionary</h1>
         <div style="margin-top:26px">${nothingFound('The dictionary is not available in this window.')}</div>`;
     }
 
-    const body = terms.length
-      ? `<div class="chips" style="display:flex;flex-wrap:wrap;gap:9px">
-           ${terms.map((t) => `<span class="chip"><span class="txt">${esc(t)}</span><span class="x" data-act="remove-term" data-term="${esc(t)}">×</span></span>`).join('')}
-         </div>`
-      : hero({
+    if (!entries.length) {
+      return `<h1 class="page-title">Dictionary</h1>
+        <div style="margin-top:26px">${hero({
           title: 'Sway spells the way you do.',
-          body: 'Add names, jargon, and product words Sway keeps getting wrong. They are sent to the transcriber as a hint, so it knows to expect them.',
+          body: 'Add names, jargon, and product words Sway keeps getting wrong. They are sent '
+              + 'to the transcriber as a hint, so it knows to expect them. Sway also picks up '
+              + 'names you dictate often, and shows you what it learned.',
           chips: ['Ashwini', 'Groq', 'Kubernetes', 'Mayfair'].map(
             (w) => `<span class="chip on-dark">${esc(w)}</span>`),
           action: { act: 'add-term', label: 'Add a word' },
-        });
+        })}</div>`;
+    }
+
+    const scope = state.dictScope || 'all';
+    const counts = {
+      all: entries.length,
+      manual: entries.filter((e) => e.source === 'manual').length,
+      learned: entries.filter((e) => e.source === 'learned').length,
+      shared: entries.filter((e) => e.source === 'shared').length,
+    };
+    // Only offer a filter that would actually show something. An empty
+    // "Learned" tab teaches the user nothing except that it is empty.
+    const tabs = [['all', 'All'], ['manual', 'Added by me'],
+                  ['learned', 'Learned'], ['shared', 'Shared']]
+      .filter(([id]) => id === 'all' || counts[id] > 0);
+
+    const shown = scope === 'all' ? entries : entries.filter((e) => e.source === scope);
 
     return `
       <div style="display:flex;align-items:center;gap:16px">
         <h1 class="page-title">Dictionary</h1>
         <div style="flex:1"></div>
+        <button class="btn" data-act="import-vocab">Import</button>
+        <button class="btn" data-act="export-vocab">Export</button>
         <button class="btn primary" data-act="add-term">${icon('plus')} Add new</button>
       </div>
-      <div class="small muted" style="margin-top:14px">${terms.length} term${terms.length === 1 ? '' : 's'} biasing transcription.</div>
-      <div style="margin-top:26px">${body}</div>`;
+      ${tabs.length > 1 ? `<div class="tabs">${tabs.map(([id, label]) =>
+        `<button class="tab ${scope === id ? 'active' : ''}" data-scope="${id}">${label} <span class="muted">${counts[id]}</span></button>`).join('')}</div>` : ''}
+      <div class="small muted" style="margin-top:14px">
+        ${entries.length} term${entries.length === 1 ? '' : 's'} biasing transcription.
+        Pin the ones that matter most — the transcriber only has room for a couple of hundred characters.
+      </div>
+      <div style="margin-top:24px">${shown.length ? termChips(shown) : nothingFound('Nothing here yet.')}</div>`;
+  },
+  bind(root) {
+    root.querySelectorAll('[data-scope]').forEach((tab) => {
+      tab.addEventListener('click', async () => {
+        state.dictScope = tab.dataset.scope;
+        await refresh();
+      });
+    });
   },
 };
+
+const SOURCE_LABEL = { manual: 'added by you', learned: 'learned from your dictation', shared: 'from a shared pack' };
+
+function termChips(entries) {
+  return `<div class="chips" style="display:flex;flex-wrap:wrap;gap:9px">
+    ${entries.map((e) => {
+      const used = e.hits ? `, said ${e.hits} time${e.hits === 1 ? '' : 's'}` : '';
+      const title = `${SOURCE_LABEL[e.source] || e.source}${used}`;
+      return `<span class="chip ${e.pinned ? 'selected' : ''}" title="${esc(title)}">
+        <span class="txt" style="cursor:pointer" data-act="pin-term"
+              data-term="${esc(e.term)}" data-pinned="${e.pinned ? '1' : ''}"
+          >${e.pinned ? '★ ' : ''}${esc(e.term)}</span>
+        <span class="x" data-act="remove-term" data-term="${esc(e.term)}">×</span>
+      </span>`;
+    }).join('')}
+  </div>`;
+}
 
 /* ---- Snippets ------------------------------------------------------------
 
@@ -856,6 +905,9 @@ function voicePanel() {
       </select>`)}
     ${settingRow('Remove filler words', 'Drops "um", "uh", and "you know" from the final text.',
       toggle(settings.remove_fillers !== false, 'data-act="set" data-field="remove_fillers"'))}
+    ${settingRow('Learn names I use often',
+      'Adds names and jargon you dictate repeatedly to your Dictionary. Everything it learns is listed there, and you can remove any of it.',
+      toggle(settings.auto_learn_vocabulary !== false, 'data-act="set" data-field="auto_learn_vocabulary"'))}
     <div style="margin-top:34px">
       <span class="meta-label">Input device</span>
       ${deviceList}
@@ -1332,6 +1384,74 @@ document.addEventListener('click', async (event) => {
         await post('/api/dictionary/remove', { terms: [target.dataset.term] });
         state.dictionary = null; await refresh();
         break;
+
+      case 'pin-term':
+        await post('/api/dictionary/pin', {
+          term: target.dataset.term,
+          pinned: !target.dataset.pinned,
+        });
+        state.dictionary = null; await refresh();
+        break;
+
+      case 'export-vocab': {
+        const pack = await api('/api/dictionary/export');
+        // Shown as text rather than pushed as a download: this runs in a
+        // webview where a file save can be refused outright, and a button
+        // that silently does nothing is worse than one that hands you the
+        // text to copy.
+        openModal({
+          title: 'Share your vocabulary',
+          body: `
+            <div class="small muted">Send this to a teammate and have them paste it into Import.
+              It carries only the words — not how often you use them, and not which you pinned.</div>
+            <textarea class="input mono selectable" id="v-pack" rows="9" readonly>${esc(JSON.stringify(pack, null, 2))}</textarea>`,
+          actions: `<div class="spacer"></div>
+            <button class="btn" data-act="close-modal">Done</button>
+            <button class="btn primary" data-act="copy-pack">${icon('copy')} Copy</button>`,
+        });
+        break;
+      }
+      case 'copy-pack':
+        try {
+          await navigator.clipboard.writeText(el('v-pack').value);
+          toast('Copied to the clipboard');
+        } catch {
+          el('v-pack').select();
+          toast('Select it and press Ctrl+C');
+        }
+        break;
+
+      case 'import-vocab':
+        openModal({
+          title: 'Import a vocabulary pack',
+          body: `
+            <div class="small muted">Paste a pack someone exported. Its words are added
+              alongside yours, labelled “shared”, and you can remove any of them.</div>
+            <textarea class="input mono" id="v-import" rows="9" placeholder='{"version": 1, "terms": ["..."]}'></textarea>
+            <div id="v-error" class="small" style="color:var(--red)"></div>`,
+          actions: `<div class="spacer"></div>
+            <button class="btn" data-act="close-modal">Cancel</button>
+            <button class="btn primary" data-act="save-import">Import</button>`,
+        });
+        break;
+      case 'save-import': {
+        const error = el('v-error');
+        let pack;
+        try {
+          pack = JSON.parse(el('v-import').value);
+        } catch {
+          error.textContent = 'That is not valid JSON — paste the whole pack, braces and all.';
+          break;
+        }
+        try {
+          const result = await post('/api/dictionary/import', { pack });
+          closeModal(); state.dictionary = null; await refresh();
+          toast(result.added
+            ? `Added ${result.added} term${result.added === 1 ? '' : 's'}`
+            : 'You already had every word in that pack');
+        } catch (err) { error.textContent = err.message; }
+        break;
+      }
 
       case 'pick-device': await saveSetting('audio_device', target.dataset.device || null); break;
       case 'edit-hotkey': hotkeyDialog(); break;

@@ -28,6 +28,7 @@ Threading model (see CLAUDE.md's architecture rules for why):
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
 import time
@@ -58,7 +59,12 @@ from sway.config import Config
 from sway.corrections import CorrectionScan
 from sway.corrections import scan as scan_corrections
 from sway.dashboard.server import DashboardServer, EngineControl
-from sway.dictionary import DictionaryStore, build_prompt_bias
+from sway.dictionary import (
+    DictionaryStore,
+    build_prompt_bias,
+    candidate_terms,
+    prioritise,
+)
 from sway.errors import (
     AudioError,
     ClipboardError,
@@ -92,6 +98,18 @@ from sway.tray import TrayIcon, TrayState
 from sway.window import AppWindow
 
 logger = logging.getLogger(__name__)
+
+
+def _mentions(text: str, term: str) -> bool:
+    """Whether ``term`` appears in ``text`` as whole words.
+
+    Case-insensitive, because the user typed "Kubernetes" and Whisper may well
+    have written "kubernetes". Word-bounded, so "API" is not counted as used
+    every time someone says "capability".
+    """
+    if not term.strip():
+        return False
+    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE) is not None
 
 
 def should_process(held_ms: float, min_hold_ms: int) -> bool:
@@ -891,6 +909,7 @@ class Engine:
             wpm=round(metrics.wpm, 1) if metrics.wpm is not None else "",
             time_saved_s=round(metrics.time_saved_s, 1),
         )
+        self._update_vocabulary(cleaned_text, transcript)
         self._record_history(
             kind=KIND_DICTATION,
             text=cleaned_text,
@@ -1123,11 +1142,16 @@ class Engine:
         if self._dictionary is None:
             return ""
         try:
-            terms = self._dictionary.list_terms()
+            entries = self._dictionary.list_entries()
         except DictionaryStoreError as exc:
             logger.warning("could not read the personal dictionary: %s", exc)
             return ""
-        return build_prompt_bias(terms, max_chars=self._config.dictionary.max_prompt_chars)
+        # Ordered before it is truncated. The budget is a couple of hundred
+        # characters, so with a real dictionary the order decides which terms
+        # get biased at all -- alphabetical would mean "whichever start with A".
+        return build_prompt_bias(
+            prioritise(entries), max_chars=self._config.dictionary.max_prompt_chars
+        )
 
     def _clean_up(
         self,
@@ -1207,6 +1231,37 @@ class Engine:
             correction_kinds=",".join(correction.kinds),
         )
         return cleaned_text
+
+    def _update_vocabulary(self, text: str, transcript: _Transcript) -> None:
+        """Count which dictionary terms were used, and learn new ones.
+
+        Runs *after* the paste, on the same post-injection block as the history
+        write, so none of it counts against the sub-second budget. Never
+        raises: vocabulary bookkeeping must not be able to fail a dictation
+        that has already succeeded.
+
+        Learning is gated on ``transcript.confident``. A word Whisper itself
+        was unsure of is the last thing that should be fed back in as a
+        transcription bias -- that is how a mishearing becomes permanent.
+        """
+        if self._dictionary is None or not text.strip():
+            return
+        try:
+            entries = self._dictionary.list_entries()
+            known = [entry.term for entry in entries]
+            used = [term for term in known if _mentions(text, term)]
+            if used:
+                self._dictionary.record_usage(used)
+
+            if not self._settings.get().auto_learn_vocabulary:
+                return
+            if not transcript.confident:
+                return
+            learned = self._dictionary.observe_candidates(candidate_terms(text, known=known))
+            if learned:
+                logger.info("learned %d new vocabulary term(s): %s", len(learned), ", ".join(learned))
+        except Exception:
+            logger.exception("could not update the personal dictionary")
 
     def _scan_corrections(self, text: str) -> CorrectionScan:
         """Look for spoken self-corrections. Never raises.

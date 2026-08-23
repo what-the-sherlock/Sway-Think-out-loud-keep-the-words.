@@ -261,6 +261,11 @@ class DashboardServer:
                 return self._dictionary()
             if path == "/api/devices":
                 return {"devices": _input_devices()}
+            if path == "/api/dictionary/export":
+                # A GET, because it produces a file and changes nothing. The
+                # UI turns it into a download client-side; the server never
+                # writes to disk on the user's behalf.
+                return actions.dictionary_export(self._require_dictionary())
         raise KeyError(path)
 
     # -- composite reads for the new UI ------------------------------------
@@ -331,10 +336,10 @@ class DashboardServer:
             from sway.dictionary import DictionaryStore
 
             with DictionaryStore.open(self._dictionary_db) as store:
-                return {"available": True, "terms": store.list_terms()}
+                return {"available": True, **actions.dictionary_payload(store)}
         except Exception as exc:
             logger.warning("could not read the dictionary: %s", exc)
-            return {"available": False, "terms": [], "error": str(exc)}
+            return {"available": False, "terms": [], "entries": [], "error": str(exc)}
 
     def _overview(self, q: DashboardQueries, params: Mapping[str, list[str]]) -> dict[str, Any]:
         range_key = _one(params, "range", "7d")
@@ -465,6 +470,10 @@ class DashboardServer:
             return actions.dictionary_add(self._require_dictionary(), payload)
         if path == "/api/dictionary/remove":
             return actions.dictionary_remove(self._require_dictionary(), payload)
+        if path == "/api/dictionary/pin":
+            return actions.dictionary_pin(self._require_dictionary(), payload)
+        if path == "/api/dictionary/import":
+            return actions.dictionary_import(self._require_dictionary(), payload)
 
         # -- history -------------------------------------------------------
         if path == "/api/history/delete":

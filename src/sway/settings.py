@@ -161,6 +161,10 @@ class Settings:
     #: Whether the cleanup pass strips "um"/"uh"/"you know". Off keeps them,
     #: for users who want a closer record of what they actually said.
     remove_fillers: bool = True
+    #: Whether names and jargon dictated repeatedly are added to the personal
+    #: dictionary on their own. Learned terms are always visible and
+    #: removable, so this is on by default.
+    auto_learn_vocabulary: bool = True
     #: User-defined zero-cost triggers.
     triggers: tuple[Trigger, ...] = ()
     #: Per-app cleanup style overrides, layered over :mod:`flow.profiles`.
@@ -294,6 +298,7 @@ _KNOWN_KEYS = {
     "onboarding_complete",
     "context_mode",
     "remove_fillers",
+    "auto_learn_vocabulary",
     "triggers",
     "app_rules",
 }
@@ -386,6 +391,11 @@ def parse(raw: Any) -> Settings:
             default=DEFAULTS.remove_fillers,
             name="remove_fillers",
         ),
+        auto_learn_vocabulary=_as_bool(
+            raw.get("auto_learn_vocabulary", DEFAULTS.auto_learn_vocabulary),
+            default=DEFAULTS.auto_learn_vocabulary,
+            name="auto_learn_vocabulary",
+        ),
         triggers=tuple(triggers),
         app_rules=tuple(rules),
         unknown={k: v for k, v in raw.items() if k not in _KNOWN_KEYS},
@@ -410,6 +420,7 @@ def to_dict(settings: Settings) -> dict[str, Any]:
         "onboarding_complete": settings.onboarding_complete,
         "context_mode": settings.context_mode,
         "remove_fillers": settings.remove_fillers,
+        "auto_learn_vocabulary": settings.auto_learn_vocabulary,
         "triggers": [asdict(t) for t in settings.triggers],
         "app_rules": [asdict(r) for r in settings.app_rules],
     }

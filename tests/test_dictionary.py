@@ -7,7 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from sway.dictionary import DictionaryStore, build_prompt_bias
+import sqlite3
+
+from sway.dictionary import (
+    SOURCE_LEARNED,
+    SOURCE_MANUAL,
+    SOURCE_SHARED,
+    DictionaryEntry,
+    DictionaryStore,
+    build_prompt_bias,
+    candidate_terms,
+    prioritise,
+)
 from sway.errors import DictionaryStoreError
 
 
@@ -180,3 +191,138 @@ def test_add_many_works_from_a_different_thread(db_path: Path):
 
         assert not error, f"cross-thread write raised: {error}"
         assert store.list_terms() == ["Anthropic"]
+
+
+# ---------------------------------------------------------------------------
+# v2: provenance, importance, usage, and learning
+# ---------------------------------------------------------------------------
+
+
+def test_a_v1_database_migrates_and_keeps_its_terms(db_path: Path) -> None:
+    """The migration runs against real user data, so losing a row here means
+    losing vocabulary someone typed in by hand."""
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.executescript(
+        "CREATE TABLE dictionary_entries (term TEXT PRIMARY KEY, added_at REAL NOT NULL);"
+    )
+    conn.execute("INSERT INTO dictionary_entries VALUES (?, ?)", ("Kubernetes", 1.0))
+    conn.execute("PRAGMA user_version=1")
+    conn.close()
+
+    with DictionaryStore.open(db_path) as store:
+        entries = store.list_entries()
+    assert [e.term for e in entries] == ["Kubernetes"]
+    # A pre-existing row was added by hand and never used. Anything else would
+    # be inventing history.
+    assert entries[0].source == SOURCE_MANUAL
+    assert entries[0].hits == 0
+    assert entries[0].pinned is False
+
+
+class TestPrioritise:
+    """Ordering for the prompt budget. This is not cosmetic: the budget is a
+    couple of hundred characters, so the order decides which terms reach the
+    transcriber at all."""
+
+    def test_pinned_terms_come_first(self) -> None:
+        entries = [
+            DictionaryEntry(term="Zebra", pinned=True),
+            DictionaryEntry(term="Apple", hits=99),
+        ]
+        assert prioritise(entries)[0] == "Zebra"
+
+    def test_then_the_terms_actually_used(self) -> None:
+        entries = [
+            DictionaryEntry(term="Never", hits=0),
+            DictionaryEntry(term="Often", hits=12),
+            DictionaryEntry(term="Sometimes", hits=3),
+        ]
+        assert prioritise(entries) == ["Often", "Sometimes", "Never"]
+
+    def test_ties_break_alphabetically_so_the_order_is_stable(self) -> None:
+        """A fresh dictionary has no usage at all. Without a final tiebreak the
+        order would depend on row order and the prompt would change between
+        runs for no reason."""
+        entries = [DictionaryEntry(term=t) for t in ("Delta", "alpha", "Charlie")]
+        assert prioritise(entries) == ["alpha", "Charlie", "Delta"]
+
+    def test_the_budget_keeps_what_matters_when_it_cannot_keep_everything(self) -> None:
+        entries = [
+            DictionaryEntry(term="Aardvark"),
+            DictionaryEntry(term="Barnacle"),
+            DictionaryEntry(term="Zeppelin", pinned=True),
+        ]
+        # Alphabetical order would spend the whole budget before reaching the
+        # pinned term. That was the v1 behaviour.
+        assert build_prompt_bias(prioritise(entries), max_chars=10) == "Zeppelin"
+
+
+class TestUsage:
+    def test_recording_usage_is_case_insensitive(self, db_path: Path) -> None:
+        """The user typed "Kubernetes"; Whisper may well produce "kubernetes"."""
+        with DictionaryStore.open(db_path) as store:
+            store.add_many(["Kubernetes"])
+            assert store.record_usage(["kubernetes"]) == 1
+            assert store.list_entries()[0].hits == 1
+
+    def test_pinning_an_unknown_term_reports_it(self, db_path: Path) -> None:
+        with DictionaryStore.open(db_path) as store:
+            assert store.set_pinned("Nope", True) is False
+
+
+class TestLearning:
+    def test_a_term_is_learned_only_after_the_threshold(self, db_path: Path) -> None:
+        with DictionaryStore.open(db_path) as store:
+            assert store.observe_candidates(["Samir"], threshold=3) == []
+            assert store.observe_candidates(["Samir"], threshold=3) == []
+            assert store.observe_candidates(["Samir"], threshold=3) == ["Samir"]
+            assert [e.source for e in store.list_entries()] == [SOURCE_LEARNED]
+
+    def test_a_learned_term_is_not_promoted_twice(self, db_path: Path) -> None:
+        with DictionaryStore.open(db_path) as store:
+            for _ in range(3):
+                store.observe_candidates(["Samir"], threshold=3)
+            assert store.observe_candidates(["Samir"], threshold=3) == []
+            assert len(store.list_entries()) == 1
+
+    def test_removing_a_term_clears_its_learning_progress(self, db_path: Path) -> None:
+        """Otherwise a word the user deliberately deleted comes straight back
+        on the very next sentence, which reads as the app overruling them."""
+        with DictionaryStore.open(db_path) as store:
+            for _ in range(3):
+                store.observe_candidates(["Samir"], threshold=3)
+            store.remove_many(["Samir"])
+            assert store.observe_candidates(["Samir"], threshold=3) == []
+
+    def test_an_existing_term_keeps_its_source(self, db_path: Path) -> None:
+        """A word typed by hand does not become "learned" because Sway later
+        saw it, and an import never relabels someone's own vocabulary."""
+        with DictionaryStore.open(db_path) as store:
+            store.add_many(["Paddle"], source=SOURCE_MANUAL)
+            store.add_many(["Paddle"], source=SOURCE_SHARED)
+            assert store.list_entries()[0].source == SOURCE_MANUAL
+
+
+class TestCandidateTerms:
+    def test_finds_mid_sentence_names_and_acronyms(self) -> None:
+        found = candidate_terms("We shipped Paddle for Samir using the GDPR endpoint.")
+        assert "Paddle" in found
+        assert "Samir" in found
+        assert "GDPR" in found
+
+    def test_ignores_sentence_openers(self) -> None:
+        """Whisper capitalises the first word of every sentence. Without this
+        every dictation would propose its own opening word as a proper noun."""
+        assert candidate_terms("Deploy the service. Everything passed.") == []
+
+    def test_ignores_words_already_known(self) -> None:
+        assert candidate_terms("We use Paddle here.", known=["paddle"]) == []
+
+    def test_ignores_grammatical_capitals(self) -> None:
+        assert candidate_terms("I think Monday works, and I will confirm.") == []
+
+    def test_does_not_propose_bare_numbers(self) -> None:
+        assert candidate_terms("Invoice 4471 was paid on the 9th.") == []
+
+    def test_reports_each_word_once(self) -> None:
+        assert candidate_terms("Samir met Samir and Samir.") == ["Samir"]

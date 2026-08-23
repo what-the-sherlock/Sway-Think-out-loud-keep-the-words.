@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sway import credentials
+from sway.dictionary import SOURCES
 from sway.settings import (
     CLEANUP_STYLES,
     CONTEXT_MODES,
@@ -119,6 +120,7 @@ _SIMPLE_FIELDS: dict[str, Any] = {
     "history_retention_days": lambda p: _require_int(p, "history_retention_days", low=0, high=3650),
     "latency_retention_days": lambda p: _require_int(p, "latency_retention_days", low=0, high=3650),
     "remove_fillers": lambda p: _require_bool(p, "remove_fillers"),
+    "auto_learn_vocabulary": lambda p: _require_bool(p, "auto_learn_vocabulary"),
 }
 
 
@@ -337,9 +339,13 @@ def dictionary_add(db_path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     if len(cleaned) > 500:
         raise ActionError("that is too many terms at once (limit 500)")
 
+    source = payload.get("source", "manual")
+    if source not in SOURCES:
+        raise ActionError(f"unknown source {source!r}")
+
     with DictionaryStore.open(db_path) as store:
-        added = store.add_many(cleaned)
-        return {"added": added, "terms": store.list_terms()}
+        added = store.add_many(cleaned, source=source)
+        return {"added": added, **dictionary_payload(store)}
 
 
 def dictionary_remove(db_path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -355,7 +361,90 @@ def dictionary_remove(db_path: Path, payload: Mapping[str, Any]) -> dict[str, An
 
     with DictionaryStore.open(db_path) as store:
         removed = store.remove_many(cleaned)
-        return {"removed": removed, "terms": store.list_terms()}
+        return {"removed": removed, **dictionary_payload(store)}
+
+
+def dictionary_pin(db_path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Mark a term important so it survives the prompt budget."""
+    from sway.dictionary import DictionaryStore
+
+    term = _require_str(payload, "term", max_chars=200)
+    pinned = _require_bool(payload, "pinned")
+    with DictionaryStore.open(db_path) as store:
+        if not store.set_pinned(term, pinned):
+            raise ActionError(f"{term!r} is not in the dictionary")
+        return dictionary_payload(store)
+
+
+def dictionary_export(db_path: Path) -> dict[str, Any]:
+    """A shareable vocabulary pack.
+
+    This is the whole of "team vocabulary" in a product with no accounts and no
+    server (CLAUDE.md: no server component). One person exports, the others
+    import; terms arrive labelled "shared" and can be removed like any other.
+    Nothing is uploaded, and nothing leaves the machine unless the user
+    deliberately hands someone the file.
+
+    Usage counts and pins are *not* exported. They describe how one person
+    works, and they are nobody else's business.
+    """
+    from sway.dictionary import DictionaryStore
+
+    with DictionaryStore.open(db_path) as store:
+        return {
+            "version": 1,
+            "exported_at": time.time(),
+            "terms": [entry.term for entry in store.list_entries()],
+        }
+
+
+def dictionary_import(db_path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Ingest a pack produced by :func:`dictionary_export`."""
+    from sway.dictionary import SOURCE_SHARED, DictionaryStore
+
+    pack = payload.get("pack", payload)
+    # `dict`, not `Mapping`: this module imports Mapping only for typing, and
+    # a JSON body decodes to a plain dict regardless.
+    if not isinstance(pack, dict):
+        raise ActionError("that does not look like a vocabulary pack")
+    version = pack.get("version")
+    if version != 1:
+        raise ActionError(f"this build cannot read a version {version!r} vocabulary pack")
+    raw = pack.get("terms")
+    if not isinstance(raw, list) or not raw:
+        raise ActionError("that pack has no terms in it")
+    cleaned = [t.strip() for t in raw if isinstance(t, str) and t.strip()]
+    if not cleaned:
+        raise ActionError("that pack has no terms in it")
+    if len(cleaned) > 2000:
+        raise ActionError("that pack is too large (limit 2000 terms)")
+
+    with DictionaryStore.open(db_path) as store:
+        added = store.add_many(cleaned, source=SOURCE_SHARED)
+        return {"added": added, "skipped": len(cleaned) - added, **dictionary_payload(store)}
+
+
+def dictionary_payload(store: Any) -> dict[str, Any]:
+    """The shape every dictionary route returns, read and write alike, so the
+    UI has exactly one contract to render against.
+
+    ``terms`` is kept alongside the richer ``entries`` because the CLI and the
+    older client code read it, and dropping it would break them for no gain.
+    """
+    entries = store.list_entries()
+    return {
+        "terms": [entry.term for entry in entries],
+        "entries": [
+            {
+                "term": entry.term,
+                "source": entry.source,
+                "pinned": entry.pinned,
+                "hits": entry.hits,
+                "last_used_at": entry.last_used_at,
+            }
+            for entry in entries
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +547,10 @@ __all__ = [
     "delete_app_rule",
     "delete_trigger",
     "dictionary_add",
+    "dictionary_payload",
+    "dictionary_pin",
+    "dictionary_import",
+    "dictionary_export",
     "dictionary_remove",
     "history_delete",
     "history_delete_all",
