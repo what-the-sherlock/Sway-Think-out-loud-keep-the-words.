@@ -26,6 +26,16 @@ from typing import TYPE_CHECKING, Any
 
 from sway import credentials
 from sway.dictionary import SOURCES
+from sway.hotkey import ChordError, parse_chord
+from sway.transforms import (
+    DEFAULT_IDS,
+    DEFAULT_TRANSFORMS,
+    MAX_DESCRIPTION_CHARS,
+    MAX_INSTRUCTION_CHARS,
+    MAX_TRANSFORMS,
+    Transform,
+    find_shortcut_conflicts,
+)
 from sway.settings import (
     CLEANUP_STYLES,
     CONTEXT_MODES,
@@ -288,6 +298,151 @@ def trigger_view(settings: Settings) -> list[dict[str, Any]]:
             ],
         }
         for t in settings.triggers
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Transforms
+# ---------------------------------------------------------------------------
+
+
+def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
+    """Create or update one transform.
+
+    Like :func:`save_trigger`, an existing id is an edit that keeps its
+    position and anything else is an append.
+    """
+    current = store.get()
+    name = _require_str(payload, "name", max_chars=MAX_NAME_CHARS)
+    instruction = _require_str(payload, "instruction", max_chars=MAX_INSTRUCTION_CHARS)
+
+    shortcut = _optional_str(payload, "shortcut", max_chars=64) or ""
+    if shortcut:
+        # Validated at the door rather than at bind time, so an unusable
+        # shortcut is refused with a reason the user is looking at instead of
+        # being silently skipped by the engine hours later.
+        try:
+            shortcut = str(parse_chord(shortcut))
+        except ChordError as exc:
+            raise ActionError(str(exc)) from exc
+
+    phrase = _optional_str(payload, "phrase", max_chars=MAX_PHRASE_CHARS) or ""
+    transform_id = payload.get("id")
+    transform_id = transform_id if isinstance(transform_id, str) and transform_id else None
+
+    if phrase and not normalise_phrase(phrase):
+        raise ActionError("that phrase has no words in it")
+    for existing in current.transforms:
+        if (
+            phrase
+            and existing.id != transform_id
+            and normalise_phrase(existing.phrase) == normalise_phrase(phrase)
+        ):
+            raise ActionError(f"“{existing.name}” already uses that phrase")
+    for existing in current.triggers:
+        if phrase and existing.normalised_phrase() == normalise_phrase(phrase):
+            raise ActionError(f"the snippet “{existing.phrase}” already uses that phrase")
+
+    enabled = payload.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = True
+
+    if transform_id is None and len(current.transforms) >= MAX_TRANSFORMS:
+        raise ActionError(f"you can have at most {MAX_TRANSFORMS} transforms")
+
+    updated: list[Transform] = []
+    replaced = False
+    for existing in current.transforms:
+        if existing.id == transform_id:
+            updated.append(
+                Transform(
+                    id=existing.id,
+                    name=name,
+                    instruction=instruction,
+                    description=_optional_str(payload, "description", max_chars=MAX_DESCRIPTION_CHARS)
+                    or "",
+                    phrase=phrase,
+                    shortcut=shortcut,
+                    icon=_optional_str(payload, "icon", max_chars=8) or "",
+                    enabled=enabled,
+                    # Editing a built-in keeps it a built-in, so "reset to
+                    # defaults" can still put it back.
+                    builtin=existing.builtin,
+                )
+            )
+            replaced = True
+        else:
+            updated.append(existing)
+
+    if not replaced:
+        from sway.settings import _new_id
+
+        updated.append(
+            Transform(
+                id=transform_id or _new_id(),
+                name=name,
+                instruction=instruction,
+                description=_optional_str(payload, "description", max_chars=MAX_DESCRIPTION_CHARS)
+                or "",
+                phrase=phrase,
+                shortcut=shortcut,
+                icon=_optional_str(payload, "icon", max_chars=8) or "",
+                enabled=enabled,
+            )
+        )
+
+    try:
+        return store.update(transforms=tuple(updated))
+    except SettingsWriteError as exc:
+        raise ActionError(str(exc)) from exc
+
+
+def delete_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
+    transform_id = payload.get("id")
+    if not isinstance(transform_id, str) or not transform_id:
+        raise ActionError("which transform?")
+    remaining = tuple(t for t in store.get().transforms if t.id != transform_id)
+    try:
+        return store.update(transforms=remaining)
+    except SettingsWriteError as exc:
+        raise ActionError(str(exc)) from exc
+
+
+def reset_transforms(store: SettingsStore) -> Settings:
+    """Restore the shipped transforms, keeping the user's own.
+
+    A built-in the user edited goes back to how it shipped; one they created
+    is left completely alone. Wiping those too would make this button
+    destructive in a way its name does not suggest.
+    """
+    custom = tuple(t for t in store.get().transforms if t.id not in DEFAULT_IDS)
+    try:
+        return store.update(transforms=DEFAULT_TRANSFORMS + custom)
+    except SettingsWriteError as exc:
+        raise ActionError(str(exc)) from exc
+
+
+def transform_view(settings: Settings) -> list[dict[str, Any]]:
+    """Transforms plus their shortcut conflicts, shaped for the UI."""
+    conflicts = find_shortcut_conflicts(settings.transforms)
+    by_id = {t.id: t for t in settings.transforms}
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "description": t.description,
+            "instruction": t.instruction,
+            "phrase": t.phrase,
+            "shortcut": t.shortcut,
+            "shortcut_label": parse_chord(t.shortcut).pretty() if t.shortcut else "",
+            "icon": t.icon,
+            "enabled": t.enabled,
+            "builtin": t.builtin,
+            "conflicts": [
+                by_id[other].name for other in conflicts.get(t.id, []) if other in by_id
+            ],
+        }
+        for t in settings.transforms
     ]
 
 
@@ -556,6 +711,10 @@ __all__ = [
     "history_delete_all",
     "key_status",
     "save_app_rule",
+    "save_transform",
+    "delete_transform",
+    "reset_transforms",
+    "transform_view",
     "save_trigger",
     "set_key",
     "trigger_view",

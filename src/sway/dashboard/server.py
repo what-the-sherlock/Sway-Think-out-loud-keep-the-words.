@@ -324,6 +324,7 @@ class DashboardServer:
         if settings is not None:
             payload["settings"] = settings_to_dict(settings)
             payload["triggers"] = actions.trigger_view(settings)
+            payload["transforms"] = actions.transform_view(settings)
             payload["app_rules"] = [
                 {"process": r.process, "style": r.style} for r in settings.app_rules
             ]
@@ -444,6 +445,18 @@ class DashboardServer:
             return self.settings_payload()
         if path == "/api/triggers/delete":
             actions.delete_trigger(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/transforms/save":
+            actions.save_transform(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/transforms/delete":
+            actions.delete_transform(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/transforms/reset":
+            actions.reset_transforms(self._require_settings())
             self._notify_settings_changed()
             return self.settings_payload()
         if path == "/api/app-rules/save":

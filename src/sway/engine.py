@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -82,7 +82,15 @@ from sway.groq_client import (
 )
 from sway.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 from sway.history_window import HistoryWindow
-from sway.hotkey import KNOWN_KEYS, HotkeyListener, prettify_hotkey
+from sway.hotkey import (
+    KNOWN_KEYS,
+    Chord,
+    ChordError,
+    ChordListener,
+    HotkeyListener,
+    parse_chord,
+    prettify_hotkey,
+)
 from sway.inject import TextInjector
 from sway.latency.models import Stage
 from sway.latency.tracker import LatencyTracker, RunRecorder
@@ -92,6 +100,8 @@ from sway.platform import PlatformAdapter, get_platform
 from sway.profiles import CleanupStyle, style_for_process
 from sway.selection import SelectionReader
 from sway.settings import SettingsStore, apply_to_config
+from sway import transforms as transforms_module
+from sway.transforms import Transform, build_directive_block
 from sway.triggers import apply_triggers
 from sway.streaming import ChunkSessionResult, ChunkStreamer, max_overlap_words, stitch_transcripts
 from sway.tray import TrayIcon, TrayState
@@ -301,6 +311,9 @@ class Engine:
             on_release=self._on_release,
         )
         self._command_hotkey: HotkeyListener | None = None
+        #: One OS hook for every transform shortcut. Rebuilt from settings at
+        #: startup and again whenever the user edits a transform.
+        self._chords = ChordListener()
         if config.hotkey.command_key is not None:
             self._command_hotkey = HotkeyListener(
                 key=KNOWN_KEYS[config.hotkey.command_key],
@@ -343,6 +356,8 @@ class Engine:
         self._hotkey.start()
         if self._command_hotkey is not None:
             self._command_hotkey.start()
+        self._bind_transform_shortcuts()
+        self._chords.start()
         if self._config.tray.enabled:
             self._tray = TrayIcon(
                 on_show_history=self._open_history_window,
@@ -526,6 +541,7 @@ class Engine:
         for label, action in (
             ("hotkey", self._hotkey.stop),
             ("command hotkey", self._stop_command_hotkey),
+            ("transform shortcuts", self._chords.stop),
             ("tray", self._stop_tray),
             ("instance file", self._withdraw_instance),
             ("window", self._stop_window),
@@ -868,7 +884,7 @@ class Engine:
 
         # Local, zero-cost substitutions happen before the model sees the
         # text, so a pasted signature or address is never "tidied up".
-        triggered = self._apply_triggers(transcript.text, run)
+        triggered, transforms = self._apply_triggers(transcript.text, run)
         if triggered != transcript.text:
             transcript = replace(transcript, text=triggered)
 
@@ -877,7 +893,7 @@ class Engine:
         # because its result decides whether cleanup runs at all.
         correction = self._scan_corrections(transcript.text)
 
-        cleaned_text = self._clean_up(transcript, run, focused_process, correction)
+        cleaned_text = self._clean_up(transcript, run, focused_process, correction, transforms)
 
         self._set_ui_state(BarState.INJECTING)
         with run.stage(Stage.INJECT):
@@ -1159,6 +1175,7 @@ class Engine:
         run: RunRecorder,
         focused_process: str | None,
         correction: CorrectionScan | None = None,
+        transforms: Sequence[Transform] = (),
     ) -> str:
         """Runs the cleanup pass over ``transcript`` in the style of the
         focused app's profile (Phase 3), or bypasses it per the skip
@@ -1195,14 +1212,14 @@ class Engine:
         # skip-rate analysis belongs.
         if correction is None:
             correction = CorrectionScan(text=raw_text)
-        skip_reason = self._cleanup_skip_reason(transcript, style, correction)
+        skip_reason = self._cleanup_skip_reason(transcript, style, correction, transforms)
         if skip_reason:
             cleaned_text = raw_text
         else:
             try:
                 with run.stage(Stage.CLEANUP):
                     cleaned_text, guardrail = self._request_cleanup(
-                        raw_text, style, transcript, run, correction
+                        raw_text, style, transcript, run, correction, transforms
                     )
             except (GroqError, TimeoutError) as exc:
                 # The transcript is the user's words and they are already
@@ -1277,7 +1294,11 @@ class Engine:
             return CorrectionScan(text=text)
 
     def _cleanup_skip_reason(
-        self, transcript: _Transcript, style: CleanupStyle, correction: CorrectionScan
+        self,
+        transcript: _Transcript,
+        style: CleanupStyle,
+        correction: CorrectionScan,
+        transforms: Sequence[Transform] = (),
     ) -> str:
         """Why this transcript bypasses the LLM, or ``""`` to run cleanup.
 
@@ -1295,7 +1316,9 @@ class Engine:
             return "disabled"
         if style is CleanupStyle.VERBATIM:
             return "verbatim_profile"
-        if correction.detected:
+        # A fired transform has already had its phrase excised, so skipping the
+        # call now would drop the words and deliver nothing for them.
+        if transforms or correction.detected:
             return ""
         if cfg.skip_when_unconfident and not transcript.confident:
             return "low_confidence"
@@ -1312,6 +1335,7 @@ class Engine:
         transcript: _Transcript,
         run: RunRecorder,
         correction: CorrectionScan,
+        transforms: Sequence[Transform] = (),
     ) -> tuple[str, str]:
         """The cleanup round trip plus its output checks. Returns the text to
         paste and the guardrail reason that rejected the rewrite (``""`` when
@@ -1332,7 +1356,10 @@ class Engine:
                     language=transcript.language,
                     correction=correction.detected,
                     remove_fillers=self._settings.get().remove_fillers,
-                ),
+                )
+                # Appended last, after the byte-identical style prompt, so the
+                # stable prefix stays cacheable (D8.3).
+                + build_directive_block(transforms),
                 model=cfg.model,
                 temperature=cfg.temperature,
                 reasoning_effort=cfg.reasoning_effort or None,
@@ -1375,12 +1402,19 @@ class Engine:
     # -- the voice-command pipeline (Phase 5) -----------------------------
 
     def _process_command(
-        self, start_frame: int, focused_process: str | None, selection_ready: threading.Event
+        self,
+        start_frame: int,
+        focused_process: str | None,
+        selection_ready: threading.Event,
+        instruction: str = "",
+        source: str = "command",
     ) -> None:
-        with self._tracker.run({"source": "command"}) as run:
+        with self._tracker.run({"source": source}) as run:
             self._run_pipeline(
                 run,
-                lambda: self._run_command(start_frame, focused_process, selection_ready, run),
+                lambda: self._run_command(
+                    start_frame, focused_process, selection_ready, run, instruction
+                ),
                 label="command",
             )
 
@@ -1390,6 +1424,7 @@ class Engine:
         focused_process: str | None,
         selection_ready: threading.Event,
         run: RunRecorder,
+        instruction: str = "",
     ) -> None:
         with run.stage(Stage.SELECTION):
             selection_ready.wait(timeout=self._config.commands.selection_timeout_s + 1.0)
@@ -1399,17 +1434,24 @@ class Engine:
             self._set_ui_state(BarState.ERROR, detail="nothing selected")
             return
 
-        instruction = self._transcribe_single_shot(start_frame, run)
-        if not instruction:
-            self._set_ui_state(BarState.IDLE)
-            return
+        # A transform supplies its instruction from storage, so there is
+        # nothing to transcribe and this path makes one network call where a
+        # spoken command makes two.
+        if instruction:
+            instruction_text = instruction
+        else:
+            spoken = self._transcribe_single_shot(start_frame, run)
+            if not spoken:
+                self._set_ui_state(BarState.IDLE)
+                return
+            instruction_text = spoken.text
 
         with run.stage(Stage.COMMAND):
             self._require_groq()
             cfg = self._config.commands
             future = self._network.submit(
                 self._groq.cleanup(
-                    build_command_user_message(instruction.text, selected_text),
+                    build_command_user_message(instruction_text, selected_text),
                     system_prompt=COMMAND_SYSTEM_PROMPT,
                     model=cfg.model,
                     temperature=cfg.temperature,
@@ -1422,7 +1464,26 @@ class Engine:
             # preambles/quoting a model adds around an otherwise-correct
             # transformation; an empty result falls back to leaving the
             # selection untouched rather than pasting nothing over it.
-            transformed = normalize_cleanup_output(result.text, selected_text) or selected_text
+            candidate = normalize_cleanup_output(result.text, selected_text)
+            # The dictation path has always re-checked the model's output; this
+            # one only normalised it. With a transform firing from a keystroke
+            # and no spoken instruction to confirm intent, a response that
+            # answered instead of rewriting would silently overwrite the
+            # selection. `correction_detected` relaxes the shrink floor because
+            # "Summarize" and "Make concise" are supposed to shrink the text.
+            if candidate and is_cleanup_output_safe(
+                selected_text, candidate, correction_detected=True
+            ):
+                transformed = candidate
+            else:
+                reason = unsafe_reason(selected_text, candidate, correction_detected=True)
+                if candidate:
+                    logger.warning(
+                        "transform output rejected by the %s guardrail; leaving the selection alone",
+                        reason,
+                    )
+                run.annotate(command_guardrail_reason=reason)
+                transformed = selected_text
 
         with run.stage(Stage.INJECT):
             pasted = self._inject_with_fallback(transformed, run)
@@ -1659,28 +1720,57 @@ class Engine:
                         break
         return style_for_process(focused_process)
 
-    def _apply_triggers(self, text: str, run: RunRecorder) -> str:
-        """Substitute the user's zero-cost triggers before anything else.
+    def _apply_triggers(self, text: str, run: RunRecorder) -> tuple[str, list[Transform]]:
+        """Resolve snippets and spoken transforms before anything else.
 
         Runs before cleanup so a substituted email address or signature is
-        never rewritten by the model, and before the network so a purely
-        local dictation stays purely local. Never raises: a bug in trigger
-        matching must not cost the user their words, so any failure falls
-        back to the untouched transcript.
+        never rewritten by the model, and before the network so a purely local
+        dictation stays purely local. Never raises: a bug in matching must not
+        cost the user their words, so any failure falls back to the untouched
+        transcript and no transforms.
+
+        Both kinds go through one matcher (see
+        :func:`sway.transforms.as_matchable`). A snippet substitutes its
+        payload; a transform substitutes nothing -- its phrase is excised and
+        its instruction is returned here, to be folded into the cleanup request
+        that was going to happen anyway. That is D8.3's rule: one model call,
+        always.
         """
-        triggers = self._settings.get().triggers
-        if not triggers:
-            return text
+        settings = self._settings.get()
+        triggers = settings.triggers
+        # Transforms only fire from speech when the model is actually going to
+        # run. Excising "make that concise" and then skipping cleanup would
+        # delete the words and deliver nothing in exchange -- worse than
+        # leaving the phrase in.
+        transforms = (
+            transforms_module.enabled_with_phrase(settings.transforms)
+            if self._config.cleanup.enabled
+            else []
+        )
+        matchable = list(triggers) + transforms_module.as_matchable(transforms)
+        if not matchable:
+            return text, []
         try:
-            result = apply_triggers(text, triggers)
+            result = apply_triggers(text, matchable)
         except Exception:
             logger.exception("trigger matching failed; using the raw transcript")
-            return text
+            return text, []
         if not result.fired:
-            return text
-        logger.info("%d trigger(s) fired", len(result.hits))
-        run.annotate(triggers_fired=len(result.hits))
-        return result.text
+            return text, []
+
+        by_id = {t.id: t for t in transforms}
+        fired = [by_id[hit.trigger_id] for hit in result.hits if hit.trigger_id in by_id]
+        snippets = len(result.hits) - len(fired)
+        if snippets:
+            logger.info("%d snippet(s) fired", snippets)
+        if fired:
+            logger.info("transform(s) fired: %s", ", ".join(t.name for t in fired))
+        run.annotate(
+            triggers_fired=snippets,
+            transforms_fired=len(fired),
+            transform_names=",".join(t.name for t in fired),
+        )
+        return result.text, fired
 
     def _record_error(
         self,
@@ -1773,6 +1863,11 @@ class Engine:
 
         self._config = new_config
 
+        # Transform shortcuts rebind in place rather than needing a restart:
+        # the OS hook stays up and only the dispatch table changes, so a
+        # shortcut the user just bound works on the very next keystroke.
+        self._bind_transform_shortcuts()
+
         # Launch-at-login is the one setting that lives outside our own files,
         # so it is pushed to the OS here rather than being read back from it.
         try:
@@ -1781,6 +1876,88 @@ class Engine:
             logger.warning("could not update the launch-at-login setting", exc_info=True)
 
         return {"restart_required": restart_required}
+
+    def _bind_transform_shortcuts(self) -> None:
+        """Rebuild the chord table from the user's enabled transforms.
+
+        Never raises. A shortcut string that will not parse is logged and
+        skipped rather than taken as a reason to start with no shortcuts at
+        all -- one bad binding must not disable the other seven.
+        """
+        bindings: dict[Chord, Callable[[], None]] = {}
+        try:
+            transforms = self._settings.get().transforms
+        except Exception:
+            logger.exception("could not read transforms; leaving shortcuts unbound")
+            return
+
+        for transform in transforms_module.enabled_with_shortcut(transforms):
+            try:
+                chord = parse_chord(transform.shortcut)
+            except ChordError as exc:
+                logger.warning(
+                    "transform %r has an unusable shortcut %r (%s); leaving it unbound",
+                    transform.name,
+                    transform.shortcut,
+                    exc,
+                )
+                continue
+            if chord in bindings:
+                # Two transforms on one chord: first wins, and the UI shows the
+                # conflict. Silently letting the last one win would make the
+                # list disagree with what actually happens.
+                logger.warning("shortcut %s is bound twice; keeping the first", chord)
+                continue
+            bindings[chord] = self._transform_handler(transform.id)
+
+        self._chords.rebind(bindings)
+        if bindings:
+            logger.info("bound %d transform shortcut(s)", len(bindings))
+
+    def _transform_handler(self, transform_id: str) -> Callable[[], None]:
+        """A chord handler that runs one transform over the current selection.
+
+        Returns immediately: the handler runs on the listener thread, so
+        anything slow here would delay every subsequent keystroke.
+        """
+
+        def fire() -> None:
+            self._run_transform(transform_id)
+
+        return fire
+
+    def _run_transform(self, transform_id: str) -> None:
+        """Apply a stored transform to whatever is selected in the focused app.
+
+        Reuses the voice-command pipeline wholesale -- same selection capture,
+        same system prompt, same single chat completion, same injection -- with
+        the instruction coming from storage instead of from speech. That makes
+        it strictly cheaper than a spoken command: no recording, no
+        transcription request.
+        """
+        transform = transforms_module.by_id(self._settings.get().transforms, transform_id)
+        if transform is None or not transform.enabled:
+            return
+        if not self._listening:
+            return
+
+        self._set_ui_state(BarState.THINKING, detail=transform.name)
+        selection_ready = threading.Event()
+        self._selected_text = ""
+        focused = self._platform.focused_process_name()
+
+        threading.Thread(
+            target=self._capture_selection,
+            args=(selection_ready,),
+            name="flow-selection",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            name="flow-transform",
+            target=self._process_command,
+            args=(self._ring.mark(), focused, selection_ready, transform.instruction, "transform"),
+            daemon=True,
+        ).start()
 
     def _sync_launch_at_login(self, enabled: bool) -> None:
         """Add or remove this build from the per-user Run key."""

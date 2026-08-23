@@ -571,6 +571,111 @@ function snippetRows(triggers) {
     </div>`).join('')}</div>`;
 }
 
+/* ---- Transforms ----------------------------------------------------------
+
+   A transform is a saved instruction. It reaches the text two ways, and the
+   card says which are set up, because the two cost different things: a
+   shortcut runs one model call over a selection, a phrase folds its
+   instruction into the cleanup call that was happening anyway.            */
+
+views.transforms = {
+  async load() { state.settings = await api('/api/settings'); },
+  render() {
+    const all = (state.settings && state.settings.transforms) || [];
+    const active = all.filter((t) => t.enabled).length;
+
+    if (!all.length) {
+      return `
+        <h1 class="page-title">Transforms</h1>
+        <div style="margin-top:26px">${hero({
+          title: 'Say it once. Shape it after.',
+          body: 'A transform is a saved instruction that rewrites text — polish it, '
+              + 'make it concise, turn it into an email. Run one over any selection with '
+              + 'its shortcut, or say its phrase while dictating.',
+          chips: ['Polish', 'Make concise', 'Rewrite professionally'].map(
+            (w) => `<span class="chip on-dark">${esc(w)}</span>`),
+          action: { act: 'add-transform', label: 'Create a transform' },
+        })}</div>`;
+    }
+
+    return `
+      <div style="display:flex;align-items:center;gap:16px">
+        <h1 class="page-title">Transforms</h1>
+        <div style="flex:1"></div>
+        <button class="btn" data-act="reset-transforms">Reset to defaults</button>
+        <button class="btn primary" data-act="add-transform">${icon('plus')} New transform</button>
+      </div>
+      <div class="small muted" style="margin-top:14px">
+        ${active} of ${all.length} turned on. A transform only costs a request when you run it.
+      </div>
+      <div class="grid cols-3" style="margin-top:24px">
+        ${all.map(transformCard).join('')}
+      </div>`;
+  },
+};
+
+function transformCard(t) {
+  const ways = [];
+  if (t.shortcut_label) ways.push(`<span class="cap">${esc(t.shortcut_label)}</span>`);
+  if (t.phrase) ways.push(`<span class="chip"><span class="txt">“${esc(t.phrase)}”</span></span>`);
+
+  return `<div class="card" style="display:flex;flex-direction:column;gap:10px">
+    <div style="display:flex;align-items:flex-start;gap:10px">
+      <div class="grow">
+        <div style="font-weight:600">${esc(t.name)}</div>
+        ${t.description ? `<div class="small muted" style="margin-top:3px">${esc(t.description)}</div>` : ''}
+      </div>
+      ${toggle(t.enabled, `data-act="toggle-transform" data-id="${esc(t.id)}"`)}
+    </div>
+    ${ways.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">${ways.join('')}</div>`
+      : `<div class="small muted">No shortcut or phrase yet — it cannot be run.</div>`}
+    ${t.conflicts && t.conflicts.length
+      ? `<div class="small" style="color:var(--red)">Same shortcut as “${esc(t.conflicts[0])}” — only one of them will run.</div>`
+      : ''}
+    <div style="display:flex;gap:6px;margin-top:auto;padding-top:6px">
+      ${iconBtn('edit', 'Edit', `data-act="edit-transform" data-id="${esc(t.id)}"`)}
+      ${iconBtn('trash', 'Delete', `data-act="delete-transform" data-id="${esc(t.id)}"`)}
+    </div>
+  </div>`;
+}
+
+function transformDialog(existing) {
+  const t = existing || { id: '', name: '', description: '', instruction: '', phrase: '', shortcut: '', enabled: true };
+  openModal({
+    title: existing ? 'Edit transform' : 'New transform',
+    body: `
+      <div>
+        <label class="field-label" for="x-name">Name</label>
+        <input class="input" id="x-name" value="${esc(t.name)}" placeholder="Prompt Engineer" maxlength="80">
+      </div>
+      <div>
+        <label class="field-label" for="x-desc">Description <span class="muted">(optional)</span></label>
+        <input class="input" id="x-desc" value="${esc(t.description)}" placeholder="What it is for" maxlength="200">
+      </div>
+      <div>
+        <label class="field-label" for="x-instruction">Instruction</label>
+        <textarea class="input" id="x-instruction" maxlength="600" rows="4"
+          placeholder="Rewrite the text into a highly effective AI prompt while preserving the intent.">${esc(t.instruction)}</textarea>
+        <div class="small muted">Written to the model as-is. One clear sentence works better than a paragraph — and say what to preserve, not just what to change.</div>
+      </div>
+      <div>
+        <label class="field-label" for="x-shortcut">Shortcut <span class="muted">(optional)</span></label>
+        <input class="input" id="x-shortcut" value="${esc(t.shortcut)}" placeholder="ctrl+alt+p" maxlength="64">
+        <div class="small muted">Runs it over whatever you have selected. Needs a modifier, e.g. Ctrl+Alt+P.</div>
+      </div>
+      <div>
+        <label class="field-label" for="x-phrase">Spoken phrase <span class="muted">(optional)</span></label>
+        <input class="input" id="x-phrase" value="${esc(t.phrase)}" placeholder="make that concise" maxlength="80">
+        <div class="small muted">Say it at the end of a dictation. Folded into the cleanup request, so it costs no extra call.</div>
+      </div>
+      <div id="x-error" class="small" style="color:var(--red)"></div>`,
+    actions: `<div class="spacer"></div>
+      <button class="btn" data-act="close-modal">Cancel</button>
+      <button class="btn primary" data-act="save-transform" data-id="${esc(t.id)}">Save</button>`,
+  });
+}
+
 /* ---- Insights ----------------------------------------------------------- */
 
 views.insights = {
@@ -1318,6 +1423,55 @@ document.addEventListener('click', async (event) => {
       case 'save-key': await saveKey(); break;
       case 'test-key': await testKey(); break;
 
+      case 'add-transform': transformDialog(null); break;
+      case 'edit-transform': {
+        const list = (state.settings && state.settings.transforms) || [];
+        transformDialog(list.find((t) => t.id === target.dataset.id) || null);
+        break;
+      }
+      case 'save-transform': {
+        const error = el('x-error');
+        try {
+          state.settings = await post('/api/transforms/save', {
+            id: target.dataset.id || undefined,
+            name: el('x-name').value,
+            description: el('x-desc').value,
+            instruction: el('x-instruction').value,
+            shortcut: el('x-shortcut').value,
+            phrase: el('x-phrase').value,
+            enabled: true,
+          });
+          closeModal(); await refresh(); toast('Transform saved');
+        } catch (err) { error.textContent = err.message; }
+        break;
+      }
+      case 'toggle-transform': {
+        const list = (state.settings && state.settings.transforms) || [];
+        const t = list.find((x) => x.id === target.dataset.id);
+        if (!t) break;
+        state.settings = await post('/api/transforms/save', { ...t, enabled: !t.enabled });
+        await refresh();
+        break;
+      }
+      case 'delete-transform': {
+        const list = (state.settings && state.settings.transforms) || [];
+        const gone = list.find((t) => t.id === target.dataset.id);
+        state.settings = await post('/api/transforms/delete', { id: target.dataset.id });
+        await refresh();
+        // Deleting is immediate with an undo in the toast, matching how
+        // snippets behave -- no confirm dialog anywhere in this app.
+        toast(`Deleted “${gone ? gone.name : 'transform'}”`, gone && (async () => {
+          await post('/api/transforms/save', gone);
+          await refresh();
+        }));
+        break;
+      }
+      case 'reset-transforms':
+        state.settings = await post('/api/transforms/reset', {});
+        await refresh();
+        toast('Built-in transforms restored');
+        break;
+
       case 'add-trigger': triggerDialog(null); break;
       case 'copy-snippet': {
         const list = (state.settings && state.settings.triggers) || [];
@@ -1511,6 +1665,12 @@ function renderNav() {
   // place: Settings owns the API key, Snippets owns phrase conflicts.
   setBadge('settings-count', settingsProblemCount());
   setBadge('snippets-count', countConflicts());
+  setBadge('transforms-count', countTransformConflicts());
+}
+
+function countTransformConflicts() {
+  const transforms = (state.settings && state.settings.transforms) || [];
+  return transforms.filter((t) => t.conflicts && t.conflicts.length).length;
 }
 
 function setBadge(id, count) {

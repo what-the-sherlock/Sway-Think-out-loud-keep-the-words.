@@ -100,12 +100,22 @@ def resolve_payload(trigger: Trigger, *, today: date | None = None) -> str:
     ``date`` renders the current date rather than a stored string, which is
     the entire point of it being its own type: a macro would freeze the day
     it was created.
+
+    ``transform`` inserts nothing. Its phrase is an *instruction*, not
+    content, so matching it excises it from the transcript and the caller
+    picks the fired id out of :attr:`TriggerResult.hits`. Routing transforms
+    through this matcher rather than a second one is deliberate: the "never
+    fire on a substring", "longest phrase wins", and "never overlap" rules
+    that keep a snippet from eating words are exactly the rules a transform
+    phrase needs, and a parallel implementation would drift from them.
     """
     if trigger.type == "date":
         day = today or date.today()
         # Platform-independent: %-d/%#d differ between POSIX and Windows, so
         # the day is formatted by hand rather than by strftime.
         return f"{day.day} {day.strftime('%B %Y')}"
+    if trigger.type == "transform":
+        return ""
     return trigger.payload
 
 
@@ -243,7 +253,9 @@ def apply_triggers(
             if any(consumed[index + offset] for offset in range(span)):
                 index += 1
                 continue
-            if tuple(word for _, _, word in window) == needle:
+            if tuple(word for _, _, word in window) == needle and _may_fire_here(
+                trigger, index + span, len(tokens)
+            ):
                 for offset in range(span):
                     consumed[index + offset] = True
                 hits.append(
@@ -278,6 +290,30 @@ def apply_triggers(
     )
 
 
+def _may_fire_here(trigger: Trigger, end_index: int, total_tokens: int) -> bool:
+    """Whether a match at this position is really an invocation.
+
+    Snippets fire anywhere: their phrase *is* the content being inserted, and
+    "send it to my email" needs the substitution mid-sentence.
+
+    A transform phrase is an instruction *about* the utterance, and the same
+    words are ordinary speech somewhere else -- "we should polish that stone
+    before shipping" is not a request to run Polish. This is D8.2's rule that a
+    trigger at a clause boundary is a command and the same words mid-sentence
+    are content; the cheap and decisive half of it is position, so a transform
+    only fires when nothing follows it.
+
+    Deliberately narrower than D8.2's full rule, which also scopes a
+    mid-utterance trigger to the preceding clause. Trailing-only costs the user
+    nothing they cannot phrase around -- you say "...and make that concise" at
+    the end anyway -- and it cannot silently delete words in the middle of a
+    sentence, which is the failure that matters.
+    """
+    if trigger.type != "transform":
+        return True
+    return end_index == total_tokens
+
+
 def _tidy(text: str) -> str:
     """Clean up the seams a substitution leaves behind.
 
@@ -287,6 +323,16 @@ def _tidy(text: str) -> str:
     """
     collapsed = re.sub(r"[ \t]{2,}", " ", text)
     collapsed = re.sub(r"\s+([.,!?;:])", r"\1", collapsed)
+    # Excising a phrase can strand a clause comma against the sentence's full
+    # stop ("...the release slipped,."). The comma separated the phrase from
+    # what came before it and has nothing left to separate, so it goes.
+    #
+    # Deliberately narrow. A first attempt also collapsed a full stop followed
+    # by a full stop, which turned every dictated "Wait... what?" into
+    # "Wait.. what?" -- damaging ordinary speech to tidy an artefact. A doubled
+    # terminator is left for the cleanup pass, which a fired transform always
+    # runs anyway.
+    collapsed = re.sub(r"[,;:]+[ \t]*(?=[.!?])", "", collapsed)
     return collapsed.strip()
 
 

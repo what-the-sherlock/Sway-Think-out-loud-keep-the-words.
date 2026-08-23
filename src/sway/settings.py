@@ -41,6 +41,14 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from sway.transforms import (
+    DEFAULT_TRANSFORMS,
+    MAX_DESCRIPTION_CHARS,
+    MAX_INSTRUCTION_CHARS,
+    MAX_TRANSFORMS,
+    Transform,
+)
+
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILENAME = "settings.json"
@@ -169,6 +177,11 @@ class Settings:
     triggers: tuple[Trigger, ...] = ()
     #: Per-app cleanup style overrides, layered over :mod:`flow.profiles`.
     app_rules: tuple[AppRule, ...] = ()
+    #: User-defined and built-in text transforms. A settings file with no
+    #: ``transforms`` key at all predates the feature and is given the shipped
+    #: set (see :func:`parse`); an empty tuple means the user deleted every one
+    #: and must stay empty.
+    transforms: tuple[Transform, ...] = DEFAULT_TRANSFORMS
     #: Fields written by a build newer than this one, preserved verbatim so a
     #: downgrade-then-save does not destroy them.
     unknown: dict[str, Any] = field(default_factory=dict, compare=False)
@@ -269,6 +282,45 @@ def _coerce_time(value: Any) -> float:
         return 0.0
 
 
+def _parse_transform(raw: Any, *, seen: set[str]) -> Transform | None:
+    """One transform, or ``None`` if it is unusable.
+
+    A transform with no instruction would make a model call that asks for
+    nothing, so it is dropped rather than kept in a state that costs quota and
+    changes nothing.
+    """
+    if not isinstance(raw, dict):
+        return None
+    name = _as_optional_str(raw.get("name"), name="transform.name", max_chars=MAX_NAME_CHARS)
+    instruction = _as_optional_str(
+        raw.get("instruction"), name="transform.instruction", max_chars=MAX_INSTRUCTION_CHARS
+    )
+    if name is None or instruction is None:
+        return None
+
+    transform_id = _as_optional_str(raw.get("id"), name="transform.id", max_chars=64) or _new_id()
+    if transform_id in seen:
+        return None
+    seen.add(transform_id)
+
+    return Transform(
+        id=transform_id,
+        name=name,
+        instruction=instruction,
+        description=_as_optional_str(
+            raw.get("description"), name="transform.description", max_chars=MAX_DESCRIPTION_CHARS
+        )
+        or "",
+        phrase=_as_optional_str(raw.get("phrase"), name="transform.phrase", max_chars=MAX_PHRASE_CHARS)
+        or "",
+        shortcut=_as_optional_str(raw.get("shortcut"), name="transform.shortcut", max_chars=64)
+        or "",
+        icon=_as_optional_str(raw.get("icon"), name="transform.icon", max_chars=8) or "",
+        enabled=_as_bool(raw.get("enabled", False), default=False, name="transform.enabled"),
+        builtin=_as_bool(raw.get("builtin", False), default=False, name="transform.builtin"),
+    )
+
+
 def _parse_app_rule(raw: Any, *, seen: set[str]) -> AppRule | None:
     if not isinstance(raw, dict):
         return None
@@ -301,6 +353,7 @@ _KNOWN_KEYS = {
     "auto_learn_vocabulary",
     "triggers",
     "app_rules",
+    "transforms",
 }
 
 
@@ -356,6 +409,24 @@ def parse(raw: Any) -> Settings:
         if parsed_rule is not None:
             rules.append(parsed_rule)
 
+    # Absent means "written before transforms existed": fill in the shipped
+    # set so an upgrading user sees them. Present-but-empty means the user
+    # deleted every one, and must stay that way.
+    transforms: tuple[Transform, ...]
+    if "transforms" not in raw:
+        transforms = DEFAULT_TRANSFORMS
+    else:
+        parsed_transforms: list[Transform] = []
+        seen_ids: set[str] = set()
+        for item in _as_list(raw.get("transforms")):
+            if len(parsed_transforms) >= MAX_TRANSFORMS:
+                logger.warning("settings: more than %d transforms; ignoring the rest", MAX_TRANSFORMS)
+                break
+            parsed_transform = _parse_transform(item, seen=seen_ids)
+            if parsed_transform is not None:
+                parsed_transforms.append(parsed_transform)
+        transforms = tuple(parsed_transforms)
+
     return Settings(
         hotkey=_as_optional_str(raw.get("hotkey"), name="hotkey", max_chars=64),
         audio_device=_as_optional_str(raw.get("audio_device"), name="audio_device"),
@@ -398,6 +469,7 @@ def parse(raw: Any) -> Settings:
         ),
         triggers=tuple(triggers),
         app_rules=tuple(rules),
+        transforms=transforms,
         unknown={k: v for k, v in raw.items() if k not in _KNOWN_KEYS},
     )
 
@@ -423,6 +495,7 @@ def to_dict(settings: Settings) -> dict[str, Any]:
         "auto_learn_vocabulary": settings.auto_learn_vocabulary,
         "triggers": [asdict(t) for t in settings.triggers],
         "app_rules": [asdict(r) for r in settings.app_rules],
+        "transforms": [asdict(t) for t in settings.transforms],
     }
     # Unknown keys never shadow a key this build owns, so a stale field from a
     # newer version cannot resurrect itself over a value the user just set.
@@ -626,6 +699,7 @@ __all__ = [
     "Settings",
     "SettingsStore",
     "SettingsWriteError",
+    "Transform",
     "Trigger",
     "apply_to_config",
     "normalise_phrase",
