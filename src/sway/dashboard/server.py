@@ -40,7 +40,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from flow.dashboard.queries import DashboardQueries, DashboardQueryError, start_of_today
+from sway.dashboard import actions
+from sway.dashboard.actions import ActionError
+from sway.dashboard.queries import DashboardQueries, DashboardQueryError, start_of_today
+from sway.errors import SwayError
+from sway.settings import (
+    CLEANUP_STYLES as _CLEANUP_STYLES,
+    CONTEXT_MODES as _CONTEXT_MODES,
+    OVERLAY_POSITIONS as _OVERLAY_POSITIONS,
+    TRIGGER_TYPES as _TRIGGER_TYPES,
+    SettingsStore,
+    to_dict as settings_to_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +63,22 @@ RANGE_DAYS: dict[str, int | None] = {"7d": 7, "30d": 30, "90d": 90, "all": None}
 #: Cap on a single Activity page, so a pathological ``limit`` cannot make the
 #: server materialise the entire history in memory.
 MAX_PAGE = 500
+
+
+def _input_devices() -> list[dict[str, Any]]:
+    """Microphones, or an empty list on a machine with no working backend.
+
+    Imported lazily: ``sounddevice`` loads PortAudio, and ``flow dashboard``
+    run standalone has no reason to pay that cost or to fail if the audio
+    stack is broken.
+    """
+    try:
+        from sway.audio.capture import input_devices
+
+        return input_devices()
+    except Exception:
+        logger.warning("could not enumerate input devices", exc_info=True)
+        return []
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +95,27 @@ class EngineControl:
     set_listening: Callable[[bool], None] | None = None
     #: Live engine facts the databases cannot know: hotkey, mic, model.
     describe: Callable[[], dict[str, Any]] | None = None
-    #: Bring the app forward. Called by a *second launch* of Flow rather than
+    #: Bring the app forward. Called by a *second launch* of Sway rather than
     #: by the UI (see flow.instance), which is why it lives here and not in
     #: the browser-facing routes.
     focus: Callable[[], None] | None = None
+    #: Make one cheap authenticated call to Groq and report what happened.
+    #: Owned by the engine because it holds the pre-warmed HTTP client; the
+    #: server has no business creating a second one.
+    test_key: Callable[[], dict[str, Any]] | None = None
+    #: Told after any settings write, so the engine can hot-apply what it can
+    #: (device, retention, overlay position) and flag what needs a restart.
+    on_settings_changed: Callable[[], dict[str, Any]] | None = None
+    #: Quit the whole application, cleanly. Exposed so the window's own
+    #: control and the tray's Quit item end in exactly the same shutdown.
+    quit: Callable[[], None] | None = None
+    #: The last error the engine surfaced, or ``None``. Home renders it.
+    last_error: Callable[[], dict[str, Any] | None] | None = None
+    #: Live mic level as a 0-3 bucket, and whether the hotkey is held right
+    #: now. Both exist for onboarding, which has to let the user *observe*
+    #: that the mic and the hook work rather than being told they do.
+    input_level: Callable[[], int] | None = None
+    hotkey_down: Callable[[], bool] | None = None
 
 
 class DashboardServer:
@@ -86,6 +130,8 @@ class DashboardServer:
         control: EngineControl | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        dictionary_db: Path | None = None,
+        settings: SettingsStore | None = None,
     ) -> None:
         self._history_db = history_db
         self._latency_db = latency_db
@@ -93,6 +139,11 @@ class DashboardServer:
         self._control = control or EngineControl()
         self._host = host
         self._port = port
+        self._dictionary_db = dictionary_db
+        #: Optional so ``flow dashboard`` standalone still reports history
+        #: without being able to change anything. Every write route checks
+        #: for it and returns a clear "not available" rather than crashing.
+        self._settings = settings
         self._token = secrets.token_urlsafe(24)
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -134,7 +185,7 @@ class DashboardServer:
         start, because the engine itself is unaffected either way.
         """
         try:
-            from flow.history import HistoryStore
+            from sway.history import HistoryStore
 
             HistoryStore.open(self._history_db).close()
         except Exception:
@@ -202,7 +253,88 @@ class DashboardServer:
                 return perf
             if path == "/api/status":
                 return self.status()
+            if path == "/api/home":
+                return self._home(q)
+            if path == "/api/settings":
+                return self.settings_payload()
+            if path == "/api/dictionary":
+                return self._dictionary()
+            if path == "/api/devices":
+                return {"devices": _input_devices()}
         raise KeyError(path)
+
+    # -- composite reads for the new UI ------------------------------------
+
+    def _home(self, q: DashboardQueries) -> dict[str, Any]:
+        """Everything the Home screen shows, in one request.
+
+        Composite on purpose: Home is the screen the window opens on, and
+        four parallel requests on a cold WebView is exactly where a "native"
+        app stops feeling native. One query object serves all of it.
+        """
+        today = q.summary(since=start_of_today())
+        streaks = q.streaks()
+        recent = q.sessions(limit=8)
+        health = q.health()
+
+        return {
+            "status": self.status(),
+            "today": _summary_dict(today),
+            "all_time": _summary_dict(q.summary()),
+            "streaks": {"current": streaks.current, "longest": streaks.longest},
+            "recent": recent,
+            "health": {
+                "status": health.status,
+                "headline": health.headline,
+                "detail": health.detail,
+            },
+            "typing_wpm": self._typing_wpm,
+            "has_data": q.session_count() > 0,
+        }
+
+    def settings_payload(self) -> dict[str, Any]:
+        """Current settings, engine facts, and key status.
+
+        Assembled rather than dumped: the UI needs to distinguish "the user
+        set this" from "this is what the engine resolved", and only this
+        layer can see both.
+        """
+        settings = self._settings.get() if self._settings is not None else None
+        engine: dict[str, Any] = {}
+        if self._control.describe is not None:
+            try:
+                engine = self._control.describe()
+            except Exception:
+                logger.debug("could not describe the engine", exc_info=True)
+
+        payload: dict[str, Any] = {
+            "editable": self._settings is not None,
+            "engine": engine,
+            "key": actions.key_status().as_dict(),
+            "overlay_positions": list(_OVERLAY_POSITIONS),
+            "cleanup_styles": list(_CLEANUP_STYLES),
+            "trigger_types": list(_TRIGGER_TYPES),
+            "context_modes": list(_CONTEXT_MODES),
+        }
+        if settings is not None:
+            payload["settings"] = settings_to_dict(settings)
+            payload["triggers"] = actions.trigger_view(settings)
+            payload["app_rules"] = [
+                {"process": r.process, "style": r.style} for r in settings.app_rules
+            ]
+        return payload
+
+    def _dictionary(self) -> dict[str, Any]:
+        if self._dictionary_db is None:
+            return {"available": False, "terms": []}
+        try:
+            from sway.dictionary import DictionaryStore
+
+            with DictionaryStore.open(self._dictionary_db) as store:
+                return {"available": True, "terms": store.list_terms()}
+        except Exception as exc:
+            logger.warning("could not read the dictionary: %s", exc)
+            return {"available": False, "terms": [], "error": str(exc)}
 
     def _overview(self, q: DashboardQueries, params: Mapping[str, list[str]]) -> dict[str, Any]:
         range_key = _one(params, "range", "7d")
@@ -273,6 +405,9 @@ class DashboardServer:
             "engine": engine,
             "now": time.time(),
             "today": date.today().isoformat(),
+            "level": _safe_call(self._control.input_level, 0),
+            "hotkey_down": _safe_call(self._control.hotkey_down, False),
+            "last_error": _safe_call(self._control.last_error, None),
         }
 
     def handle_command(self, path: str, payload: Mapping[str, Any]) -> Any:
@@ -293,7 +428,104 @@ class DashboardServer:
                 raise PermissionError("no engine attached")
             self._control.focus()
             return {"focused": True}
+
+        # -- settings and the things stored alongside them -----------------
+        if path == "/api/settings":
+            actions.update_settings(self._require_settings(), payload)
+            return {**self.settings_payload(), "applied": self._notify_settings_changed()}
+        if path == "/api/triggers/save":
+            actions.save_trigger(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/triggers/delete":
+            actions.delete_trigger(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/app-rules/save":
+            actions.save_app_rule(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/app-rules/delete":
+            actions.delete_app_rule(self._require_settings(), payload)
+            self._notify_settings_changed()
+            return self.settings_payload()
+
+        # -- the API key ---------------------------------------------------
+        if path == "/api/key":
+            result = actions.set_key(payload)
+            self._notify_settings_changed()
+            return result
+        if path == "/api/key/test":
+            if self._control.test_key is None:
+                raise PermissionError("no engine attached")
+            return self._control.test_key()
+
+        # -- dictionary ----------------------------------------------------
+        if path == "/api/dictionary/add":
+            return actions.dictionary_add(self._require_dictionary(), payload)
+        if path == "/api/dictionary/remove":
+            return actions.dictionary_remove(self._require_dictionary(), payload)
+
+        # -- history -------------------------------------------------------
+        if path == "/api/history/delete":
+            return actions.history_delete(self._history_db, payload)
+        if path == "/api/history/delete-all":
+            return actions.history_delete_all(self._history_db, payload)
+
+        # -- lifecycle -----------------------------------------------------
+        if path == "/api/quit":
+            if self._control.quit is None:
+                raise PermissionError("no engine attached")
+            # Answer before shutting down: the caller is the UI, and a
+            # connection reset mid-response renders as an error toast on a
+            # window that is about to close anyway.
+            self._control.quit()
+            return {"quitting": True}
+
         raise KeyError(path)
+
+    # -- helpers for the write routes --------------------------------------
+
+    def _require_settings(self) -> SettingsStore:
+        if self._settings is None:
+            raise PermissionError("settings are not editable from this dashboard")
+        return self._settings
+
+    def _require_dictionary(self) -> Path:
+        if self._dictionary_db is None:
+            raise PermissionError("the dictionary is not available from this dashboard")
+        return self._dictionary_db
+
+    def _notify_settings_changed(self) -> dict[str, Any]:
+        """Let the engine hot-apply what it can. Never fails the request.
+
+        A settings write has already succeeded by the time this runs, so an
+        engine that cannot apply it must not turn a saved setting into an
+        error the user reads as "not saved".
+        """
+        if self._control.on_settings_changed is None:
+            return {}
+        try:
+            return self._control.on_settings_changed() or {}
+        except Exception:
+            logger.exception("engine failed to apply changed settings")
+            return {}
+
+
+def _safe_call(fn: Callable[[], Any] | None, default: Any) -> Any:
+    """Call an optional engine probe, or fall back.
+
+    ``/api/status`` is polled several times a second by the onboarding meters,
+    so one failing probe must degrade to its default rather than turning the
+    whole status route into a 500 and freezing the screen the user is on.
+    """
+    if fn is None:
+        return default
+    try:
+        return fn()
+    except Exception:
+        logger.debug("engine status probe failed", exc_info=True)
+        return default
 
 
 def _summary_dict(summary: Any) -> dict[str, Any]:
@@ -333,7 +565,7 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
         # HTTP/1.1 so the browser can keep one connection for the whole page
         # load rather than reconnecting per asset.
         protocol_version = "HTTP/1.1"
-        server_version = "Flow"
+        server_version = "Sway"
         sys_version = ""
 
         def log_message(self, format: str, *args: Any) -> None:
@@ -346,7 +578,7 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
 
         def _authorised(self, params: Mapping[str, list[str]]) -> bool:
             supplied = _one(params, "token", "") or (
-                self.headers.get("X-Flow-Token") or ""
+                self.headers.get("X-Sway-Token") or ""
             )
             # Constant-time: the token is short-lived, but a timing oracle on
             # loopback is cheap to close and cheaper than reasoning about it.
@@ -425,10 +657,19 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 self._json(HTTPStatus.OK, server.handle_command(parsed.path, payload))
+            except ActionError as exc:
+                # A problem with what was asked for, not a bug. The message is
+                # already written for a human, so it goes straight to the UI.
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
             except PermissionError as exc:
                 self._error(HTTPStatus.CONFLICT, str(exc))
             except KeyError:
                 self._error(HTTPStatus.NOT_FOUND, "unknown endpoint")
+            except SwayError as exc:
+                # Expected store-level failures (a locked database, a full
+                # disk) already carry a user-facing message.
+                logger.warning("dashboard command failed: %s", exc)
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             except Exception:
                 logger.exception("dashboard command failed")
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal error")

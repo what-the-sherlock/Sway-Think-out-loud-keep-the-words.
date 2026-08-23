@@ -22,7 +22,7 @@ import re
 import threading
 import unicodedata
 
-from flow.profiles import CleanupStyle
+from sway.profiles import CleanupStyle
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +78,63 @@ _PROMPT_BY_STYLE: dict[CleanupStyle, str] = {
 }
 
 
-def system_prompt_for_style(style: CleanupStyle, *, language: str | None = None) -> str:
+#: Appended only when :mod:`sway.corrections` found a retraction, so an
+#: ordinary utterance never pays for these tokens. The base prompts already ask
+#: for self-corrections to be resolved; this block exists because an 8B-class
+#: model applies that instruction unevenly to *entity* swaps -- a time, a name,
+#: a figure -- which is exactly the case users notice. The examples are the
+#: specification, and the last two are there to stop the model over-applying it.
+CORRECTION_DIRECTIVE = (
+    " The speaker corrected themselves somewhere in this transcript. Resolve "
+    "it: keep only what they settled on, and remove both the retracted words "
+    "and the correction marker itself. Change nothing else in the sentence. "
+    "If on reflection a phrase was not a correction, leave it exactly as "
+    "spoken. Examples:"
+    """
+Input: "I have a meeting at 7am, no no, it's at 8am."
+Output: "I have a meeting at 8am."
+Input: "Send this to John - actually, send it to Sarah."
+Output: "Send this to Sarah."
+Input: "The budget is five thousand - wait, make that fifty thousand."
+Output: "The budget is fifty thousand."
+Input: "We're using Stripe - sorry, I mean Paddle."
+Output: "We're using Paddle."
+Input: "I don't want to go, actually."
+Output: "I don't want to go, actually."
+Input: "We shipped Monday and, actually, Tuesday as well."
+Output: "We shipped Monday and, actually, Tuesday as well." """
+)
+
+
+#: Appended when the user has turned filler removal off. Phrased as an
+#: exception to the base prompt rather than by swapping the prompt out, so the
+#: stable prefix stays byte-identical and the rest of the contract (never
+#: answer, never translate, never add markdown) is stated exactly once.
+KEEP_FILLERS_DIRECTIVE = (
+    " Exception to the above: do not remove filler words. Keep \"um\", \"uh\", "
+    "\"like\", \"you know\" and similar hesitations exactly where the speaker "
+    "said them. Still fix grammar, capitalization, and punctuation, and still "
+    "resolve self-corrections."
+)
+
+
+def system_prompt_for_style(
+    style: CleanupStyle,
+    *,
+    language: str | None = None,
+    correction: bool = False,
+    remove_fillers: bool = True,
+) -> str:
     """The cleanup system prompt for a profile style, optionally pinned to the
     language Whisper detected.
+
+    ``correction`` appends :data:`CORRECTION_DIRECTIVE`. It is set from
+    :func:`sway.corrections.scan`, never guessed here, so the extra tokens are
+    spent only on the utterances that need them.
+
+    Everything variable is appended *after* the style prompt, which is
+    byte-identical across requests -- the ordering Groq's prompt caching needs
+    to be able to reuse the stable prefix.
 
     Naming the language is what stops an 8B-class model quietly answering a
     Hindi transcript in English: the shared rules already forbid translating,
@@ -95,6 +149,10 @@ def system_prompt_for_style(style: CleanupStyle, *, language: str | None = None)
             f" The transcript's primary language is {language}; reply in "
             f"{language}, preserving any other language the speaker used."
         )
+    if not remove_fillers:
+        prompt += KEEP_FILLERS_DIRECTIVE
+    if correction:
+        prompt += CORRECTION_DIRECTIVE
     return prompt
 
 
@@ -237,6 +295,12 @@ _RATIO_GUARD_MIN_WORDS = 3
 #: (shrinking past this) or answer/add commentary (growing past this).
 _MIN_LENGTH_RATIO = 0.3
 _MAX_LENGTH_RATIO = 2.0
+#: The floor when the speaker demonstrably retracted part of what they said.
+#: "The budget is five thousand -- wait, make that fifty thousand" is eleven
+#: words that correctly become four, a ratio of 0.36 that the normal floor
+#: barely clears and a slightly longer retraction would not. A correction is
+#: the one case where heavy shrinkage is the *right* answer.
+_CORRECTION_MIN_LENGTH_RATIO = 0.2
 #: For transcripts under _RATIO_GUARD_MIN_WORDS words, the model may add a
 #: little (capitalization, punctuation, expanding "don't"), but turning a
 #: couple of words into a paragraph means it answered rather than rewrote.
@@ -375,7 +439,13 @@ def _scripts(text: str) -> set[str]:
     return found
 
 
-def is_cleanup_output_safe(original: str, cleaned: str) -> bool:
+def is_cleanup_output_safe(
+    original: str,
+    cleaned: str,
+    *,
+    retracted: str = "",
+    correction_detected: bool = False,
+) -> bool:
     """Whether a cleanup rewrite may be pasted, or must be discarded in favor
     of the raw transcript.
 
@@ -393,6 +463,17 @@ def is_cleanup_output_safe(original: str, cleaned: str) -> bool:
       actually said.
 
     Callers fall back to ``original`` whenever this returns ``False``.
+
+    ``retracted`` is the span of the transcript the speaker took back -- see
+    :meth:`sway.corrections.CorrectionScan.retracted_text`. Entities inside it
+    are exempt from the lost-entity check, because "a meeting at 7am, no no,
+    it's at 8am" *must* lose the 7 to be correct, and without this exemption
+    the right answer is indistinguishable from the model dropping a number.
+    Only what the speaker withdrew is exempt; every other number, address, and
+    URL in the utterance is still protected.
+
+    ``correction_detected`` additionally lowers the shrink floor, since a
+    retraction legitimately removes more text than a tidy-up does.
     """
     text = cleaned.strip()
     if not text:
@@ -400,12 +481,13 @@ def is_cleanup_output_safe(original: str, cleaned: str) -> bool:
 
     original_words = word_count(original)
     cleaned_words = word_count(text)
+    floor = _CORRECTION_MIN_LENGTH_RATIO if correction_detected else _MIN_LENGTH_RATIO
     if original_words < _RATIO_GUARD_MIN_WORDS:
         if cleaned_words > original_words + _MAX_ABSOLUTE_WORD_GROWTH:
             return False
     else:
         ratio = cleaned_words / original_words
-        if not _MIN_LENGTH_RATIO <= ratio <= _MAX_LENGTH_RATIO:
+        if not floor <= ratio <= _MAX_LENGTH_RATIO:
             return False
 
     if _ASSISTANT_VOICE_PATTERN.match(text) and not _ASSISTANT_VOICE_PATTERN.match(original.strip()):
@@ -426,26 +508,37 @@ def is_cleanup_output_safe(original: str, cleaned: str) -> bool:
     if _scripts(original) - _scripts(text):
         return False
 
-    missing = _protected_entities(original) - _protected_entities(text)
+    missing = _protected_entities(original) - _protected_entities(text) - _protected_entities(retracted)
     return not missing
 
 
-def unsafe_reason(original: str, cleaned: str) -> str:
+def unsafe_reason(
+    original: str,
+    cleaned: str,
+    *,
+    retracted: str = "",
+    correction_detected: bool = False,
+) -> str:
     """A short label for *why* :func:`is_cleanup_output_safe` rejected a
     rewrite, for the latency record and the log line. Returns ``""`` when the
     rewrite is in fact safe.
+
+    Takes the same correction context as :func:`is_cleanup_output_safe` and
+    must be kept in step with it: a reason of ``""`` for a rewrite the check
+    rejected would log a rejection with no cause.
     """
     text = cleaned.strip()
     if not text:
         return "empty"
     original_words = word_count(original)
     cleaned_words = word_count(text)
+    floor = _CORRECTION_MIN_LENGTH_RATIO if correction_detected else _MIN_LENGTH_RATIO
     if original_words < _RATIO_GUARD_MIN_WORDS:
         if cleaned_words > original_words + _MAX_ABSOLUTE_WORD_GROWTH:
             return "grew"
     else:
         ratio = cleaned_words / original_words
-        if ratio < _MIN_LENGTH_RATIO:
+        if ratio < floor:
             return "shrank"
         if ratio > _MAX_LENGTH_RATIO:
             return "grew"
@@ -458,7 +551,7 @@ def unsafe_reason(original: str, cleaned: str) -> str:
         return "answered_question"
     if _scripts(original) - _scripts(text):
         return "language_changed"
-    missing = _protected_entities(original) - _protected_entities(text)
+    missing = _protected_entities(original) - _protected_entities(text) - _protected_entities(retracted)
     if missing:
         return f"lost_entity:{sorted(missing)[0][:32]}"
     return ""
@@ -518,6 +611,8 @@ class CleanupStats:
 
 __all__ = [
     "CLEANUP_SYSTEM_PROMPT",
+    "CORRECTION_DIRECTIVE",
+    "KEEP_FILLERS_DIRECTIVE",
     "FORMAL_CLEANUP_SYSTEM_PROMPT",
     "CleanupStats",
     "has_filler_markers",

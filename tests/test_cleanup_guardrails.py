@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from flow.cleanup import (
+from sway.cleanup import (
     CLEANUP_SYSTEM_PROMPT,
     has_filler_markers,
     is_cleanup_output_safe,
@@ -20,7 +20,7 @@ from flow.cleanup import (
     system_prompt_for_style,
     unsafe_reason,
 )
-from flow.profiles import CleanupStyle
+from sway.profiles import CleanupStyle
 
 # Hindi fixtures, spelled out so the file stays readable in any editor.
 HI_TOMORROW_TEN = "कल सुबह दस बजे ठीक रहेगा"
@@ -252,3 +252,112 @@ def test_every_style_prompt_forbids_translating_and_markdown():
         prompt = system_prompt_for_style(style)
         assert "Never translate" in prompt
         assert "no markdown" in prompt
+
+
+# ---------------------------------------------------------------------------
+# The correction exemption
+#
+# The entity guard treats every number in a transcript as protected. That is
+# right for a tidy-up and wrong for a retraction: "a meeting at 7am, no no,
+# it's at 8am" *must* lose the 7 to be correct, and without an exemption the
+# right answer is indistinguishable from the model dropping a figure. These
+# tests pin both halves -- that the exemption works, and that it stays narrow.
+# ---------------------------------------------------------------------------
+
+
+def test_a_retracted_number_may_disappear():
+    raw = "I have a meeting at 7am, no no, it's at 8am."
+    cleaned = "I have a meeting at 8am."
+    assert not is_cleanup_output_safe(raw, cleaned)
+    assert is_cleanup_output_safe(
+        raw, cleaned, retracted="7am, no no", correction_detected=True
+    )
+
+
+def test_a_retracted_time_may_disappear():
+    raw = "Call me at 10:30 - make that 11."
+    cleaned = "Call me at 11."
+    assert unsafe_reason(raw, cleaned) == "lost_entity:10:30"
+    assert is_cleanup_output_safe(
+        raw, cleaned, retracted="10:30 - make that", correction_detected=True
+    )
+
+
+def test_the_exemption_does_not_cover_untouched_entities():
+    """A correction licenses losing what the speaker took back, and nothing
+    else. The room number was never retracted and must survive."""
+    raw = "Meeting at 7am, no no, at 8am, in room 412."
+    assert is_cleanup_output_safe(
+        raw, "Meeting at 8am in room 412.", retracted="7am, no no", correction_detected=True
+    )
+    assert not is_cleanup_output_safe(
+        raw, "Meeting at 8am.", retracted="7am, no no", correction_detected=True
+    )
+
+
+def test_the_exemption_is_off_by_default():
+    """Every existing caller passes neither argument, so the defaults must
+    reproduce the old behaviour exactly."""
+    raw = "The invoice is 4471 and the total is 320."
+    cleaned = "The invoice is 4471."
+    assert not is_cleanup_output_safe(raw, cleaned)
+    assert unsafe_reason(raw, cleaned) == "lost_entity:320"
+
+
+def test_a_correction_lowers_the_shrink_floor():
+    """A long, stumbling retraction correctly collapses to a short sentence.
+    Twenty words becoming five is a ratio the ordinary floor rejects outright,
+    and rejecting it means pasting the whole stumble at the user's cursor."""
+    raw = (
+        "The budget for this whole project is five thousand pounds, no wait, "
+        "sorry, scratch that, make it fifty thousand pounds"
+    )
+    cleaned = "The budget is fifty thousand."
+    assert not is_cleanup_output_safe(raw, cleaned)
+    assert unsafe_reason(raw, cleaned) == "shrank"
+    assert is_cleanup_output_safe(raw, cleaned, correction_detected=True)
+
+
+def test_the_lowered_floor_still_rejects_a_summary():
+    """Relaxing the floor must not open the door to the model summarizing."""
+    raw = (
+        "So the plan is that we ship the beta on Tuesday, gather feedback for a "
+        "fortnight, and then decide whether the general release slips to the "
+        "following month or stays where it is on the roadmap."
+    )
+    assert not is_cleanup_output_safe(raw, "We ship Tuesday.", correction_detected=True)
+
+
+def test_unsafe_reason_agrees_with_the_check_under_a_correction():
+    """A rejection with no stated cause would be unloggable, so the two
+    functions have to stay in step under every argument combination."""
+    cases = [
+        ("Meeting at 7am, no no, at 8am, in room 412.", "Meeting at 8am.", "7am, no no"),
+        ("I have a meeting at 7am, no no, it's at 8am.", "I have a meeting at 8am.", "7am, no no"),
+        ("Send it to a@b.com, sorry, c@d.com.", "Send it to c@d.com.", "a@b.com, sorry"),
+    ]
+    for raw, cleaned, retracted in cases:
+        safe = is_cleanup_output_safe(
+            raw, cleaned, retracted=retracted, correction_detected=True
+        )
+        reason = unsafe_reason(raw, cleaned, retracted=retracted, correction_detected=True)
+        assert safe == (reason == "")
+
+
+def test_the_correction_directive_is_only_added_when_asked():
+    plain = system_prompt_for_style(CleanupStyle.CASUAL)
+    with_correction = system_prompt_for_style(CleanupStyle.CASUAL, correction=True)
+    assert "corrected themselves somewhere" not in plain
+    assert "corrected themselves somewhere" in with_correction
+    # The stable half must stay byte-identical and stay first, or Groq's
+    # prompt caching has nothing to reuse across requests.
+    assert with_correction.startswith(plain)
+
+
+def test_the_correction_directive_teaches_the_negative_cases():
+    """The examples are the specification. Without the two pass-through cases
+    the model over-applies the instruction and "I don't want to go, actually"
+    loses its negation."""
+    prompt = system_prompt_for_style(CleanupStyle.CASUAL, correction=True)
+    assert prompt.count("I don't want to go, actually.") == 2
+    assert prompt.count("We shipped Monday and, actually, Tuesday as well.") == 2
