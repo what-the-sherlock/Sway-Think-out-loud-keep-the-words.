@@ -835,6 +835,33 @@ function performancePanel() {
                 <div class="small muted" style="margin-top:12px">Median per stage. The widest bar is your latency budget.</div>`)}
         ${card(`<div class="sec-head"><span class="meta-label">Failures</span></div>${errors}`)}
       </div>
+      ${understandingPanel(p.understanding)}
+    </div>`;
+}
+
+// Counted from what actually happened on real dictations -- corrections
+// detected, transforms fired, snippets substituted. Nothing here is derived
+// from an assumption, so nothing here is labelled an estimate.
+function understandingPanel(u) {
+  if (!u || !u.dictations) return '';
+  const pct = (v) => (v === null || v === undefined ? DASH : fmt.pct(v));
+  return `
+    <div class="grid cols-3">
+      ${card(stat({
+        label: 'corrected mid-sentence',
+        value: fmt.int(u.corrections),
+        foot: `${pct(u.correction_rate)} of ${fmt.int(u.dictations)} dictations`,
+      }))}
+      ${card(stat({
+        label: 'resolved with no model call',
+        value: pct(u.no_model_call_rate),
+        foot: `${fmt.int(u.no_model_call)} needed nothing from the network`,
+      }))}
+      ${card(stat({
+        label: 'snippets and transforms',
+        value: fmt.int(u.snippets + u.transforms),
+        foot: `${fmt.int(u.snippets)} snippet${u.snippets === 1 ? '' : 's'}, ${fmt.int(u.transforms)} transform${u.transforms === 1 ? '' : 's'}`,
+      }))}
     </div>`;
 }
 

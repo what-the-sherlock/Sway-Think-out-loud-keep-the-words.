@@ -250,6 +250,7 @@ class DashboardServer:
                     "detail": health.detail,
                 }
                 perf["range"] = _one(params, "range", "30d")
+                perf["understanding"] = q.understanding(since=since)
                 return perf
             if path == "/api/status":
                 return self.status()

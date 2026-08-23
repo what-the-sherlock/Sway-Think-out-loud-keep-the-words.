@@ -599,6 +599,60 @@ class DashboardQueries:
             ),
         }
 
+    def understanding(self, *, since: float | None = None) -> dict[str, Any]:
+        """How often Sway acted on intent rather than transcribing literally.
+
+        Every figure here is counted from what the engine annotated on real
+        runs -- corrections detected, transforms fired, snippets substituted,
+        utterances resolved with no model call at all. Nothing is derived from
+        an assumption, so nothing here needs an "estimate" label; a database
+        with no runs in it reports zero rather than a plausible-looking number.
+        """
+        if not self.has_runs:
+            return _empty_understanding()
+
+        where, params = _time_window("started_at", since, None)
+        rows = [
+            row
+            for row in self._select(f"SELECT metadata FROM lat.runs{where}", params)
+            if not _was_skipped(row["metadata"])
+        ]
+        # Only dictations. A command or a transform run has no transcript to
+        # correct, and counting them would dilute the rate.
+        dictations = [
+            _metadata_dict(row["metadata"])
+            for row in rows
+            if _metadata_dict(row["metadata"]).get("source") == "hotkey"
+        ]
+        if not dictations:
+            return _empty_understanding()
+
+        corrections = [m for m in dictations if m.get("correction_detected")]
+        transforms = sum(int(m.get("transforms_fired") or 0) for m in dictations)
+        snippets = sum(int(m.get("triggers_fired") or 0) for m in dictations)
+        no_model = [m for m in dictations if m.get("cleanup_skipped")]
+
+        kinds: dict[str, int] = {}
+        for meta in corrections:
+            for kind in str(meta.get("correction_kinds") or "").split(","):
+                if kind:
+                    kinds[kind] = kinds.get(kind, 0) + 1
+
+        return {
+            "dictations": len(dictations),
+            "corrections": len(corrections),
+            "correction_rate": len(corrections) / len(dictations),
+            "transforms": transforms,
+            "snippets": snippets,
+            "no_model_call": len(no_model),
+            "no_model_call_rate": len(no_model) / len(dictations),
+            "correction_kinds": sorted(
+                ({"kind": name, "count": count} for name, count in kinds.items()),
+                key=lambda item: item["count"],
+                reverse=True,
+            ),
+        }
+
     def stage_breakdown(self, *, since: float | None = None) -> list[StageBreakdown]:
         """Median and p95 per pipeline stage, plus each stage's share of the
         total. This is what answers "why did that dictation feel slow?".
@@ -754,6 +808,19 @@ def _time_window(column: str, since: float | None, until: float | None) -> tuple
         clauses.append(f"{column} < ?")
         params.append(until)
     return ((" WHERE " + " AND ".join(clauses)) if clauses else "", params)
+
+
+def _empty_understanding() -> dict[str, Any]:
+    return {
+        "dictations": 0,
+        "corrections": 0,
+        "correction_rate": None,
+        "transforms": 0,
+        "snippets": 0,
+        "no_model_call": 0,
+        "no_model_call_rate": None,
+        "correction_kinds": [],
+    }
 
 
 def _metadata_dict(raw: Any) -> dict[str, Any]:

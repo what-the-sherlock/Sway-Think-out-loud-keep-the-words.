@@ -2,13 +2,14 @@
 # default, so an empty file behaves identically.
 #
 # Precedence: environment variables > this file > defaults.
-# Any option can be overridden as FLOW_<SECTION>_<OPTION>, e.g.
-#   FLOW_LATENCY_ENABLED=0   FLOW_LOGGING_LEVEL=DEBUG
+# Any option can be overridden as SWAY_<SECTION>_<OPTION>, e.g.
+#   SWAY_LATENCY_ENABLED=0   SWAY_LOGGING_LEVEL=DEBUG
+# The older FLOW_* prefix still works but logs a deprecation warning.
 #
 # Secrets never live here. GROQ_API_KEY belongs in .env (see .env.example).
 
 # Where the latency database and log file live.
-# Default: %LOCALAPPDATA%\Sway on Windows, $XDG_DATA_HOME/flow elsewhere.
+# Default: %LOCALAPPDATA%\Sway on Windows, $XDG_DATA_HOME/sway elsewhere.
 # data_dir = "D:/Whisper flow clone/.flow"
 
 [logging]
@@ -39,9 +40,11 @@ vad_padding_ms = 200         # speech-adjacent silence kept on each side of the 
 preroll_ms = 300
 
 [hotkey]
-key = "ctrl_r"                # hold to dictate; see flow.hotkey.KNOWN_KEYS for valid names
+key = "ctrl_r"                # hold to dictate; see sway.hotkey.KNOWN_KEYS for valid names
 min_hold_ms = 200             # holds shorter than this are treated as an accidental tap
 command_key = "shift_r"       # hold with text selected to run a voice command; "" disables commands
+# Per-transform shortcuts (e.g. Ctrl+Alt+P) are not configured here -- they are
+# part of each transform, editable in the app under Transforms.
 
 [groq]
 base_url = "https://api.groq.com"
@@ -62,10 +65,27 @@ skip_min_words = 8             # transcripts shorter than this with no filler wo
 reasoning_effort = "low"
 max_output_tokens = 2048       # ceiling so a runaway generation can't blow the latency budget
 skip_when_unconfident = true   # bypass the LLM when Whisper itself was unsure of the transcript
+# Self-correction ("meeting at 7, no, 8" -> "meeting at 8") overrides the two
+# heuristic skips above when a correction is detected, because those are the
+# cases they get wrong: a correction is often short, and a speaker who stumbles
+# is one Whisper is least confident about. It never overrides `enabled = false`
+# or a verbatim app profile. How hard Sway looks is a user setting, under
+# Settings > Voice > Understanding, not a value here.
 
 [dictionary]
 enabled = true                 # inject the personal dictionary into Whisper's prompt
-max_prompt_chars = 200         # caps how much of the dictionary is sent per request
+# Caps how much of the dictionary is sent per request. Whisper only attends to
+# roughly its last ~224 tokens, so this is a real ceiling rather than a
+# safety margin -- which is why terms are ordered by what you pinned and what
+# you actually say before being truncated to fit. Manage them in the app under
+# Dictionary, or with `sway dictionary add/remove/list`.
+max_prompt_chars = 200
+
+[analytics]
+# Your typing speed, used only for the "time saved" estimate on the dashboard.
+# That figure is labelled an estimate in the UI because it is derived from this
+# number rather than measured.
+typing_wpm = 45.0
 
 [streaming]
 # Off by default on measured evidence: Groq's whisper-large-v3-turbo returns
@@ -77,6 +97,9 @@ chunk_seconds = 5.0            # length of each background chunk sent while stil
 overlap_seconds = 1.0          # shared between consecutive chunks/tail, for boundary dedup
 poll_interval_s = 0.2          # how often the background worker checks whether a chunk is due
 
+# Voice commands and transforms over selected text. A transform bound to a
+# shortcut runs through this same path, but supplies its instruction from
+# storage, so it makes one request instead of two (no transcription).
 [commands]
 model = "openai/gpt-oss-20b"
 temperature = 0.2              # 0.0-2.0; low keeps the rewrite close to the instruction

@@ -65,12 +65,12 @@ POSITIVE: tuple[Case, ...] = (
     Case("Send this to John - actually, send it to Sarah.", True, "Sarah", "John"),
     Case("I'll be there Tuesday, sorry, Wednesday.", True, "Wednesday", "Tuesday"),
     Case("The budget is five thousand - wait, make that fifty thousand.", True, "fifty thousand"),
-    Case("I think we should launch in June... actually July would be better.", True, "July", "June"),
+    Case("I think we should launch in June... actually July would be better.", True, "launch in July", "June"),
     Case("Create a meeting for Monday at 3pm. No, Tuesday at 3pm.", True, "Tuesday", "Monday"),
     Case("We're using Stripe - sorry, I mean Paddle.", True, "Paddle", "Stripe"),
     Case("Let's meet Friday - sorry, Saturday.", True, "Saturday", "Friday"),
     Case("Call me at 10:30 - make that 11.", True, "11", "10:30"),
-    Case("Let's do Paris, no, London.", True, "London", "Paris"),
+    Case("Let's do Paris, no, London.", True, "do London", "Paris"),
     Case("Use the old API - sorry, the new API.", True, "new API"),
     Case("Meeting at 7, no, 8.", True, "8"),
 )
@@ -112,7 +112,40 @@ def run_detection(mode: str) -> tuple[int, list[str]]:
     return failures, lines
 
 
-def run_live(mode: str) -> tuple[int, list[str]]:
+async def _cleanup_with_backoff(client, text, config, *, correction):
+    """One cleanup call, retried once if the free tier says to wait.
+
+    GroqClient deliberately never retries a 429 -- in the app, making the user
+    wait is worse than pasting the raw transcript. A batch harness is the
+    opposite case: it is not on anyone's critical path, and a run that dies
+    two-thirds through measures nothing.
+    """
+    import asyncio
+
+    from sway.groq_client import GroqRateLimitError
+
+    for attempt in range(2):
+        try:
+            return await client.cleanup(
+                text,
+                system_prompt=system_prompt_for_style(
+                    CleanupStyle.CASUAL, correction=correction
+                ),
+                model=config.cleanup.model,
+                temperature=config.cleanup.temperature,
+                reasoning_effort=config.cleanup.reasoning_effort or None,
+                max_output_tokens=config.cleanup.max_output_tokens or None,
+            )
+        except GroqRateLimitError as exc:
+            if attempt:
+                raise
+            wait = (getattr(exc, "retry_after_s", None) or 10.0) + 1.0
+            print(f"  rate limited; waiting {wait:.0f}s", flush=True)
+            await asyncio.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def run_live(mode: str, *, delay: float) -> tuple[int, list[str]]:
     """The online half: one real cleanup call per case.
 
     Deliberately routed through the same guardrails the engine uses, because a
@@ -133,24 +166,27 @@ def run_live(mode: str) -> tuple[int, list[str]]:
 
     async def main() -> None:
         nonlocal failures
-        async with GroqClient(
-            api_key=config.groq_api_key.reveal(),
+        # GroqClient exposes aclose() rather than the async context manager
+        # protocol, so it is closed explicitly.
+        client = GroqClient(
+            config.groq_api_key,
             base_url=config.groq.base_url,
             timeout_s=config.groq.timeout_s,
             connect_timeout_s=config.groq.connect_timeout_s,
             max_retries=config.groq.max_retries,
-        ) as client:
-            for case in CASES:
+        )
+        try:
+            for index, case in enumerate(CASES):
                 result = scan(case.text, mode=mode)
-                response = await client.cleanup(
-                    case.text,
-                    system_prompt=system_prompt_for_style(
-                        CleanupStyle.CASUAL, correction=result.detected
-                    ),
-                    model=config.cleanup.model,
-                    temperature=config.cleanup.temperature,
-                    reasoning_effort=config.cleanup.reasoning_effort or None,
-                    max_output_tokens=config.cleanup.max_output_tokens or None,
+                if index:
+                    # Paced on purpose. The harness sends a request per case
+                    # back to back, which is nothing like real dictation and
+                    # walks straight into the free tier's tokens-per-minute
+                    # limit. The delay is the harness being a good citizen,
+                    # not a property of the feature.
+                    await asyncio.sleep(delay)
+                response = await _cleanup_with_backoff(
+                    client, case.text, config, correction=result.detected
                 )
                 candidate = normalize_cleanup_output(response.text, case.text)
                 retracted = result.retracted_text()
@@ -184,6 +220,8 @@ def run_live(mode: str) -> tuple[int, list[str]]:
                 lines.append(f"         -> {final}")
                 for problem in problems:
                     lines.append(f"         !! {problem}")
+        finally:
+            await client.aclose()
 
     asyncio.run(main())
     lines.append("-" * 78)
@@ -199,11 +237,17 @@ def main(argv: list[str] | None = None) -> int:
         help="also send each case to the cleanup model (needs a Groq key; ~21 requests)",
     )
     parser.add_argument("--mode", choices=MODES, default=DEFAULT_MODE)
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=3.0,
+        help="seconds between live requests, to stay inside the free tier (default: 3)",
+    )
     args = parser.parse_args(argv)
 
     failures, lines = run_detection(args.mode)
     if args.live:
-        live_failures, live_lines = run_live(args.mode)
+        live_failures, live_lines = run_live(args.mode, delay=args.delay)
         failures += live_failures
         lines += live_lines
 
