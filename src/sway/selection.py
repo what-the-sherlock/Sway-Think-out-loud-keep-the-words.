@@ -13,8 +13,8 @@ from __future__ import annotations
 import logging
 import time
 
-from flow.errors import FlowError
-from flow.platform import PlatformAdapter
+from sway.errors import SwayError
+from sway.platform import PlatformAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +50,13 @@ class SelectionReader:
     def read(self) -> str:
         try:
             previous = self._platform.clipboard_get()
-        except FlowError:
+        except SwayError:
             logger.warning("could not save the clipboard before reading a selection")
             previous = None
 
         try:
             self._platform.clipboard_set(_SENTINEL)
-        except FlowError:
+        except SwayError:
             logger.warning("could not clear the clipboard before reading a selection")
             return ""
 
@@ -66,7 +66,7 @@ class SelectionReader:
         if previous is not None:
             try:
                 self._platform.clipboard_set(previous)
-            except FlowError:
+            except SwayError:
                 logger.warning("could not restore the clipboard after reading a selection")
 
         return selected
@@ -76,7 +76,7 @@ class SelectionReader:
         while True:
             try:
                 current = self._platform.clipboard_get()
-            except FlowError:
+            except SwayError:
                 return ""
             if current != _SENTINEL:
                 return current

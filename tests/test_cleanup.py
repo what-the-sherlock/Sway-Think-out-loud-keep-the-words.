@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 
-from flow.cleanup import (
+from sway.cleanup import (
     CLEANUP_SYSTEM_PROMPT,
     FORMAL_CLEANUP_SYSTEM_PROMPT,
     CleanupStats,
@@ -17,7 +17,7 @@ from flow.cleanup import (
     system_prompt_for_style,
     word_count,
 )
-from flow.profiles import CleanupStyle
+from sway.profiles import CleanupStyle
 
 
 # -- word_count --------------------------------------------------------------
@@ -155,7 +155,7 @@ def test_stats_rejects_non_positive_log_every():
 
 def test_stats_logs_summary_at_info_every_log_every_records(caplog: "logging.LogCaptureFixture"):
     stats = CleanupStats(log_every=2)
-    with caplog.at_level(logging.INFO, logger="flow.cleanup"):
+    with caplog.at_level(logging.INFO, logger="sway.cleanup"):
         stats.record(skipped=True)
         assert not any(r.levelno == logging.INFO for r in caplog.records)
         stats.record(skipped=False)

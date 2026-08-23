@@ -32,8 +32,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
 
-from flow.analytics import DEFAULT_TYPING_WPM, time_saved_seconds
-from flow.errors import FlowError
+from sway.analytics import DEFAULT_TYPING_WPM, time_saved_seconds
+from sway.errors import SwayError
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ _V2_COLUMNS = frozenset(
 )
 
 
-class DashboardQueryError(FlowError):
+class DashboardQueryError(SwayError):
     """A dashboard read failed. Never fatal: the engine keeps dictating."""
 
 
@@ -653,7 +653,7 @@ class DashboardQueries:
             return Health(
                 "unknown",
                 "Not enough recent activity",
-                "Flow hasn't run a dictation in the last 24 hours, so there's nothing to assess.",
+                "Sway hasn't run a dictation in the last 24 hours, so there's nothing to assess.",
             )
 
         error_rate = recent["error_rate"] or 0.0

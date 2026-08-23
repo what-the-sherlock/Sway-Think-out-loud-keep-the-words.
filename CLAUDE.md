@@ -76,8 +76,28 @@ user-visible failure state on the overlay. On 429, surface which limit
 was hit by reading the response headers. The app must never hang with
 the mic hot.
 
+## Phase 6 — the product layer (the dashboard)
+The engine (Phases 0-5) is done. Phase 6 builds the interface around it:
+Overview, Activity, Insights, Performance, Dictionary, Snippets, Style,
+Voice Profile, Settings. Design language is dark-first and restrained
+(Linear/Raycast, not Bootstrap admin).
+
+Hard rule for this phase: **real data only.** If a metric cannot be
+measured, add the instrumentation or show an explicit "not available yet"
+state. Never fabricate WPM, latency, app usage, cost, corrections, or
+accuracy. Anything derived from an assumption (e.g. time saved, which
+compares against `[analytics].typing_wpm`) must be labelled an estimate
+in the UI.
+
+Metric hierarchy: productivity -> usage -> personalization -> performance
+-> infrastructure. Not: API calls -> latency -> tokens -> charts.
+
 ## What NOT to do
-- Do not add a web UI, FastAPI, or any localhost server.
+- Do not add FastAPI or a public network listener.
+- The dashboard UI is the ONE exception to the no-web-UI rule, agreed
+  deliberately: Tkinter cannot express the intended design. It is a local
+  desktop-shell UI only. Everything else (overlay, tray, hotkeys) stays
+  native, and no server may bind a public interface.
 - Do not add a database beyond SQLite.
 - Do not add features from later phases early.
 - Do not use `keyboard` (needs admin on Windows) — use pynput.

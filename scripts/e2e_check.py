@@ -39,18 +39,18 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:  # allow running without installing the package
     sys.path.insert(0, str(_SRC))
 
-from flow.audio.flac import encode_flac  # noqa: E402
-from flow.audio.vad import VadTrimmer  # noqa: E402
-from flow.cleanup import (  # noqa: E402
+from sway.audio.flac import encode_flac  # noqa: E402
+from sway.audio.vad import VadTrimmer  # noqa: E402
+from sway.cleanup import (  # noqa: E402
     is_cleanup_output_safe,
     normalize_cleanup_output,
     should_skip_cleanup,
     system_prompt_for_style,
     unsafe_reason,
 )
-from flow.config import load_config  # noqa: E402
-from flow.groq_client import GroqClient, GroqError  # noqa: E402
-from flow.profiles import CleanupStyle  # noqa: E402
+from sway.config import load_config  # noqa: E402
+from sway.groq_client import GroqClient, GroqError  # noqa: E402
+from sway.profiles import CleanupStyle  # noqa: E402
 
 DEFAULT_CLIPS = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "speech"
 

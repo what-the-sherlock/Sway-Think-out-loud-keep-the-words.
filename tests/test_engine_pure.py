@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from flow.engine import _failure_label, preroll_start_frame, should_process
-from flow.groq_client import GroqError, GroqRateLimitError
+from sway.engine import _failure_label, preroll_start_frame, should_process
+from sway.groq_client import GroqError, GroqRateLimitError
 
 
 # -- hold debouncing ---------------------------------------------------------

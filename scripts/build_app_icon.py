@@ -12,9 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from flow.branding import app_badge_image  # noqa: E402
+from sway.branding import app_badge_image  # noqa: E402
 
-OUTPUT = ROOT / "packaging" / "flow.ico"
+OUTPUT = ROOT / "packaging" / "sway.ico"
 _SIZES = [16, 24, 32, 48, 64, 128, 256]
 
 

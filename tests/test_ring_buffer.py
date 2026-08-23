@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from flow.audio.ring_buffer import RingBuffer
+from sway.audio.ring_buffer import RingBuffer
 
 
 def _pcm(*values: int) -> bytes:

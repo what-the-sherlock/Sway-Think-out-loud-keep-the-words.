@@ -22,15 +22,15 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from flow import APP_NAME, __version__
-from flow.config import Config, load_config
-from flow.platform import get_platform
-from flow.errors import AudioError, FlowError, LatencyStoreError
-from flow.latency.report import format_table, summarize
-from flow.latency.store import LatencyStore
-from flow.latency.tracker import LatencyTracker
-from flow.logging_setup import configure_logging
-from flow.pipeline.stub import STUB_STAGES, StubPipeline
+from sway import APP_NAME, __version__
+from sway.config import Config, load_config
+from sway.platform import get_platform
+from sway.errors import AudioError, SwayError, LatencyStoreError
+from sway.latency.report import format_table, summarize
+from sway.latency.store import LatencyStore
+from sway.latency.tracker import LatencyTracker
+from sway.logging_setup import configure_logging
+from sway.pipeline.stub import STUB_STAGES, StubPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ _DEFAULT_HISTORY_LIMIT = 50
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="flow",
+        prog="sway",
         description=f"{APP_NAME} - local voice dictation with LLM cleanup.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -100,20 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     startup = sub.add_parser(
         "startup",
-        help="show or change whether Flow starts automatically at login",
+        help="show or change whether Sway starts automatically at login",
     )
     startup_group = startup.add_mutually_exclusive_group()
     startup_group.add_argument(
-        "--enable", action="store_true", help="start Flow when you log in"
+        "--enable", action="store_true", help="start Sway when you log in"
     )
     startup_group.add_argument(
-        "--disable", action="store_true", help="stop starting Flow at login"
+        "--disable", action="store_true", help="stop starting Sway at login"
     )
     startup.set_defaults(handler=_cmd_startup)
 
     run = sub.add_parser(
         "run",
-        help="run Flow: hold the hotkey, speak, release to paste the transcript",
+        help="run Sway: hold the hotkey, speak, release to paste the transcript",
     )
     run.set_defaults(handler=_cmd_run)
 
@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard = sub.add_parser(
         "dashboard",
-        help="open the Flow dashboard in a browser",
+        help="open the Sway dashboard in a browser",
         description=(
             "Serves the dashboard on loopback and opens it. Standalone: it "
             "reports the history and latency already recorded, but cannot "
@@ -196,8 +196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = _load(args)
         configure_logging(config, force_level=args.log_level)
+        # After logging is configured (so the migration is visible in the log
+        # file) but before any handler touches a database. Never raises.
+        _migrate_from_legacy(config)
         return args.handler(args, config)
-    except FlowError as exc:
+    except SwayError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -208,8 +211,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _load(args: argparse.Namespace) -> Config:
     env = dict(os.environ)
     if args.data_dir is not None:
-        env["FLOW_DATA_DIR"] = str(args.data_dir)
+        env["SWAY_DATA_DIR"] = str(args.data_dir)
     return load_config(config_file=args.config, env=env)
+
+
+def _migrate_from_legacy(config: Config) -> None:
+    """Carry a pre-rename install forward. Best-effort by contract.
+
+    Imported lazily and wrapped: a migration problem must never be the reason
+    the app will not start, since the app works perfectly well with a fresh
+    data directory -- the user would just have lost their history, which the
+    log will say.
+    """
+    try:
+        from sway.migrate import migrate
+
+        migrate(data_dir=config.data_dir)
+    except Exception:
+        logger.warning("migration from the previous name failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -299,10 +318,10 @@ def _cmd_config(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
-def _startup_command() -> str | None:
+def startup_command() -> str | None:
     """The command line Windows should run at login, or ``None`` if unknown.
 
-    In a frozen build this is ``Flow.exe`` itself. From source there is no
+    In a frozen build this is ``Sway.exe`` itself. From source there is no
     single sensible answer -- the venv's python, the module, and the working
     directory all matter -- and registering a half-guessed command would
     leave a login entry that fails silently every morning. Better to decline.
@@ -326,12 +345,12 @@ def _cmd_startup(args: argparse.Namespace, config: Config) -> int:
         print("start at login: disabled" if ok else "could not change the setting")
         return 0 if ok else 1
 
-    command = _startup_command()
+    command = startup_command()
     if command is None:
         print(
             "error: only the packaged build can register itself to start at login.\n"
             "Running from source, the command to register is ambiguous (which\n"
-            "interpreter, which working directory), so Flow will not guess.",
+            "interpreter, which working directory), so Sway will not guess.",
             file=sys.stderr,
         )
         return 2
@@ -344,21 +363,30 @@ def _cmd_run(args: argparse.Namespace, config: Config) -> int:
     del args
     # Imported lazily so `flow demo`/`report`/`config` never pay for
     # importing sounddevice/pynput/httpx just to answer a Phase 0 question.
-    from flow.engine import Engine
+    from sway.engine import Engine
 
     if not config.groq_api_key:
+        # Not fatal any more. Onboarding lives inside the app window, so the
+        # app has to be running for the user to be able to give it a key at
+        # all. A console run still says so, because a terminal user is not
+        # going to see the window's onboarding by accident.
         print(
-            "error: GROQ_API_KEY is not set (copy .env.example to .env and fill it in)",
+            "note: no Groq API key yet — Sway will ask for one in its window.",
             file=sys.stderr,
         )
-        return 2
 
     tracker = LatencyTracker.from_config(config)
     engine = Engine(config, tracker)
     try:
         engine.start()
-        print(f"Flow is running. Hold {config.hotkey.key} to dictate. Ctrl+C to quit.", file=sys.stderr)
-        engine.run_overlay()
+        from sway.hotkey import prettify_hotkey
+
+        print(
+            f"Sway is running. Hold {prettify_hotkey(config.hotkey.key)} to dictate. "
+            "Ctrl+C to quit.",
+            file=sys.stderr,
+        )
+        engine.run_ui()
     except KeyboardInterrupt:
         # Ctrl+C from a console run is a normal quit, not a crash. The
         # `finally` below still performs the full shutdown.
@@ -369,7 +397,7 @@ def _cmd_run(args: argparse.Namespace, config: Config) -> int:
         # without this, the only durable record of a crash would be whatever
         # the user managed to read before clicking OK. Logged here rather
         # than in flow.gui so `python -m flow run` gets it too.
-        logger.exception("Flow stopped with an unhandled error")
+        logger.exception("Sway stopped with an unhandled error")
         raise
     finally:
         # Runs on every path including a crash, which is what keeps a failed
@@ -387,7 +415,7 @@ def _cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
     """
     import webbrowser
 
-    from flow.dashboard.server import DashboardServer
+    from sway.dashboard.server import DashboardServer
 
     server = DashboardServer(
         history_db=config.history_db_path,
@@ -396,7 +424,7 @@ def _cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
         port=args.port,
     )
     url = server.start()
-    print(f"Flow dashboard: {url}", file=sys.stderr)
+    print(f"Sway dashboard: {url}", file=sys.stderr)
     print("Press Ctrl+C to stop.", file=sys.stderr)
     if not args.no_browser:
         webbrowser.open(url)
@@ -413,7 +441,7 @@ def _cmd_dashboard(args: argparse.Namespace, config: Config) -> int:
 def _cmd_devices(args: argparse.Namespace, config: Config) -> int:
     del args, config
     # Imported lazily; see _cmd_run.
-    from flow.audio.capture import list_input_devices
+    from sway.audio.capture import list_input_devices
 
     try:
         devices = list_input_devices()
@@ -430,7 +458,7 @@ def _cmd_devices(args: argparse.Namespace, config: Config) -> int:
 
 
 def _cmd_dictionary_add(args: argparse.Namespace, config: Config) -> int:
-    from flow.dictionary import DictionaryStore
+    from sway.dictionary import DictionaryStore
 
     with DictionaryStore.open(config.dictionary_db_path) as store:
         added = store.add_many(args.terms)
@@ -440,7 +468,7 @@ def _cmd_dictionary_add(args: argparse.Namespace, config: Config) -> int:
 
 
 def _cmd_dictionary_remove(args: argparse.Namespace, config: Config) -> int:
-    from flow.dictionary import DictionaryStore
+    from sway.dictionary import DictionaryStore
 
     with DictionaryStore.open(config.dictionary_db_path) as store:
         removed = store.remove_many(args.terms)
@@ -451,7 +479,7 @@ def _cmd_dictionary_remove(args: argparse.Namespace, config: Config) -> int:
 
 def _cmd_dictionary_list(args: argparse.Namespace, config: Config) -> int:
     del args
-    from flow.dictionary import DictionaryStore
+    from sway.dictionary import DictionaryStore
 
     with DictionaryStore.open(config.dictionary_db_path) as store:
         terms = store.list_terms()
@@ -476,7 +504,7 @@ def _cmd_history_list(args: argparse.Namespace, config: Config) -> int:
         print("error: --last must be at least 1", file=sys.stderr)
         return 2
 
-    from flow.history import HistoryStore
+    from sway.history import HistoryStore
 
     with HistoryStore.open(config.history_db_path) as store:
         entries = store.search(args.search or "", kind=args.kind, limit=args.last)

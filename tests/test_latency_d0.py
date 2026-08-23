@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import json
 
-from flow.latency.models import STAGE_ORDER, RunRecord, Stage, StageTiming
-from flow.latency.report import format_table, summarize
-from flow.latency.store import LatencyStore
-from flow.latency.tracker import LatencyTracker
+from sway.latency.models import STAGE_ORDER, RunRecord, Stage, StageTiming
+from sway.latency.report import format_table, summarize
+from sway.latency.store import LatencyStore
+from sway.latency.tracker import LatencyTracker
 
 # The stage values that existed before D0. A rename orphans every historical
 # row carrying the old spelling, and the break is silent: the report simply

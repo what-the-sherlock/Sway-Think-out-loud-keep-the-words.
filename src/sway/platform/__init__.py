@@ -21,7 +21,7 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class PlatformAdapter(Protocol):
-    """Everything Flow needs from the host operating system."""
+    """Everything Sway needs from the host operating system."""
 
     #: Short, stable identifier used in logs and diagnostics.
     name: str
@@ -110,11 +110,11 @@ class PlatformAdapter(Protocol):
 def get_platform() -> PlatformAdapter:
     """Return the adapter for the current OS (cached; adapters are stateless)."""
     if sys.platform == "win32":
-        from flow.platform.windows import WindowsPlatform
+        from sway.platform.windows import WindowsPlatform
 
         return WindowsPlatform()
 
-    from flow.platform.posix import PosixPlatform
+    from sway.platform.posix import PosixPlatform
 
     return PosixPlatform()
 

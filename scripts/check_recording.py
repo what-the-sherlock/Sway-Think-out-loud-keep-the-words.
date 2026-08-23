@@ -1,11 +1,11 @@
-"""Is Flow recording dictations to latency.db right now?
+"""Is Sway recording dictations to latency.db right now?
 
 Diagnostic for when scripts/baseline.py sits at the same clip count while you
 speak. It answers three questions the harness cannot distinguish between:
 whether the app is writing runs at all, whether it is writing them where this
 script looks, and whether new runs carry the D0 stages the baseline needs.
 
-Run it with Flow running, dictate once, and watch.
+Run it with Sway running, dictate once, and watch.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from flow.config import load_config  # noqa: E402
-from flow.latency.store import LatencyStore  # noqa: E402
+from sway.config import load_config  # noqa: E402
+from sway.latency.store import LatencyStore  # noqa: E402
 
 
 def main() -> int:
@@ -27,7 +27,7 @@ def main() -> int:
     print(f"database        : {db}")
     print(f"exists          : {db.exists()}")
     if not db.exists():
-        print("\n-> Flow has never written a run here. Is `flow run` actually running,")
+        print("\n-> Sway has never written a run here. Is `flow run` actually running,")
         print("   and did it start from the same config as this script?")
         return 1
     print(f"last modified   : {time.strftime('%H:%M:%S', time.localtime(db.stat().st_mtime))}")
@@ -58,7 +58,7 @@ def main() -> int:
                 print(f"\n  RECORDED: ok={run.ok} total={run.total_ms:.0f}ms")
                 print(f"  stages: {stages}")
                 if "hotkey_hold" not in stages:
-                    print("\n  -> No hotkey_hold stage. This Flow is running PRE-D0 code.")
+                    print("\n  -> No hotkey_hold stage. This Sway is running PRE-D0 code.")
                     print("     Restart it from this branch so the new stages are recorded.")
                     return 1
                 print("\n  -> Recording works. baseline.py should advance too.")
@@ -66,9 +66,9 @@ def main() -> int:
         time.sleep(0.25)
 
     print("\n  NOTHING RECORDED in 30s.")
-    print("  -> The hotkey is not reaching Flow, or the hold was under 200ms,")
-    print(f"     or Flow is writing somewhere other than {db}.")
-    print("     Check the Flow window for log output while you hold the key.")
+    print("  -> The hotkey is not reaching Sway, or the hold was under 200ms,")
+    print(f"     or Sway is writing somewhere other than {db}.")
+    print("     Check the Sway window for log output while you hold the key.")
     return 1
 
 

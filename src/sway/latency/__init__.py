@@ -8,10 +8,10 @@ sub-1000ms budget is being met.
 
 from __future__ import annotations
 
-from flow.latency.models import RunRecord, Stage, StageTiming
-from flow.latency.report import Summary, StageStats, format_table, percentile, summarize
-from flow.latency.store import LatencyStore
-from flow.latency.tracker import LatencyTracker, RunRecorder
+from sway.latency.models import RunRecord, Stage, StageTiming
+from sway.latency.report import Summary, StageStats, format_table, percentile, summarize
+from sway.latency.store import LatencyStore
+from sway.latency.tracker import LatencyTracker, RunRecorder
 
 __all__ = [
     "LatencyStore",

@@ -27,10 +27,31 @@ INK = (235, 236, 240)
 SURFACE = (26, 27, 32)
 SURFACE_RAISED = (38, 40, 47)
 
+#: Accents. Four tokens, each with exactly one job -- the discipline recorded
+#: in docs/ui-reference-analysis.md §5, with Sway's own hue rather than the
+#: benchmark's lilac.
+#:
+#: indigo = the brand, and so "Sway is working on it"
+#: amber  = "this is your hotkey". Recording is the hotkey being held, which
+#:          makes it the one runtime state that carries colour.
+#: red    = something needs you
+#: grey   = off / absent, deliberately not a fifth hue
+#:
+#: An earlier palette spent red on *recording* -- the most frequent, most
+#: benign state -- which left no colour meaning "act on this", and gave the
+#: hotkey no colour at all.
+ACCENT_BRAND = (79, 70, 229)
+ACCENT_RECORDING = (255, 184, 77)
+ACCENT_ERROR = (229, 72, 77)
 ACCENT_IDLE = (108, 111, 125)
-ACCENT_RECORDING = (255, 77, 94)
-ACCENT_THINKING = (74, 168, 255)
-ACCENT_ERROR = (255, 171, 46)
+
+#: Kept as a name because the tray tints the whole mark and needs a token for
+#: "nothing is happening", which is the ink colour rather than an accent.
+ACCENT_NEUTRAL = INK
+
+#: The processing state uses the brand colour. Aliased rather than duplicated
+#: so there is one indigo in the file.
+ACCENT_THINKING = ACCENT_BRAND
 
 
 @lru_cache(maxsize=1)

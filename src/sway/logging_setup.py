@@ -11,14 +11,14 @@ import logging.handlers
 import sys
 from pathlib import Path
 
-from flow.config import Config
+from sway.config import Config
 
 _CONSOLE_FORMAT = "%(levelname)-7s %(name)s: %(message)s"
 _FILE_FORMAT = "%(asctime)s %(levelname)-7s %(name)s [%(threadName)s]: %(message)s"
 
 #: Root of the application's logger tree. Configuring this instead of the real
 #: root logger keeps third-party libraries from inheriting our handlers.
-LOGGER_NAME = "flow"
+LOGGER_NAME = "sway"
 
 
 def configure_logging(config: Config, *, force_level: str | None = None) -> logging.Logger:

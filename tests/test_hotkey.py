@@ -8,8 +8,8 @@ has no logic of its own beyond delegating to the tracker.
 
 from __future__ import annotations
 
-from flow.hotkey import KNOWN_KEYS, KeyHoldTracker
-from flow.config import _VALID_HOTKEYS  # noqa: PLC2701 - deliberately checking sync, see below
+from sway.hotkey import KNOWN_KEYS, KeyHoldTracker
+from sway.config import _VALID_HOTKEYS  # noqa: PLC2701 - deliberately checking sync, see below
 
 
 def test_first_press_fires():

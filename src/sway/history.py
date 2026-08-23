@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
-from flow.analytics import SessionMetrics, count_words
-from flow.errors import HistoryStoreError
+from sway.analytics import SessionMetrics, count_words
+from sway.errors import HistoryStoreError
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class HistoryStore:
         if version > SCHEMA_VERSION:
             raise HistoryStoreError(
                 f"history database schema v{version} is newer than this build "
-                f"(v{SCHEMA_VERSION}); upgrade Flow or delete the database"
+                f"(v{SCHEMA_VERSION}); upgrade Sway or delete the database"
             )
         if version == SCHEMA_VERSION:
             return
@@ -281,6 +281,30 @@ class HistoryStore:
             raise HistoryStoreError(f"could not delete history entry: {exc}") from exc
         return cursor.rowcount > 0
 
+    def delete_all(self) -> int:
+        """Remove every entry and every correction. Returns rows removed.
+
+        D6's "delete all" must actually wipe the rows rather than hide them,
+        so this is a real DELETE followed by a VACUUM: without the vacuum the
+        transcript text stays readable in the file's free pages, which makes
+        "delete all" a lie to anyone who opens the .db in a hex editor.
+        Corrections are removed explicitly because ``ON DELETE CASCADE`` only
+        fires when foreign keys are enabled, which is off by default in
+        sqlite3 and not something this store turns on.
+        """
+        try:
+            with self._lock:
+                cursor = self._conn.execute("DELETE FROM history_entries")
+                removed = cursor.rowcount or 0
+                self._conn.execute("DELETE FROM corrections")
+                self._conn.commit()
+                # VACUUM cannot run inside a transaction; commit() above ends
+                # the implicit one sqlite3 opens for the DELETEs.
+                self._conn.execute("VACUUM")
+            return removed
+        except sqlite3.Error as exc:
+            raise HistoryStoreError(f"could not delete history: {exc}") from exc
+
     def prune(self, retention_days: int, *, now: float | None = None) -> int:
         """Delete entries older than ``retention_days``. Returns rows removed."""
         if retention_days <= 0:
@@ -365,7 +389,7 @@ class HistoryStore:
         """Record that ``original`` was fixed to ``corrected``. Returns the id.
 
         Recorded explicitly (from the session detail view) rather than
-        inferred: Flow cannot see what the user edits after the paste lands
+        inferred: Sway cannot see what the user edits after the paste lands
         in another application, and guessing from clipboard activity would
         manufacture data the dashboard then presents as measured fact.
         """

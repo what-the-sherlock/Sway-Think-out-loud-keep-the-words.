@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from flow.audio.vad import VadTrimmer
+from sway.audio.vad import VadTrimmer
 
 
 class FakeVad:

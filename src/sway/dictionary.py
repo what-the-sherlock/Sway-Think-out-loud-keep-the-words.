@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Self
 
-from flow.errors import DictionaryStoreError
+from sway.errors import DictionaryStoreError
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ class DictionaryStore:
         if version > SCHEMA_VERSION:
             raise DictionaryStoreError(
                 f"dictionary database schema v{version} is newer than this build "
-                f"(v{SCHEMA_VERSION}); upgrade Flow or delete the database"
+                f"(v{SCHEMA_VERSION}); upgrade Sway or delete the database"
             )
         if version == SCHEMA_VERSION:
             return

@@ -12,8 +12,8 @@ from __future__ import annotations
 import logging
 import threading
 
-from flow.errors import FlowError, PasteBlockedError
-from flow.platform import PlatformAdapter
+from sway.errors import SwayError, PasteBlockedError
+from sway.platform import PlatformAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class TextInjector:
             )
         try:
             previous = self._platform.clipboard_get()
-        except FlowError:
+        except SwayError:
             logger.warning("could not read the clipboard to save it; pasting anyway")
             previous = None
 
@@ -72,7 +72,7 @@ class TextInjector:
             return
         try:
             current = self._platform.clipboard_get()
-        except FlowError:
+        except SwayError:
             logger.debug("could not read the clipboard before restoring it; restoring anyway")
         else:
             if current != injected:
@@ -82,7 +82,7 @@ class TextInjector:
                 return
         try:
             self._platform.clipboard_set(previous)
-        except FlowError:
+        except SwayError:
             logger.warning("could not restore the original clipboard contents")
 
 

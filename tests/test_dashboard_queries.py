@@ -14,11 +14,11 @@ from datetime import date, timedelta
 
 import pytest
 
-from flow.analytics import session_metrics
-from flow.dashboard.queries import DashboardQueries, percentile
-from flow.history import KIND_DICTATION, HistoryStore
-from flow.latency.models import RunRecord, StageTiming
-from flow.latency.store import LatencyStore
+from sway.analytics import session_metrics
+from sway.dashboard.queries import DashboardQueries, percentile
+from sway.history import KIND_DICTATION, HistoryStore
+from sway.latency.models import RunRecord, StageTiming
+from sway.latency.store import LatencyStore
 
 DAY = 86_400.0
 

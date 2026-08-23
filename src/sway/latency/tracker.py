@@ -28,15 +28,15 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from flow.errors import FlowError
-from flow.latency.models import RunRecord, Stage, StageTiming
-from flow.latency.store import LatencyStore
+from sway.errors import SwayError
+from sway.latency.models import RunRecord, Stage, StageTiming
+from sway.latency.store import LatencyStore
 
 logger = logging.getLogger(__name__)
 
 #: Dedicated logger for per-stage timing events, so timings can be turned on
 #: (or routed elsewhere) without enabling debug logging for the whole app.
-stage_logger = logging.getLogger("flow.latency.stages")
+stage_logger = logging.getLogger("sway.latency.stages")
 
 _NS_PER_MS = 1_000_000.0
 
@@ -375,7 +375,7 @@ class LatencyTracker:
             removed = store.prune(self._retention_days)
             if removed:
                 logger.info("pruned %d latency run(s) older than %d day(s)", removed, self._retention_days)
-        except FlowError as exc:
+        except SwayError as exc:
             # Degraded mode: keep draining so producers never block, but write
             # nothing. The app keeps dictating; only measurement is lost.
             logger.error("latency tracking disabled: %s", exc)
@@ -408,7 +408,7 @@ class LatencyTracker:
             if batch and store is not None:
                 try:
                     store.insert_runs(batch)
-                except FlowError as exc:
+                except SwayError as exc:
                     logger.error("could not persist %d latency record(s): %s", len(batch), exc)
                 except Exception:  # pragma: no cover - never kill the writer
                     logger.exception("unexpected error persisting latency records")

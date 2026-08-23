@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flow.analytics import (
+from sway.analytics import (
     MAX_PLAUSIBLE_WPM,
     count_words,
     format_duration,

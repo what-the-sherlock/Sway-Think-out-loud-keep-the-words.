@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from flow.audio.flac import encode_flac
+from sway.audio.flac import encode_flac
 
 
 def _pcm(*values: int) -> bytes:

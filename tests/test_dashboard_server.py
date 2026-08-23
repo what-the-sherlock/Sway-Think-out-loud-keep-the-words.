@@ -14,7 +14,7 @@ import urllib.request
 
 import pytest
 
-from flow.dashboard.server import DashboardServer, EngineControl
+from sway.dashboard.server import DashboardServer, EngineControl
 
 
 @pytest.fixture
@@ -88,7 +88,7 @@ class TestAuth:
     def test_token_also_accepted_as_a_header(self, server) -> None:
         request = urllib.request.Request(
             f"http://127.0.0.1:{server.port}/api/status",
-            headers={"X-Flow-Token": server.token},
+            headers={"X-Sway-Token": server.token},
         )
         with urllib.request.urlopen(request) as response:
             assert response.status == 200
@@ -297,7 +297,7 @@ class TestLegacySchema:
         """If the schema still cannot be read, the dashboard reports empty
         rather than 500 -- a loud failure here would read as the *engine*
         being broken, which it would not be."""
-        from flow.dashboard.queries import DashboardQueries
+        from sway.dashboard.queries import DashboardQueries
 
         history = tmp_path / "history.db"
         self._write_v1(history)  # opened directly, without the migration

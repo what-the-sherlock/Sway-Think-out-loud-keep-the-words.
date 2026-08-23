@@ -16,9 +16,9 @@ import json
 import httpx
 import pytest
 
-from flow.config import Secret
-from flow.errors import FlowError
-from flow.groq_client import (
+from sway.config import Secret
+from sway.errors import SwayError
+from sway.groq_client import (
     CHAT_COMPLETIONS_PATH,
     GroqClient,
     GroqError,
@@ -168,8 +168,8 @@ def test_construction_rejects_negative_max_retries():
 
 
 def test_groq_rate_limit_error_is_a_flow_error():
-    assert issubclass(GroqRateLimitError, FlowError)
-    assert issubclass(GroqError, FlowError)
+    assert issubclass(GroqRateLimitError, SwayError)
+    assert issubclass(GroqError, SwayError)
 
 
 # -- _extract_delta (SSE chunk parsing) ---------------------------------------

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pynput.keyboard import Controller, Key
 
-from flow.errors import ClipboardError
+from sway.errors import ClipboardError
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ def _is_process_elevated(handle: int) -> bool | None:
 class WindowsPlatform:
     """Target platform. Uses %LOCALAPPDATA% for both data and config.
 
-    Config would conventionally live in the roaming %APPDATA%, but Flow's
+    Config would conventionally live in the roaming %APPDATA%, but Sway's
     config is machine-specific (audio device, hotkey) and belongs next to the
     latency database it points at, so both live under LOCALAPPDATA.
     """
@@ -270,7 +270,7 @@ class WindowsPlatform:
 
     def focused_process_name(self) -> str | None:
         """Best-effort: any failure (no focused window, a protected process
-        Flow lacks rights to query, ...) returns None rather than raising, per
+        Sway lacks rights to query, ...) returns None rather than raising, per
         the PlatformAdapter contract -- profile selection just falls back to
         the default profile.
         """

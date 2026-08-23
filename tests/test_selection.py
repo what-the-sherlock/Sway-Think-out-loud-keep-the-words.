@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from flow.errors import ClipboardError
-from flow.selection import SelectionReader
+from sway.errors import ClipboardError
+from sway.selection import SelectionReader
 
 
 class FakePlatform:

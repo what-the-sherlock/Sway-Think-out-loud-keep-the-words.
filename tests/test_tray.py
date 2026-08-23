@@ -22,7 +22,7 @@ import types
 
 import pytest
 
-from flow.tray import TrayIcon, TrayState
+from sway.tray import TrayIcon, TrayState
 
 
 class _FakeIcon:
@@ -77,6 +77,7 @@ def _tray(**overrides):
         "on_show_history": lambda: None,
         "on_quit": lambda: None,
         "on_open_dashboard": lambda: None,
+        "on_open_settings": lambda: None,
         "on_view_logs": lambda: None,
         "is_listening": lambda: True,
         "set_listening": lambda _value: None,
@@ -101,31 +102,42 @@ def test_start_runs_the_icon_loop(fake_pystray) -> None:
     assert tray._thread is not None and not tray._thread.is_alive()
 
 
-def test_menu_contains_the_d1_items(fake_pystray) -> None:
+def test_menu_contains_the_expected_items(fake_pystray) -> None:
     tray = _tray()
     assert tray.start() is True
     tray.stop(timeout=2.0)
 
     labels = [item.text for item in tray._icon.menu if isinstance(item, _FakeMenuItem)]
     assert labels == [
-        "Open Dashboard",
+        # Named for the application, not for one screen inside it.
+        "Open Sway",
         "Agent enabled",
-        "Show History",
+        "Settings",
         "View Logs",
         "Quit",
     ]
-    # Settings is deferred to D5, when there is a pane behind it. A menu item
-    # that opens nothing reads as a bug.
-    assert "Settings" not in labels
 
 
-def test_optional_items_are_omitted_when_no_callback_is_given(fake_pystray) -> None:
-    tray = _tray(on_open_dashboard=None, on_view_logs=None, set_listening=None)
+def test_settings_is_omitted_without_a_handler(fake_pystray) -> None:
+    """The rule that kept Settings out until D5 still holds: a menu item that
+    opens nothing reads as a bug, so it appears only with a pane behind it."""
+    tray = _tray(on_open_settings=None)
     assert tray.start() is True
     tray.stop(timeout=2.0)
 
     labels = [item.text for item in tray._icon.menu if isinstance(item, _FakeMenuItem)]
-    assert labels == ["Show History", "Quit"]
+    assert "Settings" not in labels
+
+
+def test_optional_items_are_omitted_when_no_callback_is_given(fake_pystray) -> None:
+    tray = _tray(
+        on_open_dashboard=None, on_open_settings=None, on_view_logs=None, set_listening=None
+    )
+    assert tray.start() is True
+    tray.stop(timeout=2.0)
+
+    labels = [item.text for item in tray._icon.menu if isinstance(item, _FakeMenuItem)]
+    assert labels == ["Quit"]
 
 
 def test_toggling_the_agent_flips_the_state_and_refreshes_the_menu(fake_pystray) -> None:
@@ -180,13 +192,13 @@ def test_a_failing_callback_does_not_escape_the_handler(fake_pystray) -> None:
     tray loop and take the icon away for the rest of the session."""
 
     def _boom() -> None:
-        raise RuntimeError("no history store")
+        raise RuntimeError("the window will not open")
 
-    tray = _tray(on_show_history=_boom)
+    tray = _tray(on_open_settings=_boom)
     tray.start()
     tray.stop(timeout=2.0)
 
-    item = next(i for i in tray._icon.menu if getattr(i, "text", "") == "Show History")
+    item = next(i for i in tray._icon.menu if getattr(i, "text", "") == "Settings")
     item.action(tray._icon, item)  # must swallow, not propagate
 
 

@@ -1,18 +1,18 @@
 """Standalone tray-icon probe: does pystray work on this machine at all?
 
-Flow's tray icon renders but ignores every click. Three fixes aimed at menu
+Sway's tray icon renders but ignores every click. Three fixes aimed at menu
 dispatch changed nothing, and dispatch verifies correct against real pystray
-in isolation -- so the question is no longer "is Flow's menu code right?" but
+in isolation -- so the question is no longer "is Sway's menu code right?" but
 "do tray clicks reach this process at all?".
 
 This script answers that with nothing but pystray. No engine, no hotkey, no
 audio, no Tk, no dashboard. If its icon responds, the platform is fine and
-the fault is in how Flow arranges things around it. If this icon is *also*
-inert, the fault is below Flow entirely -- pystray, the shell, or an orphaned
+the fault is in how Sway arranges things around it. If this icon is *also*
+inert, the fault is below Sway entirely -- pystray, the shell, or an orphaned
 icon left behind by a crashed process -- and no amount of work in flow/tray.py
 would ever have fixed it.
 
-Run it while Flow is closed, so there is no doubt which icon is which:
+Run it while Sway is closed, so there is no doubt which icon is which:
 
     python scripts/tray_probe.py
 
@@ -34,8 +34,8 @@ from PIL import Image, ImageDraw  # noqa: E402
 
 
 def _image() -> Image.Image:
-    """A plain red square. Deliberately not Flow's mark: the whole point is
-    to be able to tell this icon apart from any Flow icon, live or orphaned,
+    """A plain red square. Deliberately not Sway's mark: the whole point is
+    to be able to tell this icon apart from any Sway icon, live or orphaned,
     at a glance in a crowded notification area."""
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     ImageDraw.Draw(image).rectangle((4, 4, 59, 59), fill=(220, 40, 40, 255))
@@ -68,7 +68,7 @@ def main() -> int:
         ),
     )
 
-    # Same private hook Flow installs, for the same reason: it is the only
+    # Same private hook Sway installs, for the same reason: it is the only
     # way to see whether Windows delivers anything at all.
     original = icon._on_notify
 
@@ -155,10 +155,10 @@ def main() -> int:
     print("=" * 70)
     if clicks:
         print(f"RESULT: the tray works. {len(clicks)} item(s) clicked: {clicks}")
-        print("-> pystray and the shell are fine; the fault is in how Flow uses them.")
+        print("-> pystray and the shell are fine; the fault is in how Sway uses them.")
     else:
         print("RESULT: no clicks were ever received.")
-        print("-> The fault is below Flow: pystray, the shell, or a stale icon.")
+        print("-> The fault is below Sway: pystray, the shell, or a stale icon.")
     return 0
 
 

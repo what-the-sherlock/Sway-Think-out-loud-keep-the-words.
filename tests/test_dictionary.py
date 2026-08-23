@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from flow.dictionary import DictionaryStore, build_prompt_bias
-from flow.errors import DictionaryStoreError
+from sway.dictionary import DictionaryStore, build_prompt_bias
+from sway.errors import DictionaryStoreError
 
 
 @pytest.fixture

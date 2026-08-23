@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 
-from flow import instance
+from sway import instance
 
 
 def _alive(_pid: int) -> bool:

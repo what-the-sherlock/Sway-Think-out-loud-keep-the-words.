@@ -29,6 +29,7 @@ from sway.settings import (
     CLEANUP_STYLES,
     CONTEXT_MODES,
     MAX_PAYLOAD_CHARS,
+    MAX_NAME_CHARS,
     MAX_PHRASE_CHARS,
     MAX_TRIGGERS,
     OVERLAY_POSITIONS,
@@ -173,6 +174,10 @@ def save_trigger(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
     """
     current = store.get()
     phrase = _require_str(payload, "phrase", max_chars=MAX_PHRASE_CHARS)
+    # Optional: a snippet the user calls "Intro email" is triggered by saying
+    # "intro email", and most of the time those are the same string. Only the
+    # phrase is required.
+    name = _optional_str(payload, "name", max_chars=MAX_NAME_CHARS) or ""
 
     kind = payload.get("type", "macro")
     if kind not in TRIGGER_TYPES:
@@ -212,6 +217,7 @@ def save_trigger(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
             updated.append(
                 Trigger(
                     id=existing.id,
+                    name=name,
                     phrase=phrase,
                     payload=payload_text,
                     type=kind,
@@ -229,6 +235,7 @@ def save_trigger(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
         updated.append(
             Trigger(
                 id=trigger_id or _new_id(),
+                name=name,
                 phrase=phrase,
                 payload=payload_text,
                 type=kind,
@@ -267,10 +274,13 @@ def trigger_view(settings: Settings) -> list[dict[str, Any]]:
     return [
         {
             "id": t.id,
+            "name": t.name,
+            "label": t.display_name(),
             "phrase": t.phrase,
             "payload": t.payload,
             "type": t.type,
             "enabled": t.enabled,
+            "created_at": t.created_at,
             "conflicts": [
                 by_id[other].phrase for other in conflicts.get(t.id, []) if other in by_id
             ],

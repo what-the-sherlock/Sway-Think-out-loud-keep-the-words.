@@ -1,7 +1,7 @@
 """Create Start-menu / Desktop shortcuts for the packaged app.
 
 The packaged build lives in ``dist/flow/``, which is not somewhere a user
-should have to navigate to. This puts Flow where Windows expects an installed
+should have to navigate to. This puts Sway where Windows expects an installed
 app to be: the Start menu, so it is reachable from the keyboard, and
 optionally the Desktop and the per-user Startup folder.
 
@@ -28,10 +28,10 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DIST_APP = PROJECT_ROOT / "dist" / "flow" / "Flow.exe"
+DIST_APP = PROJECT_ROOT / "dist" / "sway" / "Sway.exe"
 
 #: What the shortcut is called. Also how it is found again to remove it.
-SHORTCUT_NAME = "Flow.lnk"
+SHORTCUT_NAME = "Sway.lnk"
 
 
 def _shell_folders() -> dict[str, Path]:
@@ -66,7 +66,7 @@ $w = New-Object -ComObject WScript.Shell
 $s = $w.CreateShortcut('{shortcut}')
 $s.TargetPath = '{target}'
 $s.WorkingDirectory = '{working_dir}'
-$s.Description = 'Flow - voice dictation'
+$s.Description = 'Sway - voice dictation'
 {icon_line}
 $s.Save()
 """
@@ -78,7 +78,7 @@ $s.Save()
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--startup", action="store_true", help="also launch Flow when you log in"
+        "--startup", action="store_true", help="also launch Sway when you log in"
     )
     parser.add_argument("--remove", action="store_true", help="remove the shortcuts")
     args = parser.parse_args(argv)
@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    icon = PROJECT_ROOT / "packaging" / "flow.ico"
+    icon = PROJECT_ROOT / "packaging" / "sway.ico"
     wanted = ["Start menu", "Desktop"] + (["Startup"] if args.startup else [])
     for label in wanted:
         shortcut = folders[label] / SHORTCUT_NAME
@@ -114,12 +114,12 @@ def main(argv: list[str] | None = None) -> int:
     env_file = DIST_APP.parent / ".env"
     if not env_file.is_file():
         print(
-            f"\nnote: {env_file} does not exist, so Flow will start and ask for a\n"
-            "Groq API key. Copy your .env next to Flow.exe to avoid that.",
+            f"\nnote: {env_file} does not exist, so Sway will start and ask for a\n"
+            "Groq API key. Copy your .env next to Sway.exe to avoid that.",
             file=sys.stderr,
         )
 
-    print("\nFlow is now in your Start menu. Press the Windows key and type 'Flow'.")
+    print("\nFlow is now in your Start menu. Press the Windows key and type 'Sway'.")
     return 0
 
 

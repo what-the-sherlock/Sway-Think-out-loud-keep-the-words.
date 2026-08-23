@@ -10,7 +10,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from flow.latency.models import STAGE_ORDER, TOTAL_ROW, RunRecord
+from sway.latency.models import STAGE_ORDER, TOTAL_ROW, RunRecord
 
 #: Percentiles shown in the table, in column order.
 PERCENTILES: tuple[float, ...] = (50.0, 90.0, 99.0)

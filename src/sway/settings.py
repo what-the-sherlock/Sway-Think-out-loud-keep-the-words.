@@ -76,6 +76,7 @@ TRIGGER_TYPES = ("macro", "date")
 #: every utterance), not to second-guess reasonable input.
 MAX_TRIGGERS = 200
 MAX_PHRASE_CHARS = 80
+MAX_NAME_CHARS = 80
 MAX_PAYLOAD_CHARS = 4000
 MAX_APP_RULES = 200
 
@@ -100,6 +101,14 @@ class Trigger:
     type: str = "macro"
     enabled: bool = True
     created_at: float = 0.0
+    #: What the user calls this snippet in the UI, which is not always what
+    #: they say to trigger it ("Intro email" vs. the phrase "intro email").
+    #: Empty means "no separate name" and the phrase is shown instead, so
+    #: every trigger written by an older build keeps working untouched.
+    name: str = ""
+
+    def display_name(self) -> str:
+        return self.name.strip() or self.phrase
 
     def normalised_phrase(self) -> str:
         """Lower-cased, whitespace-collapsed, punctuation-trimmed.
@@ -240,6 +249,7 @@ def _parse_trigger(raw: Any, *, seen: set[str]) -> Trigger | None:
 
     return Trigger(
         id=_as_optional_str(raw.get("id"), name="trigger.id", max_chars=64) or _new_id(),
+        name=_as_optional_str(raw.get("name"), name="trigger.name", max_chars=MAX_NAME_CHARS) or "",
         phrase=phrase,
         payload=payload or "",
         type=kind,
@@ -594,6 +604,7 @@ __all__ = [
     "CONTEXT_MODES",
     "DEFAULTS",
     "MAX_PAYLOAD_CHARS",
+    "MAX_NAME_CHARS",
     "MAX_PHRASE_CHARS",
     "MAX_TRIGGERS",
     "OVERLAY_POSITIONS",

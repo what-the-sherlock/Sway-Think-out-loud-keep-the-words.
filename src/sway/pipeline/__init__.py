@@ -7,6 +7,6 @@ stages with the real ones behind the same tracker API.
 
 from __future__ import annotations
 
-from flow.pipeline.stub import STUB_STAGES, StubPipeline, StubStageSpec
+from sway.pipeline.stub import STUB_STAGES, StubPipeline, StubStageSpec
 
 __all__ = ["STUB_STAGES", "StubPipeline", "StubStageSpec"]

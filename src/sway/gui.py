@@ -1,4 +1,4 @@
-"""Entry point for the windowed build (``Flow.exe``), the one a non-technical
+"""Entry point for the windowed build (``Sway.exe``), the one a non-technical
 user double-clicks.
 
 It differs from :mod:`flow.cli` in exactly two ways, both consequences of
@@ -24,43 +24,46 @@ import logging
 import traceback
 from collections.abc import Sequence
 
-from flow import APP_NAME
-from flow.errors import FlowError
-from flow.platform import PlatformAdapter, get_platform
+from sway import APP_NAME
+from sway.errors import SwayError
+from sway.platform import PlatformAdapter, get_platform
 
 logger = logging.getLogger(__name__)
 
 #: Identifies this app's single-instance lock. Version-independent on
 #: purpose: two *different* builds running at once would double-paste just
 #: as surely as two copies of one build.
-_INSTANCE_LOCK_NAME = "FlowDictation.SingleInstance"
+_INSTANCE_LOCK_NAME = "Sway.SingleInstance"
 
-_NO_API_KEY_MESSAGE = (
-    "Flow needs a Groq API key before it can transcribe anything.\n\n"
-    "1. Get a free key at https://console.groq.com/keys\n"
-    "2. In the same folder as Flow.exe, create a new text file named .env\n"
-    "   (in Notepad: File > Save As, then set 'Save as type' to 'All Files'\n"
-    "   and name it exactly .env)\n"
-    "3. Put one line in it: GROQ_API_KEY=your-key-here\n\n"
-    "Then start Flow again."
-)
+#: The name the lock had before the rename. A pre-rename Flow.exe still
+#: holds *this* mutex, not the one above -- so taking only the new name
+#: would let an old build and a new one run side by side, each with its
+#: own hotkey hook, pasting every dictation twice.
+_LEGACY_INSTANCE_LOCK_NAME = "FlowDictation.SingleInstance"
 
 _ALREADY_RUNNING_MESSAGE = (
-    "Flow is already running.\n\n"
+    "Sway is already running.\n\n"
     "Look for its icon in the notification area (the '^' arrow next to the "
     "clock). Running a second copy would type everything you dictate twice."
 )
 
+_LEGACY_RUNNING_MESSAGE = (
+    "An older copy of this app (called Flow) is still running.\n\n"
+    "Quit it from its icon in the notification area, then start Sway again.\n\n"
+    "Running both at once would type everything you dictate twice."
+)
+
+
 
 def main_windowed(argv: Sequence[str] | None = None) -> int:
-    """``Flow.exe``'s entry point. Never raises: every failure path ends in a
+    """``Sway.exe``'s entry point. Never raises: every failure path ends in a
     dialog and a non-zero return code.
     """
     # Imported here, not at module scope: this module is the very first thing
     # the frozen app runs, and a syntax/import error anywhere in the CLI's
     # dependency tree would otherwise crash before the dialog machinery below
     # exists to report it.
-    from flow.cli import main as cli_main
+    from sway.cli import main as cli_main
 
     platform = get_platform()
     args = list(argv) if argv is not None else []
@@ -69,18 +72,28 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
         if not platform.acquire_single_instance_lock(_INSTANCE_LOCK_NAME):
             return _focus_running_instance(platform)
 
+        # Taking the legacy name too. If it is already held, a pre-rename
+        # build owns it and is running its own hotkey hook; starting anyway
+        # would double-paste every dictation. Holding it when it is free is
+        # harmless and stops an old build being launched alongside this one.
+        if not platform.acquire_single_instance_lock(_LEGACY_INSTANCE_LOCK_NAME):
+            platform.show_message(APP_NAME, _LEGACY_RUNNING_MESSAGE, error=True)
+            return 1
+
         # Only the bare, double-clicked case defaults to `run`; an explicit
         # argument list is passed through untouched so a shortcut with
         # arguments still behaves like the CLI.
         if not args:
             args = ["run"]
 
-        if args == ["run"] and not _has_api_key():
-            platform.show_message(f"{APP_NAME} — setup needed", _NO_API_KEY_MESSAGE, error=True)
-            return 2
+        # No API key is deliberately *not* handled here any more. It used to
+        # be a dead end: a dialog telling the user to create a .env file in
+        # Notepad, which is exactly the "terminal, browser tab, config file"
+        # experience this build exists to remove. The app now starts without
+        # a key and collects one through onboarding in its own window.
 
         code = cli_main(args)
-    except FlowError as exc:
+    except SwayError as exc:
         # Expected, user-facing failures (bad config, unopenable database):
         # the message is already written for a human, so show it as-is.
         platform.show_message(f"{APP_NAME} — error", str(exc), error=True)
@@ -89,7 +102,7 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
         detail = traceback.format_exc(limit=3)
         platform.show_message(
             f"{APP_NAME} — unexpected error",
-            f"Flow hit an unexpected problem and stopped.\n\n{detail}\n{_log_hint()}",
+            f"Sway hit an unexpected problem and stopped.\n\n{detail}\n{_log_hint()}",
             error=True,
         )
         return 1
@@ -99,7 +112,7 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
         # here, so the log file is the only place that detail survives.
         platform.show_message(
             f"{APP_NAME} — error",
-            f"Flow could not start (exit code {code}).\n\n{_log_hint()}",
+            f"Sway could not start (exit code {code}).\n\n{_log_hint()}",
             error=True,
         )
     return code
@@ -114,10 +127,10 @@ def _focus_running_instance(platform: PlatformAdapter) -> int:
     A dialog appears only when we could not reach it, which is the case the
     user actually has to act on.
     """
-    from flow import instance
+    from sway import instance
 
     try:
-        from flow.config import load_config
+        from sway.config import load_config
 
         data_dir = load_config().data_dir
     except Exception:
@@ -141,37 +154,24 @@ def _focus_running_instance(platform: PlatformAdapter) -> int:
     # Alive, advertised, and not answering. Say so plainly and name the
     # process, but do not kill it: this path also covers a first instance
     # that is merely busy, and killing that would lose a dictation in
-    # flight. D5's settings pane is where an explicit "restart Flow"
+    # flight. D5's settings pane is where an explicit "restart Sway"
     # action belongs.
     platform.show_message(
         APP_NAME,
-        f"Flow is already running (process {info.pid}), but it is not responding.\n\n"
-        "If it seems stuck, end that process in Task Manager and start Flow again.",
+        f"Sway is already running (process {info.pid}), but it is not responding.\n\n"
+        "If it seems stuck, end that process in Task Manager and start Sway again.",
         error=True,
     )
     return 1
 
 
-def _has_api_key() -> bool:
-    """Whether a key is configured, tolerating a config that fails to load --
-    a broken config is a different failure, reported by the normal path with
-    its own specific message rather than mislabelled as a missing key.
-    """
-    try:
-        from flow.config import load_config
-
-        return bool(load_config().groq_api_key)
-    except Exception:
-        return True
-
-
 def _log_hint() -> str:
     try:
-        from flow.config import load_config
+        from sway.config import load_config
 
         return f"Details are in:\n{load_config().log_file_path}"
     except Exception:
-        return "Details may be in Flow's log file, under %LOCALAPPDATA%\\Flow."
+        return "Details may be in Sway's log file, under %LOCALAPPDATA%\\Sway."
 
 
 __all__ = ["main_windowed"]

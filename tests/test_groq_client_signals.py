@@ -12,7 +12,7 @@ import json
 import httpx
 import pytest
 
-from flow.groq_client import (
+from sway.groq_client import (
     HIGH_NO_SPEECH_PROB,
     LOW_CONFIDENCE_AVG_LOGPROB,
     TranscriptionResult,

@@ -377,9 +377,28 @@ Freezes Flow into a self-contained Windows build that needs no Python install:
 
 ```powershell
 uv pip install -e ".[build]"
+python scripts/build_app.py
+```
+
+`scripts/build_app.py` is the one-command path: it runs PyInstaller, copies
+your `.env` next to the executable, deletes `build\`, and puts Flow in your
+Start menu and on the Desktop. Add `--startup` to launch it at login.
+
+**Why it deletes `build\`:** that is PyInstaller's scratch directory, and it
+contains a `Flow.exe` that is only a bootloader stub. Double-clicking it fails
+with *"Failed to load Python DLL python311.dll"*, because the `_internal\`
+runtime it needs was written to `dist\` instead. It sits one folder away from
+the real executable and looks identical in Explorer, so the build script
+removes it and leaves exactly one Flow.exe on disk — the working one.
+
+The individual steps, if you need them separately:
+
+```powershell
 python scripts/build_logo_asset.py   # only if the source artwork changed
 python scripts/build_app_icon.py     # only if the mark/palette changed
 pyinstaller packaging/flow.spec
+python scripts/install_shortcuts.py  # --startup to launch at login
+                                     # --remove to take them away again
 ```
 
 That produces `dist\flow\`, the whole shippable unit — zip it and hand it to
@@ -428,5 +447,6 @@ parsing, key-repeat debouncing, clipboard injection against a fake platform,
 chunk-boundary dedup, voice-command message building, selection reading against
 a fake platform, the history store — not the audio callback or the pynput/Tk/
 pystray listener wiring themselves.
-#   S w a y - - - T h i n k - o u t - l o u d - k e e p - t h e - w o r d s .  
+#   S w a y - - - T h i n k - o u t - l o u d - k e e p - t h e - w o r d s . 
+ 
  

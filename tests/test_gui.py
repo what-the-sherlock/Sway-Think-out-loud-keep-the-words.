@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import pytest
 
-from flow import gui
-from flow.errors import ConfigError, FlowError
+from sway import gui
+from sway.errors import ConfigError, SwayError
 
 
 class FakePlatform:
     name = "fake"
 
-    def __init__(self, *, lock_available: bool = True) -> None:
+    def __init__(self, *, lock_available: bool = True, held: set[str] | None = None) -> None:
         self._lock_available = lock_available
+        #: Names an "other process" already owns, so the legacy double-paste
+        #: guard can be exercised without a second real process.
+        self._held = held or set()
         self.messages: list[tuple[str, str, bool]] = []
         self.lock_names: list[str] = []
 
@@ -31,6 +34,8 @@ class FakePlatform:
 
     def acquire_single_instance_lock(self, name: str) -> bool:
         self.lock_names.append(name)
+        if name in self._held:
+            return False
         return self._lock_available
 
 
@@ -38,9 +43,6 @@ class FakePlatform:
 def platform(monkeypatch: pytest.MonkeyPatch) -> FakePlatform:
     fake = FakePlatform()
     monkeypatch.setattr(gui, "get_platform", lambda: fake)
-    # Default to "a key is configured" so tests that aren't about the key
-    # don't all have to say so; the key-specific tests override it.
-    monkeypatch.setattr(gui, "_has_api_key", lambda: True)
     return fake
 
 
@@ -57,7 +59,7 @@ def _patch_cli(monkeypatch: pytest.MonkeyPatch, result):
             raise result
         return result
 
-    monkeypatch.setattr("flow.cli.main", fake_main)
+    monkeypatch.setattr("sway.cli.main", fake_main)
     return calls
 
 
@@ -95,12 +97,12 @@ def _blocked_second_launch(monkeypatch: pytest.MonkeyPatch, tmp_path):
     fake = FakePlatform(lock_available=False)
     monkeypatch.setattr(gui, "get_platform", lambda: fake)
 
-    from flow import instance as instance_module
+    from sway import instance as instance_module
 
     class _Config:
         data_dir = tmp_path
 
-    monkeypatch.setattr("flow.config.load_config", lambda *a, **k: _Config())
+    monkeypatch.setattr("sway.config.load_config", lambda *a, **k: _Config())
     return fake, instance_module
 
 
@@ -173,46 +175,50 @@ def test_the_instance_lock_is_taken_before_anything_else(
 ):
     _patch_cli(monkeypatch, 0)
     gui.main_windowed([])
-    assert platform.lock_names == [gui._INSTANCE_LOCK_NAME]
+    # Both names, in order: the current one, then the pre-rename one whose
+    # holder would be an old build running its own hotkey hook.
+    assert platform.lock_names == [
+        gui._INSTANCE_LOCK_NAME,
+        gui._LEGACY_INSTANCE_LOCK_NAME,
+    ]
+
+
+def test_a_pre_rename_build_still_running_blocks_startup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The double-paste guard.
+
+    A pre-rename Flow.exe holds the *old* mutex, not the new one. Without
+    this check both builds would start, both would hook the hotkey, and every
+    dictation would paste twice.
+    """
+    fake = FakePlatform(held={gui._LEGACY_INSTANCE_LOCK_NAME})
+    monkeypatch.setattr(gui, "get_platform", lambda: fake)
+    calls = _patch_cli(monkeypatch, 0)
+
+    assert gui.main_windowed([]) == 1
+    assert calls == []  # never reaches the engine
+    _title, text, is_error = fake.messages[0]
+    assert is_error is True
+    assert "older copy" in text
+    assert "twice" in text
 
 
 # -- the missing-API-key path (the likeliest first run for a shared build) ----
 
 
-def test_missing_api_key_shows_actionable_setup_instructions(
+def test_a_missing_api_key_no_longer_blocks_launch(
     platform: FakePlatform, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(gui, "_has_api_key", lambda: False)
+    """The old behaviour was a dead end: a dialog telling the user to make a
+    .env file in Notepad. Onboarding now runs inside the app window, so the
+    app must start without a key rather than refusing to."""
     calls = _patch_cli(monkeypatch, 0)
 
-    assert gui.main_windowed([]) == 2
-    assert calls == []  # never reaches the CLI; nothing to transcribe with
-    _title, text, is_error = platform.messages[0]
-    assert is_error is True
-    assert "console.groq.com/keys" in text
-    assert ".env" in text
-
-
-def test_a_missing_key_does_not_block_non_run_commands(
-    platform: FakePlatform, monkeypatch: pytest.MonkeyPatch
-):
-    # `flow config` and friends are useful precisely when the key is missing.
-    monkeypatch.setattr(gui, "_has_api_key", lambda: False)
-    calls = _patch_cli(monkeypatch, 0)
-    assert gui.main_windowed(["config"]) == 0
-    assert calls == [["config"]]
-
-
-def test_has_api_key_fails_open_when_the_config_cannot_be_loaded(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    # A broken config is a different problem with its own message; it must
-    # not be reported as "you forgot your API key".
-    def boom():
-        raise ConfigError("unknown option [audio].nope")
-
-    monkeypatch.setattr("flow.config.load_config", boom)
-    assert gui._has_api_key() is True
+    assert gui.main_windowed([]) == 0
+    assert calls == [["run"]]
+    # Nothing to tell the user here -- the window asks them itself.
+    assert platform.messages == []
 
 
 # -- failure reporting -------------------------------------------------------
@@ -221,7 +227,7 @@ def test_has_api_key_fails_open_when_the_config_cannot_be_loaded(
 def test_expected_flow_errors_are_shown_verbatim(
     platform: FakePlatform, monkeypatch: pytest.MonkeyPatch
 ):
-    _patch_cli(monkeypatch, FlowError("could not open the microphone"))
+    _patch_cli(monkeypatch, SwayError("could not open the microphone"))
     assert gui.main_windowed([]) == 1
     _title, text, is_error = platform.messages[0]
     assert "could not open the microphone" in text

@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from flow.latency.models import Stage
-from flow.latency.store import LatencyStore
-from flow.latency.tracker import LatencyTracker
+from sway.latency.models import Stage
+from sway.latency.store import LatencyStore
+from sway.latency.tracker import LatencyTracker
 
 
 @pytest.fixture

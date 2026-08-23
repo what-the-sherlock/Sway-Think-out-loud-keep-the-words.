@@ -28,11 +28,40 @@ from pathlib import Path
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from flow import APP_NAME
-from flow.errors import ConfigError
-from flow.platform import get_platform
+from sway import APP_NAME
+from sway.errors import ConfigError
+from sway.platform import get_platform
 
-_ENV_PREFIX = "FLOW_"
+_ENV_PREFIX = "SWAY_"
+#: Honoured for continuity across the Flow -> Sway rename. ``SWAY_`` always
+#: wins; a ``FLOW_`` variable is used only when its ``SWAY_`` counterpart is
+#: absent, and using one is logged once so the deprecation is visible rather
+#: than silent.
+_LEGACY_ENV_PREFIX = "FLOW_"
+
+#: Set once the first legacy variable is seen, so the warning is not repeated
+#: for every field on every config load.
+_warned_legacy_env = False
+
+
+def _env_lookup(env: Mapping[str, str], suffix: str) -> str | None:
+    """Read ``SWAY_<suffix>``, falling back to ``FLOW_<suffix>``."""
+    value = env.get(f"{_ENV_PREFIX}{suffix}")
+    if value is not None:
+        return value
+    legacy = env.get(f"{_LEGACY_ENV_PREFIX}{suffix}")
+    if legacy is not None:
+        global _warned_legacy_env
+        if not _warned_legacy_env:
+            _warned_legacy_env = True
+            logging.getLogger(__name__).warning(
+                "%s%s is deprecated; rename it to %s%s",
+                _LEGACY_ENV_PREFIX,
+                suffix,
+                _ENV_PREFIX,
+                suffix,
+            )
+    return legacy
 _CONFIG_FILENAME = "config.toml"
 _ENV_FILENAME = ".env"
 
@@ -305,7 +334,7 @@ class TrayConfig:
     """The system tray icon and menu (Phase 5). See flow.tray.
 
     Best-effort: if the tray backend cannot be started (no system tray
-    available, the optional dependency failed to import), Flow logs a warning
+    available, the optional dependency failed to import), Sway logs a warning
     and keeps running without one rather than failing to start.
     """
 
@@ -363,7 +392,7 @@ class Config:
 
     @property
     def log_file_path(self) -> Path:
-        return self.data_dir / "flow.log"
+        return self.data_dir / "sway.log"
 
     def redacted_dict(self) -> dict[str, Any]:
         """A plain dict safe to print or log."""
@@ -522,9 +551,12 @@ def _build_section(cls: type, table: Mapping[str, Any], env: Mapping[str, str], 
         values[key] = _coerce(hints[key], raw, f"[{name}].{key}")
 
     for field_name in sorted(known):
-        env_key = f"{_ENV_PREFIX}{name.upper()}_{field_name.upper()}"
-        if env_key in env:
-            values[field_name] = _coerce(hints[field_name], env[env_key], env_key)
+        env_suffix = f"{name.upper()}_{field_name.upper()}"
+        raw_env = _env_lookup(env, env_suffix)
+        if raw_env is not None:
+            values[field_name] = _coerce(
+                hints[field_name], raw_env, f"{_ENV_PREFIX}{env_suffix}"
+            )
 
     return cls(**values)
 
@@ -538,7 +570,7 @@ def bundle_dir() -> Path | None:
     """The directory holding the executable in a frozen (PyInstaller) build,
     else ``None`` when running from source.
 
-    A packaged copy of Flow is handed to someone as a folder they unzip
+    A packaged copy of Sway is handed to someone as a folder they unzip
     somewhere and double-click, and the ``.env`` holding their API key
     naturally lives in that same folder. Searching only the *working*
     directory would find it when launched from Explorer (which sets the
@@ -568,7 +600,7 @@ def _find_config_file(explicit: Path | None, env: Mapping[str, str]) -> Path | N
             raise ConfigError(f"config file not found: {explicit}")
         return explicit
 
-    from_env = env.get(f"{_ENV_PREFIX}CONFIG")
+    from_env = _env_lookup(env, "CONFIG")
     if from_env:
         candidate = Path(from_env).expanduser()
         if not candidate.is_file():
@@ -686,6 +718,31 @@ def _validate(config: Config) -> None:
         raise ConfigError("[paste].restore_delay_ms must be >= 0")
 
 
+def _resolve_api_key(merged_env: Mapping[str, str]) -> str:
+    """The Groq key, from the credential store or the environment.
+
+    Resolution order lives in :mod:`flow.credentials` so there is exactly one
+    place that answers "where does the key come from". Kept behind a function
+    rather than inlined because the import is deliberately lazy: ``keyring``
+    touches the Windows vault, and ``flow config`` on a machine with a broken
+    credential store must still print a configuration.
+
+    Falls back to the plain environment lookup this function replaced if the
+    credentials module cannot be used at all, so a key in ``.env`` keeps
+    working no matter what.
+    """
+    try:
+        from sway import credentials
+
+        key, _source = credentials.resolve_key(merged_env)
+        return key
+    except Exception:  # pragma: no cover - defensive
+        logging.getLogger(__name__).debug(
+            "falling back to the plain environment for the API key", exc_info=True
+        )
+        return merged_env.get("GROQ_API_KEY", "").strip()
+
+
 def load_config(
     *,
     config_file: Path | None = None,
@@ -744,7 +801,7 @@ def load_config(
         if value is not None and not isinstance(value, dict):
             raise ConfigError(f"[{name}] must be a table in {path}")
 
-    raw_data_dir = merged_env.get(f"{_ENV_PREFIX}DATA_DIR") or table.get("data_dir")
+    raw_data_dir = _env_lookup(merged_env, "DATA_DIR") or table.get("data_dir")
     data_dir = (
         _coerce(Path, raw_data_dir, f"{_ENV_PREFIX}DATA_DIR")
         if raw_data_dir
@@ -753,7 +810,7 @@ def load_config(
 
     config = Config(
         data_dir=data_dir.resolve(),
-        groq_api_key=Secret(merged_env.get("GROQ_API_KEY", "").strip()),
+        groq_api_key=Secret(_resolve_api_key(merged_env)),
         logging=_build_section(LoggingConfig, table.get("logging") or {}, merged_env, "logging"),
         latency=_build_section(LatencyConfig, table.get("latency") or {}, merged_env, "latency"),
         audio=_build_section(AudioConfig, table.get("audio") or {}, merged_env, "audio"),

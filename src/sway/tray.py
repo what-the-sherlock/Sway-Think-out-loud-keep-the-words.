@@ -7,10 +7,13 @@ Windows and then a second, unrelated implementation per other OS later --
 that would work against CLAUDE.md's ``platform/`` isolation goal (one
 interface, OS-specific code behind it) rather than for it.
 
-Menu (D1): Open Dashboard, Agent On/Off, View Logs, Show History, Quit.
-Settings is deliberately **absent** until D5 builds the pane behind it -- a
-menu item that opens nothing reads as a bug, which is worse than a menu that
-does not yet offer the feature.
+Menu: Open Sway, Agent enabled, Settings, View Logs, Quit.
+
+Deliberately short. The Sway Bar owns the frequent actions -- history, paste,
+device, language -- because it floats where the user is already looking. What
+is left here is lifecycle: show the window, arm or disarm the agent, reach
+the logs, and quit. Both surfaces read the same engine state, so they cannot
+disagree about whether the agent is on.
 
 The icon reflects engine state (:class:`TrayState`), so the notification area
 answers "is it listening?" without opening anything. State changes arrive
@@ -54,11 +57,11 @@ class TrayState(StrEnum):
 #: without being clicked, so it carries the state in words as well as colour --
 #: colour alone is not something every user can read.
 _TOOLTIPS: dict[TrayState, str] = {
-    TrayState.IDLE: "Flow — ready",
-    TrayState.LISTENING: "Flow — listening",
-    TrayState.PROCESSING: "Flow — transcribing",
-    TrayState.ERROR: "Flow — last dictation failed",
-    TrayState.DISABLED: "Flow — paused",
+    TrayState.IDLE: "Sway — ready",
+    TrayState.LISTENING: "Sway — listening",
+    TrayState.PROCESSING: "Sway — transcribing",
+    TrayState.ERROR: "Sway — last dictation failed",
+    TrayState.DISABLED: "Sway — paused",
 }
 
 
@@ -66,7 +69,7 @@ def _build_icon_image(state: TrayState) -> Any:
     # Shared with the overlay pill and every window's title-bar icon (see
     # flow.branding) so the tray icon visibly belongs to the same app rather
     # than being yet another ad-hoc shape.
-    from flow.branding import app_badge_image
+    from sway.branding import app_badge_image
 
     return app_badge_image(_ICON_SIZE, state=str(state))
 
@@ -86,12 +89,14 @@ class TrayIcon:
         on_show_history: Callable[[], None],
         on_quit: Callable[[], None],
         on_open_dashboard: Callable[[], None] | None = None,
+        on_open_settings: Callable[[], None] | None = None,
         on_view_logs: Callable[[], None] | None = None,
         is_listening: Callable[[], bool] | None = None,
         set_listening: Callable[[bool], None] | None = None,
     ) -> None:
         self._on_show_history = on_show_history
         self._on_open_dashboard = on_open_dashboard
+        self._on_open_settings = on_open_settings
         self._on_view_logs = on_view_logs
         self._on_quit = on_quit
         self._is_listening = is_listening
@@ -110,12 +115,11 @@ class TrayIcon:
             image = _build_icon_image(self._state)
             items = []
             if self._on_open_dashboard is not None:
-                # Default: this is what a double-click on the tray icon runs,
-                # and the dashboard is now the app's main window in spirit.
+                # Default: what a double-click on the tray icon runs. Named
+                # for the application, not for one screen inside it -- the
+                # window is the app now, not a dashboard the app can show.
                 items.append(
-                    pystray.MenuItem(
-                        "Open Dashboard", self._handle_open_dashboard, default=True
-                    )
+                    pystray.MenuItem("Open Sway", self._handle_open_dashboard, default=True)
                 )
             if self._set_listening is not None and self._is_listening is not None:
                 # A checkbox rather than two items: "Agent On" and "Agent Off"
@@ -128,7 +132,13 @@ class TrayIcon:
                         checked=lambda _item: self._checked(),
                     )
                 )
-            items.append(pystray.MenuItem("Show History", self._handle_show_history))
+            if self._on_open_settings is not None:
+                items.append(pystray.MenuItem("Settings", self._handle_open_settings))
+            # "Show History" deliberately absent: the bar's own menu carries
+            # the frequent actions (history, paste, device, language) because
+            # it is where the user's attention already is. Duplicating them
+            # here would be two places to keep in sync for no gain, and would
+            # crowd the one menu that has to answer "how do I quit this?".
             if self._on_view_logs is not None:
                 items.append(pystray.MenuItem("View Logs", self._handle_view_logs))
             items += [
@@ -136,7 +146,7 @@ class TrayIcon:
                 pystray.MenuItem("Quit", self._handle_quit),
             ]
             menu = pystray.Menu(*items)
-            icon = pystray.Icon("flow", image, _TOOLTIPS[self._state], menu)
+            icon = pystray.Icon("sway", image, _TOOLTIPS[self._state], menu)
         except Exception:
             logger.warning("tray icon unavailable (pystray/Pillow not usable)", exc_info=True)
             return False
@@ -265,13 +275,22 @@ class TrayIcon:
             logger.exception("could not open the history window from the tray")
 
     def _handle_open_dashboard(self, icon: Any, item: Any) -> None:
-        logger.info("tray: %s clicked", "Open Dashboard")
+        logger.info("tray: %s clicked", "Open Sway")
         del icon, item
         try:
             if self._on_open_dashboard is not None:
                 self._on_open_dashboard()
         except Exception:
             logger.exception("could not open the dashboard from the tray")
+
+    def _handle_open_settings(self, icon: Any, item: Any) -> None:
+        logger.info("tray: %s clicked", "Settings")
+        del icon, item
+        try:
+            if self._on_open_settings is not None:
+                self._on_open_settings()
+        except Exception:
+            logger.exception("could not open settings from the tray")
 
     def _handle_view_logs(self, icon: Any, item: Any) -> None:
         logger.info("tray: %s clicked", "View Logs")

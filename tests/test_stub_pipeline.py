@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from flow.latency.models import Stage
-from flow.latency.store import LatencyStore
-from flow.latency.tracker import LatencyTracker
-from flow.pipeline.stub import STUB_STAGES, StubPipeline, StubStageSpec
+from sway.latency.models import Stage
+from sway.latency.store import LatencyStore
+from sway.latency.tracker import LatencyTracker
+from sway.pipeline.stub import STUB_STAGES, StubPipeline, StubStageSpec
 
 
 @pytest.fixture

@@ -114,5 +114,26 @@ class HotkeyListener:
         except Exception:
             logger.exception("hotkey callback raised")
 
+#: pynput key names are not user-facing text. The bar and the window both
+#: show the hotkey, so the mapping lives here rather than in either of them.
+_PRETTY_KEYS = {
+    "ctrl_r": "Right Ctrl",
+    "ctrl_l": "Left Ctrl",
+    "shift_r": "Right Shift",
+    "shift_l": "Left Shift",
+    "alt_r": "Right Alt",
+    "alt_l": "Left Alt",
+    "cmd": "Win",
+    "caps_lock": "Caps Lock",
+}
 
-__all__ = ["HotkeyListener", "KeyHoldTracker", "KNOWN_KEYS"]
+
+def prettify_hotkey(name: str) -> str:
+    """``ctrl_r`` -> ``Right Ctrl``. Unknown names are returned unchanged, so
+    a key added to KNOWN_KEYS without a label here still displays."""
+    return _PRETTY_KEYS.get(str(name).lower(), str(name))
+
+
+
+__all__ = [
+    "prettify_hotkey","HotkeyListener", "KeyHoldTracker", "KNOWN_KEYS"]

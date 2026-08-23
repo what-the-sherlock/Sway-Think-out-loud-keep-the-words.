@@ -14,7 +14,7 @@ report`` does not do on its own.
 * **A saved artifact.** The table is written to a file so D3 can diff
   against it rather than against a screenshot.
 
-Run it with the app already running (``flow run`` or Flow.exe) in another
+Run it with the app already running (``flow run`` or Sway.exe) in another
 window -- this script only reads the database, it never touches the mic. It
 prompts you through the clips; dictate into any text field you like.
 
@@ -35,10 +35,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from flow.config import load_config  # noqa: E402
-from flow.latency.models import RunRecord  # noqa: E402
-from flow.latency.report import format_table, summarize  # noqa: E402
-from flow.latency.store import LatencyStore  # noqa: E402
+from sway.config import load_config  # noqa: E402
+from sway.latency.models import RunRecord  # noqa: E402
+from sway.latency.report import format_table, summarize  # noqa: E402
+from sway.latency.store import LatencyStore  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +174,7 @@ def capture() -> float:
     started = time.time()
     total = sum(clip.count for clip in CLASSES)
     print(f"\nD0 baseline: {total} dictations.")
-    print("Flow must already be running in another window. Nothing here touches the mic.")
+    print("Sway must already be running in another window. Nothing here touches the mic.")
     print("Put your cursor in a text field -- Notepad is fine. NOT a terminal or code")
     print("editor: those match the VERBATIM profile and skip cleanup entirely, which")
     print("would leave the baseline with no data on the stage D3 most needs.")
@@ -219,7 +219,7 @@ def _await_run(
             where = classify(newest)
             skipped = newest.metadata.get("skipped")
             if hold is None:
-                detail = "no hotkey_hold stage -- this Flow is running pre-D0 code"
+                detail = "no hotkey_hold stage -- this Sway is running pre-D0 code"
             elif skipped:
                 # A run landed, but nothing was transcribed: silence, or a
                 # hold too short to count. It is recorded and it advances the
@@ -233,7 +233,7 @@ def _await_run(
         time.sleep(0.25)
     print(
         f"        nothing recorded after {timeout_s:.0f}s -- the hotkey may not have"
-        " reached Flow. Continuing."
+        " reached Sway. Continuing."
     )
     return seen
 
@@ -247,14 +247,14 @@ def report(since: float) -> str:
     config = load_config()
     db_path = config.latency_db_path
     if not Path(db_path).exists():
-        raise SystemExit(f"no latency database at {db_path}; run Flow at least once first")
+        raise SystemExit(f"no latency database at {db_path}; run Sway at least once first")
 
     with LatencyStore.open(db_path) as store:
         runs = store.fetch_runs(since=since)
     if not runs:
         raise SystemExit(
             "no runs recorded in the capture window.\n"
-            "Was Flow actually running, and is [latency] enabled in your config?"
+            "Was Sway actually running, and is [latency] enabled in your config?"
         )
 
     # Refuse to produce a baseline out of runs that predate the capture.
@@ -272,7 +272,7 @@ def report(since: float) -> str:
             "\n"
             "Runs without hotkey_hold predate D0 and cannot be classified by clip length.\n"
             "If you passed --since, it is probably reaching back before this build.\n"
-            "Run `python scripts/baseline.py` with Flow running to capture a real one."
+            "Run `python scripts/baseline.py` with Sway running to capture a real one."
         )
 
     by_class: dict[str, list[RunRecord]] = {}

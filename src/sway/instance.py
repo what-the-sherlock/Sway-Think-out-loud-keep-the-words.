@@ -1,6 +1,6 @@
 """The running instance's advertisement, and how a second launch reaches it.
 
-D1: launching Flow twice must focus the copy that is already running, not
+D1: launching Sway twice must focus the copy that is already running, not
 start a rival hotkey hook that pastes everything twice. The named mutex in
 :mod:`flow.gui` already *detects* the second launch; this module is how the
 second process then talks to the first.
@@ -13,7 +13,7 @@ request to it.
 
 That file holds a **live credential**, so it is not an ordinary state file:
 
-* It lives in ``%LOCALAPPDATA%\\Flow``, which Windows already ACLs to the
+* It lives in ``%LOCALAPPDATA%\\Sway``, which Windows already ACLs to the
   owning user; the file is additionally created ``0o600``. Note honestly that
   ``os.chmod`` is close to a no-op for real Windows ACLs -- the directory's
   inherited ACL is what actually protects this, and the mode is belt and
@@ -161,7 +161,7 @@ def request_focus(info: InstanceInfo, *, timeout_s: float = FOCUS_TIMEOUT_S) -> 
         data=b"",
         method="POST",
         headers={
-            "X-Flow-Token": info.token,
+            "X-Sway-Token": info.token,
             # The server rejects cross-origin state changes; name ourselves
             # honestly rather than forging a browser origin.
             "Origin": f"http://127.0.0.1:{info.port}",
@@ -181,7 +181,7 @@ def request_focus(info: InstanceInfo, *, timeout_s: float = FOCUS_TIMEOUT_S) -> 
 
 
 def _default_is_running(pid: int) -> bool:
-    from flow.platform import get_platform
+    from sway.platform import get_platform
 
     return get_platform().process_is_running(pid)
 

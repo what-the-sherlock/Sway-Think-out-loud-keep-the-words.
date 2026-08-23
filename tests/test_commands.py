@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from flow.commands import COMMAND_SYSTEM_PROMPT, build_command_user_message
+from sway.commands import COMMAND_SYSTEM_PROMPT, build_command_user_message
 
 
 def test_build_command_user_message_includes_instruction_and_text():

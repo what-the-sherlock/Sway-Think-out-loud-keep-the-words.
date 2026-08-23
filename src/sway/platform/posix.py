@@ -1,6 +1,6 @@
 """POSIX (Linux/macOS) implementation of :class:`~flow.platform.PlatformAdapter`.
 
-Flow targets Windows first (CLAUDE.md); this adapter exists so the codebase
+Sway targets Windows first (CLAUDE.md); this adapter exists so the codebase
 and its tests run unmodified on developer machines and CI runners that are
 not Windows. Clipboard access shells out to whatever tool is on PATH
 (``xclip`` on Linux, ``pbcopy``/``pbpaste`` on macOS) since there is no
@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from flow.errors import ClipboardError
+from sway.errors import ClipboardError
 
 _CLIPBOARD_TIMEOUT_S = 2.0
 

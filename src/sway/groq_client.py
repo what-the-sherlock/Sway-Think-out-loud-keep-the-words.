@@ -42,8 +42,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from flow.config import Secret
-from flow.errors import FlowError
+from sway.config import Secret
+from sway.errors import SwayError
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ _BODY_LIMIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 _BODY_RETRY_AFTER_RE = re.compile(r"try again in\s+([\d.]+)\s*(ms|s)\b", re.IGNORECASE)
 
 
-class GroqError(FlowError):
+class GroqError(SwayError):
     """A Groq API call failed (after retries, where retries apply)."""
 
 
@@ -241,6 +241,31 @@ class GroqClient:
         except httpx.HTTPError as exc:
             logger.warning("Groq warm-up request failed (continuing): %s", exc)
 
+    async def check_auth(self) -> None:
+        """Verify the key with the cheapest authenticated call Groq offers.
+
+        ``GET /openai/v1/models`` costs no tokens and no audio-request quota,
+        which matters because "Test connection" is a button a user may press
+        repeatedly and the free tier allows only 2,000 audio requests a day.
+
+        Returns nothing on success; raises the same ``GroqError`` /
+        ``GroqRateLimitError`` / ``TimeoutError`` family as every other call
+        here, so callers need no special-case handling.
+        """
+        try:
+            response = await self._client.get("/openai/v1/models")
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(f"Groq did not respond in time: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise GroqError(f"could not reach Groq: {exc}") from exc
+
+        if response.status_code == 429:
+            raise parse_rate_limit(response.headers, response.text)
+        if response.status_code in (401, 403):
+            raise GroqError("Groq rejected this API key.")
+        if response.status_code >= 400:
+            raise GroqError(f"Groq returned {response.status_code}.")
+
     async def transcribe(
         self,
         audio: bytes,
@@ -255,7 +280,7 @@ class GroqClient:
 
         # verbose_json (rather than plain json) additionally returns the
         # detected spoken language, which flow.cleanup uses to pick a
-        # language-appropriate filler-word heuristic; the "text" field Flow
+        # language-appropriate filler-word heuristic; the "text" field Sway
         # actually needs is present in both formats.
         data: dict[str, str] = {"model": WHISPER_MODEL, "response_format": "verbose_json"}
         if language:

@@ -16,8 +16,8 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Self
 
-from flow.errors import LatencyStoreError
-from flow.latency.models import RunRecord, StageTiming
+from sway.errors import LatencyStoreError
+from sway.latency.models import RunRecord, StageTiming
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ class LatencyStore:
         if version > SCHEMA_VERSION:
             raise LatencyStoreError(
                 f"latency database schema v{version} is newer than this build "
-                f"(v{SCHEMA_VERSION}); upgrade Flow or delete the database"
+                f"(v{SCHEMA_VERSION}); upgrade Sway or delete the database"
             )
         if version == SCHEMA_VERSION:
             return

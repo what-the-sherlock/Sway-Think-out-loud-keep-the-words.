@@ -3,60 +3,105 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Flow</title>
+<!-- Locks the page down to exactly what it needs: its own scripts, its own
+     stylesheet, and requests back to its own origin. The window renders the
+     user's dictation history, so an injected *external* request is the one
+     thing that could carry it off the machine -- which is what default-src
+     'none' and connect-src 'self' exist to stop.
+
+     style-src carries 'unsafe-inline' deliberately. The UI is rendered by
+     building markup in app.js, and layout values that depend on data (a
+     progress width, a bar height) arrive as style attributes; without this
+     every one of them is silently dropped and the page renders subtly and
+     confusingly wrong. It costs little here: CSS-based exfiltration needs an
+     external URL to send to, and default-src 'none' already forbids one.
+     script-src stays strict, which is the directive that matters. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'none'; base-uri 'none'">
+<title>Sway</title>
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-<div class="app">
+
+<!-- Icon sprite. Line icons, per PRODUCTION_BRIEF D2's "no emoji-as-icons". -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="i-mark"><path d="M3 14V6M8 18V2M13 15V5M18 12V8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" fill="none"/></g>
+    <g id="i-home"><path d="M3 8.5 10 3l7 5.5V16a1 1 0 0 1-1 1h-4v-5H8v5H4a1 1 0 0 1-1-1z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></g>
+    <g id="i-history"><circle cx="10" cy="10" r="7.2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M10 5.6V10l3 1.8" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
+    <g id="i-book"><path d="M4 3.5h5a2.5 2.5 0 0 1 2.5 2.5v10A2 2 0 0 0 10 15H4z M16 3.5h-3.5A2.5 2.5 0 0 0 10 6v10a2 2 0 0 1 1.5-1H16z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linejoin="round"/></g>
+    <g id="i-chart"><path d="M3.5 16.5V11M8 16.5V4.5M12.5 16.5V8M17 16.5v-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></g>
+    <g id="i-gear"><circle cx="10" cy="10" r="2.6" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M10 2.5v2M10 15.5v2M17.5 10h-2M4.5 10h-2M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4M15.3 15.3l-1.4-1.4M6.1 6.1 4.7 4.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></g>
+    <g id="i-info"><circle cx="10" cy="10" r="7.2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M10 9v4.5M10 6.4v.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></g>
+    <g id="i-search"><circle cx="8.8" cy="8.8" r="5.4" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="m12.8 12.8 3.6 3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></g>
+    <g id="i-copy"><rect x="7" y="7" width="9.5" height="9.5" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M13 4.5H5.5a1.5 1.5 0 0 0-1.5 1.5V13" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
+    <g id="i-trash"><path d="M4.5 5.5h11M8.2 5.5V4a1 1 0 0 1 1-1h1.6a1 1 0 0 1 1 1v1.5M6 5.5l.7 10a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-10" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+    <g id="i-edit"><path d="M13.2 3.9a1.9 1.9 0 0 1 2.7 2.7L7.4 15.1l-3.6.9.9-3.6z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></g>
+    <g id="i-snippet"><path d="M6 3.5h8a1.5 1.5 0 0 1 1.5 1.5v11.5l-5.5-3.4-5.5 3.4V5A1.5 1.5 0 0 1 6 3.5z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></g>
+    <g id="i-plus"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/></g>
+    <g id="i-back"><path d="M15 10H5M9 5l-5 5 5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+    <g id="i-check"><path d="M4.5 10.5 8 14l7.5-8" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
+    <g id="i-x"><path d="M5 5l10 10M15 5 5 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></g>
+  </defs>
+</svg>
+
+<a class="skip-link" href="#page">Skip to content</a>
+
+<div class="app" id="app">
   <nav class="sidebar">
     <div class="brand">
-      <div class="brand-mark">F</div>
-      <div class="brand-name">Flow</div>
+      <svg viewBox="0 0 20 20"><use href="#i-mark"/></svg>
+      <span class="brand-name">Sway</span>
     </div>
 
-    <div class="nav-section">Productivity</div>
-    <button class="nav-item" data-view="overview"><span class="ico">◈</span> Overview</button>
-    <button class="nav-item" data-view="activity"><span class="ico">≡</span> Activity <span class="badge" id="nav-activity-count"></span></button>
-    <button class="nav-item" data-view="insights"><span class="ico">◔</span> Insights</button>
+    <button class="nav-item" data-view="home"><svg viewBox="0 0 20 20"><use href="#i-home"/></svg> Home</button>
+    <button class="nav-item" data-view="history"><svg viewBox="0 0 20 20"><use href="#i-history"/></svg> History</button>
+    <button class="nav-item" data-view="dictionary"><svg viewBox="0 0 20 20"><use href="#i-book"/></svg> Dictionary</button>
+    <button class="nav-item" data-view="snippets">
+      <svg viewBox="0 0 20 20"><use href="#i-snippet"/></svg> Snippets
+      <span class="count" id="snippets-count"></span>
+    </button>
+    <button class="nav-item" data-view="insights"><svg viewBox="0 0 20 20"><use href="#i-chart"/></svg> Insights</button>
 
-    <div class="nav-section">Engine</div>
-    <button class="nav-item" data-view="performance"><span class="ico">⌁</span> Performance <span class="badge" id="nav-health-dot"></span></button>
-    <button class="nav-item" data-view="settings"><span class="ico">⚙</span> Settings</button>
+    <div class="nav-spacer"></div>
+    <div class="nav-divider"></div>
 
-    <div class="sidebar-foot">
-      <button class="mic-toggle" id="mic-toggle" disabled>
-        <span class="dot"></span>
-        <span>
-          <span class="label" id="mic-label">Checking…</span><br>
-          <span class="sub" id="mic-sub">engine status</span>
-        </span>
-      </button>
-    </div>
+    <button class="nav-item" data-view="settings">
+      <svg viewBox="0 0 20 20"><use href="#i-gear"/></svg> Settings
+      <span class="count" id="settings-count"></span>
+    </button>
+    <button class="nav-item" data-view="about"><svg viewBox="0 0 20 20"><use href="#i-info"/></svg> About</button>
   </nav>
 
-  <main class="main">
-    <header class="topbar">
-      <div>
-        <div class="page-title" id="page-title">Overview</div>
-        <div class="page-sub" id="page-sub"></div>
-      </div>
-      <div class="topbar-right" id="topbar-right"></div>
-    </header>
-    <div class="content" id="content"></div>
+  <main class="main" id="main">
+    <div class="page" id="page"></div>
   </main>
 </div>
 
-<div class="drawer-scrim" id="drawer-scrim"></div>
-<aside class="drawer" id="drawer" aria-label="Session detail">
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-label="Dictation detail">
   <div class="drawer-head">
-    <div>
-      <div class="page-title" id="drawer-title">Session</div>
-      <div class="page-sub" id="drawer-sub"></div>
+    <div class="grow" style="flex:1">
+      <div class="page-title" style="font-size:20px" id="drawer-title">Dictation</div>
+      <div class="small muted" id="drawer-sub"></div>
     </div>
-    <button class="btn" id="drawer-close" style="margin-left:auto">Close</button>
+    <button class="icon-btn" id="drawer-close" aria-label="Close"><svg viewBox="0 0 20 20"><use href="#i-x"/></svg></button>
   </div>
   <div class="drawer-body" id="drawer-body"></div>
 </aside>
+
+<div class="modal-scrim" id="modal-scrim">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head"><div class="modal-title" id="modal-title"></div></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot" id="modal-foot"></div>
+  </div>
+</div>
+
+<div class="onboard hidden" id="onboard">
+  <div class="rail" id="rail"></div>
+  <div class="onboard-body" id="onboard-body"></div>
+</div>
 
 <div class="toast" id="toast"></div>
 

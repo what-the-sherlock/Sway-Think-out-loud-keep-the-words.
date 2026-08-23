@@ -19,14 +19,14 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from flow.errors import FlowError
-from flow.latency.models import Stage
-from flow.latency.tracker import LatencyTracker
+from sway.errors import SwayError
+from sway.latency.models import Stage
+from sway.latency.tracker import LatencyTracker
 
 logger = logging.getLogger(__name__)
 
 
-class StubFailure(FlowError):
+class StubFailure(SwayError):
     """Simulated stage failure, used to exercise the error-recording path."""
 
 

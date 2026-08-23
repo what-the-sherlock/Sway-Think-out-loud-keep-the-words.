@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from flow.latency.models import RunRecord, Stage, StageTiming
-from flow.latency.report import format_table, percentile, summarize
+from sway.latency.models import RunRecord, Stage, StageTiming
+from sway.latency.report import format_table, percentile, summarize
 
 
 def _run(run_id: str, *, ok: bool = True, total_ms: float = 100.0, **stages: float) -> RunRecord:

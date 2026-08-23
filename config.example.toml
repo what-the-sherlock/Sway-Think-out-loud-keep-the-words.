@@ -1,4 +1,4 @@
-# Flow configuration. Copy to config.toml and edit; every value shown is the
+# Sway configuration. Copy to config.toml and edit; every value shown is the
 # default, so an empty file behaves identically.
 #
 # Precedence: environment variables > this file > defaults.
@@ -8,7 +8,7 @@
 # Secrets never live here. GROQ_API_KEY belongs in .env (see .env.example).
 
 # Where the latency database and log file live.
-# Default: %LOCALAPPDATA%\Flow on Windows, $XDG_DATA_HOME/flow elsewhere.
+# Default: %LOCALAPPDATA%\Sway on Windows, $XDG_DATA_HOME/flow elsewhere.
 # data_dir = "D:/Whisper flow clone/.flow"
 
 [logging]

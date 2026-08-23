@@ -191,6 +191,7 @@ const state = {
   range: '30d',
   insightsTab: 'usage',
   settingsTab: 'general',
+  snippetQuery: '',
   lastDeleted: null,
 };
 
@@ -431,6 +432,96 @@ views.dictionary = {
   },
 };
 
+/* ---- Snippets ------------------------------------------------------------
+
+   Promoted from a Settings tab to a page of its own. Snippets are something
+   people curate, not something they configure once -- and there is only one
+   manager for them, so a phrase can never be edited in two places that
+   disagree.                                                                */
+
+views.snippets = {
+  async load() {
+    // Snippets live in settings.json alongside everything else the user edits,
+    // so the settings payload already carries them and their conflicts.
+    state.settings = await api('/api/settings');
+  },
+  render() {
+    const all = (state.settings && state.settings.triggers) || [];
+    const query = (state.snippetQuery || '').trim().toLowerCase();
+    const shown = query
+      ? all.filter((t) => [t.label, t.phrase, t.payload].some(
+          (field) => (field || '').toLowerCase().includes(query)))
+      : all;
+
+    if (!all.length) {
+      return `
+        <h1 class="page-title">Snippets</h1>
+        <div style="margin-top:26px">${hero({
+          title: "The stuff you shouldn't have to say twice.",
+          body: 'Save the text you retype — an intro email, a signature, an address — '
+              + 'and say its phrase to insert it. Matched on this machine before anything '
+              + 'is sent anywhere, so it costs nothing and adds no delay.',
+          chips: [
+            '<span class="chip on-dark">“intro email” → Hey, I’d love to find some time…</span>',
+            '<span class="chip on-dark">“my email” → you@example.com</span>',
+          ],
+          action: { act: 'add-trigger', label: 'Add a snippet' },
+        })}</div>`;
+    }
+
+    return `
+      <div style="display:flex;align-items:center;gap:16px">
+        <h1 class="page-title">Snippets</h1>
+        <div style="flex:1"></div>
+        <button class="btn primary" data-act="add-trigger">${icon('plus')} Add new</button>
+      </div>
+      <div class="search-wrap" style="margin-top:18px">
+        ${icon('search')}
+        <input class="input" id="snippet-search" placeholder="Search snippets"
+               value="${esc(state.snippetQuery || '')}" autocomplete="off">
+      </div>
+      <div class="small muted" style="margin-top:14px">
+        ${all.length} snippet${all.length === 1 ? '' : 's'}. Say the phrase, or “use my …”, to insert one.
+      </div>
+      <div style="margin-top:22px">
+        ${shown.length ? snippetRows(shown) : nothingFound(`No snippet matches “${query}”.`)}
+      </div>`;
+  },
+  bind(root) {
+    const search = root.querySelector('#snippet-search');
+    if (!search) return;
+    search.addEventListener('input', async (event) => {
+      state.snippetQuery = event.target.value;
+      // keepFocus so the caret survives the re-render, as History's search does.
+      await refresh({ keepFocus: '#snippet-search' });
+    });
+  },
+};
+
+function snippetRows(triggers) {
+  return `<div class="rows">${triggers.map((t) => `
+    <div class="row">
+      ${toggle(t.enabled, `data-act="toggle-trigger" data-id="${esc(t.id)}"`)}
+      <div class="body">
+        ${t.name ? `<div class="text">${esc(t.name)}</div>` : ''}
+        <div class="pair" ${t.name ? 'style="margin-top:4px"' : ''}>
+          <span class="chip"><span class="txt">“${esc(t.phrase)}”</span></span>
+          <span class="arrow">&rarr;</span>
+          <span class="chip"><span class="txt">${esc(t.type === 'date' ? "today's date" : t.payload)}</span></span>
+        </div>
+        ${t.conflicts && t.conflicts.length
+          ? `<div class="small" style="color:var(--red);margin-top:6px">
+               Overlaps “${esc(t.conflicts[0])}” — the longer phrase wins.
+             </div>` : ''}
+      </div>
+      <div class="actions">
+        ${t.type === 'date' ? '' : iconBtn('copy', 'Copy text', `data-act="copy-snippet" data-id="${esc(t.id)}"`)}
+        ${iconBtn('edit', 'Edit', `data-act="edit-trigger" data-id="${esc(t.id)}"`)}
+        ${iconBtn('trash', 'Delete', `data-act="delete-trigger" data-id="${esc(t.id)}"`)}
+      </div>
+    </div>`).join('')}</div>`;
+}
+
 /* ---- Insights ----------------------------------------------------------- */
 
 views.insights = {
@@ -645,15 +736,16 @@ views.settings = {
     }
   },
   render() {
+    // Snippets used to be a tab here. They are a page now: two managers for
+    // one list is how a phrase ends up edited in two places that disagree.
     const tabs = [['general', 'General'], ['voice', 'Voice'], ['apps', 'Apps'],
-                  ['triggers', 'Triggers'], ['data', 'Data']];
-    const conflicts = countConflicts();
+                  ['data', 'Data']];
     return `
       <h1 class="page-title">Settings</h1>
       <div class="tabs">
         ${tabs.map(([id, label]) => `
           <button class="tab ${state.settingsTab === id ? 'active' : ''}" data-tab="${id}">
-            ${label}${id === 'triggers' && conflicts ? ` <span style="color:var(--red)">${conflicts}</span>` : ''}
+            ${label}
           </button>`).join('')}
       </div>
       ${state.settings.editable ? '' : '<div class="banner info" style="margin-top:24px">This window cannot change settings — no engine is attached.</div>'}
@@ -664,7 +756,6 @@ views.settings = {
     if (tab === 'general') return generalPanel();
     if (tab === 'voice') return voicePanel();
     if (tab === 'apps') return appsPanel();
-    if (tab === 'triggers') return triggersPanel();
     return dataPanel();
   },
   bind(root) {
@@ -818,47 +909,6 @@ function appsPanel() {
 }
 
 const styleLabel = (s) => ({ casual: 'Casual', formal: 'Formal', verbatim: 'No cleanup' }[s] || s);
-
-function triggersPanel() {
-  const triggers = (state.settings && state.settings.triggers) || [];
-
-  if (!triggers.length) {
-    return hero({
-      title: "The stuff you shouldn't have to say twice.",
-      body: 'Say a phrase, get the text. These are matched on this machine before anything is sent anywhere, so they cost nothing and add no delay.',
-      chips: [
-        '<span class="chip on-dark">“my email” → you@example.com</span>',
-        '<span class="chip on-dark">“today’s date” → 21 August 2026</span>',
-      ],
-      action: { act: 'add-trigger', label: 'Add a trigger' },
-    });
-  }
-
-  return `
-    <div class="sec-head">
-      <span class="meta-label">Your triggers</span>
-      <button class="btn primary small" data-act="add-trigger">${icon('plus')} Add new</button>
-    </div>
-    <div class="rows">${triggers.map((t) => `
-      <div class="row">
-        ${toggle(t.enabled, `data-act="toggle-trigger" data-id="${esc(t.id)}"`)}
-        <div class="body">
-          <div class="pair">
-            <span class="chip"><span class="txt">“${esc(t.phrase)}”</span></span>
-            <span class="arrow">→</span>
-            <span class="chip"><span class="txt">${esc(t.type === 'date' ? "today's date" : t.payload)}</span></span>
-          </div>
-          ${t.conflicts && t.conflicts.length
-            ? `<div class="small" style="color:var(--red);margin-top:6px">
-                 Overlaps “${esc(t.conflicts[0])}” — the longer phrase wins.
-               </div>` : ''}
-        </div>
-        <div class="actions">
-          ${iconBtn('edit', 'Edit', `data-act="edit-trigger" data-id="${esc(t.id)}"`)}
-          ${iconBtn('trash', 'Delete', `data-act="delete-trigger" data-id="${esc(t.id)}"`)}
-        </div>
-      </div>`).join('')}</div>`;
-}
 
 function dataPanel() {
   const s = state.settings;
@@ -1084,13 +1134,17 @@ async function testKey() {
 }
 
 function triggerDialog(existing) {
-  const t = existing || { id: '', phrase: '', payload: '', type: 'macro' };
+  const t = existing || { id: '', name: '', phrase: '', payload: '', type: 'macro' };
   openModal({
-    title: existing ? 'Edit trigger' : 'New trigger',
+    title: existing ? 'Edit snippet' : 'New snippet',
     body: `
       <div>
+        <label class="field-label" for="t-name">Name <span class="muted">(optional)</span></label>
+        <input class="input" id="t-name" value="${esc(t.name || '')}" placeholder="Intro email" maxlength="80">
+      </div>
+      <div>
         <label class="field-label" for="t-phrase">When I say</label>
-        <input class="input" id="t-phrase" value="${esc(t.phrase)}" placeholder="my email" maxlength="80">
+        <input class="input" id="t-phrase" value="${esc(t.phrase)}" placeholder="intro email" maxlength="80">
       </div>
       <div>
         <label class="field-label" for="t-type">Insert</label>
@@ -1103,7 +1157,7 @@ function triggerDialog(existing) {
         <label class="field-label" for="t-payload">Text to insert</label>
         <textarea class="input" id="t-payload" maxlength="4000" placeholder="you@example.com">${esc(t.payload)}</textarea>
       </div>
-      <div class="small muted">Matched on this machine before anything is sent. No delay, no tokens.</div>
+      <div class="small muted">Say the phrase, or “use my …”, while dictating. Matched on this machine before anything is sent — no delay, no tokens.</div>
       <div id="t-error" class="small" style="color:var(--red)"></div>`,
     actions: `<div class="spacer"></div>
       <button class="btn" data-act="close-modal">Cancel</button>
@@ -1118,6 +1172,7 @@ async function saveTrigger(id) {
   const error = el('t-error');
   const body = {
     id: id || undefined,
+    name: el('t-name').value,
     phrase: el('t-phrase').value,
     type: el('t-type').value,
     payload: el('t-payload').value,
@@ -1212,6 +1267,20 @@ document.addEventListener('click', async (event) => {
       case 'test-key': await testKey(); break;
 
       case 'add-trigger': triggerDialog(null); break;
+      case 'copy-snippet': {
+        const list = (state.settings && state.settings.triggers) || [];
+        const snippet = list.find((t) => t.id === target.dataset.id);
+        if (!snippet) break;
+        try {
+          await navigator.clipboard.writeText(snippet.payload);
+          toast('Copied to the clipboard');
+        } catch {
+          // A webview can refuse clipboard access outright. Say so rather
+          // than showing a success toast for something that did not happen.
+          toast('Could not reach the clipboard');
+        }
+        break;
+      }
       case 'edit-trigger': {
         const triggers = (state.settings && state.settings.triggers) || [];
         triggerDialog(triggers.find((t) => t.id === id));
@@ -1317,21 +1386,24 @@ function renderNav() {
     item.classList.toggle('active', item.dataset.view === state.view);
     item.onclick = () => go(item.dataset.view);
   });
-  // The Settings badge counts unresolved configuration problems — a count
-  // that needs the user, which is red's one job (§5).
-  const problems = settingsProblemCount();
-  const badge = el('settings-count');
-  badge.textContent = problems || '';
-  badge.classList.toggle('show', problems > 0);
+  // Red is for a count that needs the user (§5). Each badge counts only the
+  // problems its own screen can fix, so neither sends the user to the wrong
+  // place: Settings owns the API key, Snippets owns phrase conflicts.
+  setBadge('settings-count', settingsProblemCount());
+  setBadge('snippets-count', countConflicts());
+}
+
+function setBadge(id, count) {
+  const badge = el(id);
+  if (!badge) return;
+  badge.textContent = count || '';
+  badge.classList.toggle('show', count > 0);
 }
 
 function settingsProblemCount() {
   const s = state.settings;
   if (!s) return 0;
-  let count = 0;
-  if (s.key && !s.key.configured) count += 1;
-  count += countConflicts();
-  return count;
+  return s.key && !s.key.configured ? 1 : 0;
 }
 
 async function refresh(options = {}) {

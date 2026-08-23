@@ -16,7 +16,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "sway logo.jpg"
-OUTPUT = ROOT / "src" / "flow" / "assets" / "logo_mask.png"
+OUTPUT = ROOT / "src" / "sway" / "assets" / "logo_mask.png"
 #: Output canvas: a square, so every downstream render (tray icon, .ico,
 #: overlay avatar) can scale it uniformly without re-deriving an aspect ratio.
 CANVAS = 512

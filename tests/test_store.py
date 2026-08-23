@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from flow.errors import LatencyStoreError
-from flow.latency.models import RunRecord, StageTiming
-from flow.latency.store import SCHEMA_VERSION, LatencyStore
+from sway.errors import LatencyStoreError
+from sway.latency.models import RunRecord, StageTiming
+from sway.latency.store import SCHEMA_VERSION, LatencyStore
 
 
 def _record(run_id: str, *, started_at: float = 1000.0, ok: bool = True) -> RunRecord:

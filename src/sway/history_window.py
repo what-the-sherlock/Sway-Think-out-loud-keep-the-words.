@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from flow.history import KIND_COMMAND, KIND_DICTATION, HistoryEntry, HistoryStore
+from sway.history import KIND_COMMAND, KIND_DICTATION, HistoryEntry, HistoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class HistoryWindow:
     def _build(self) -> None:
         top = tk.Toplevel(self._parent)
         self._toplevel = top
-        top.title("Flow History")
+        top.title("Sway History")
         top.geometry(f"{_WIDTH}x{_HEIGHT}")
         top.minsize(480, 320)
 

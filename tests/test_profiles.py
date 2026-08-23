@@ -4,7 +4,7 @@ no OS interaction, per CLAUDE.md.
 
 from __future__ import annotations
 
-from flow.profiles import DEFAULT_STYLE, CleanupStyle, style_for_process
+from sway.profiles import DEFAULT_STYLE, CleanupStyle, style_for_process
 
 
 def test_unknown_process_falls_back_to_default():

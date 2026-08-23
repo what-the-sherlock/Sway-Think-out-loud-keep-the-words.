@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from flow.errors import ClipboardError, PasteBlockedError
-from flow.inject import TextInjector
+from sway.errors import ClipboardError, PasteBlockedError
+from sway.inject import TextInjector
 
 
 class FakePlatform:

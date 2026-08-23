@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from flow.config import Secret, load_config, parse_env_file
-from flow.errors import ConfigError
+from sway.config import Secret, load_config, parse_env_file
+from sway.errors import ConfigError
 
 
 # -- .env parsing ----------------------------------------------------------

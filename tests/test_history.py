@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from flow.errors import HistoryStoreError
-from flow.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
+from sway.errors import HistoryStoreError
+from sway.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 
 
 @pytest.fixture

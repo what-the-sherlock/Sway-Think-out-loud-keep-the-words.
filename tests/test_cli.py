@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from flow.cli import main
+from sway.cli import main
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +63,7 @@ def test_config_command_redacts_the_api_key(monkeypatch: pytest.MonkeyPatch, cap
 
 def test_no_command_prints_help(capsys: pytest.CaptureFixture):
     assert main([]) == 0
-    assert "usage: flow" in capsys.readouterr().out
+    assert "usage: sway" in capsys.readouterr().out
 
 
 def test_invalid_config_reports_an_error(tmp_path: Path, capsys: pytest.CaptureFixture):
@@ -97,8 +97,8 @@ def test_history_list_without_a_database_fails_cleanly(capsys: pytest.CaptureFix
 
 
 def _seed_history(tmp_path: Path) -> None:
-    from flow.config import load_config
-    from flow.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
+    from sway.config import load_config
+    from sway.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 
     config = load_config(env={"FLOW_DATA_DIR": str(tmp_path / "data")}, env_file=tmp_path / "missing.env")
     with HistoryStore.open(config.history_db_path) as store:

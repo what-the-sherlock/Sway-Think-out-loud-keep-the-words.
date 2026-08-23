@@ -31,9 +31,9 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
-from flow.audio.ring_buffer import RingBuffer
-from flow.audio.vad import VadTrimmer
-from flow.groq_client import TranscriptionResult
+from sway.audio.ring_buffer import RingBuffer
+from sway.audio.vad import VadTrimmer
+from sway.groq_client import TranscriptionResult
 
 logger = logging.getLogger(__name__)
 

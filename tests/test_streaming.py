@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from flow.streaming import ChunkClock, max_overlap_words, stitch_transcripts
+from sway.streaming import ChunkClock, max_overlap_words, stitch_transcripts
 
 # -- ChunkClock --------------------------------------------------------------
 

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "flow"
+name = "sway"
 version = "0.1.0"
 description = "Local voice dictation with LLM cleanup"
 readme = "README.md"
@@ -49,23 +49,38 @@ dependencies = [
     # the status pill and app icon as a single composited, anti-aliased
     # image -- tkinter's own canvas primitives have no anti-aliasing at all.
     "pillow>=10.0",
+    # keyring: puts the Groq API key in Windows Credential Manager instead of
+    # a plaintext file the app wrote. D5 requires this before any packaged
+    # build ships, and there is no stdlib access to the Windows vault. Pure
+    # Python plus ctypes on Windows; ~2 MB installed. Degrades to the
+    # environment/.env path when no backend exists (see flow.credentials).
+    "keyring>=24.0",
 ]
 
 [project.optional-dependencies]
+# pywebview: renders the existing loopback dashboard in a real OS window --
+# taskbar entry, app icon, no address bar -- using the WebView2 runtime that
+# ships with Windows 10/11. No Node, no Electron, no bundled browser.
+#
+# Optional on purpose: flow.window falls back to the default browser when it
+# or WebView2 is missing, so every screen works either way and a stripped
+# Windows image degrades the chrome rather than breaking the product.
+# ~7 MB installed (pywebview + pythonnet + clr_loader + bottle).
+window = ["pywebview>=5.0"]
 # pytest: the only test runner worth the dependency; tests target the pure
 # transcript/format/config functions, per CLAUDE.md.
 dev = ["pytest>=8.0"]
 # pyinstaller: freezes `flow run` into a single Windows .exe (Phase 5) so it
 # can be handed to someone without a Python install. Only needed to build a
 # release, never to run or test the app, hence its own group rather than
-# `dev`. See packaging/flow.spec.
+# `dev`. See packaging/sway.spec.
 build = ["pyinstaller>=6.0"]
 
 [project.scripts]
-flow = "flow.cli:main"
+sway = "sway.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/flow"]
+packages = ["src/sway"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
