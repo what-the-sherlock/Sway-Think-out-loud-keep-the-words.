@@ -29,6 +29,11 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _MAX_PATH = 260
 _TOKEN_QUERY = 0x0008
 _TOKEN_ELEVATION = 20  # TOKEN_INFORMATION_CLASS.TokenElevation
+#: SPI_GETCLIENTAREAANIMATION. Settings > Accessibility > Visual effects >
+#: Animation effects writes this; it is what Edge maps prefers-reduced-motion
+#: onto, so honouring it means the overlay agrees with every web surface on
+#: the same machine.
+_SPI_GETCLIENTAREAANIMATION = 0x1042
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -297,6 +302,24 @@ class WindowsPlatform:
         except OSError:
             logger.debug("could not determine the focused window's process", exc_info=True)
             return None
+
+    def animations_enabled(self) -> bool:
+        """Read SPI_GETCLIENTAREAANIMATION -- Windows' reduce-motion switch.
+
+        Fails open, per the PlatformAdapter contract: an unreadable setting
+        leaves the orb animating rather than silently freezing it.
+        """
+        try:
+            enabled = wintypes.BOOL()
+            ok = _user32.SystemParametersInfoW(
+                _SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(enabled), 0
+            )
+            if not ok:
+                return True
+            return bool(enabled.value)
+        except Exception:
+            logger.debug("could not read the animation preference", exc_info=True)
+            return True
 
     def paste_likely_blocked(self) -> bool:
         """True only when the foreground window's process is confidently

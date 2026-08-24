@@ -123,3 +123,8 @@ restore_delay_ms = 150
 
 [overlay]
 enabled = true                # the always-on-top pill window; false runs headless
+# Whether the bar's activity orb animates. "auto" follows the OS setting
+# (Windows: Settings > Accessibility > Visual effects > Animation effects),
+# "on" holds a single frame, "off" animates regardless. Named the way the
+# accessibility setting is: "on" means less movement, not more.
+reduced_motion = "auto"

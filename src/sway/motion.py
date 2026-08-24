@@ -1,7 +1,7 @@
 """Easing and time-sampled tweens for the floating bar.
 
 Pure: no Tk, no PIL, no global clock. That is deliberate, and it is the same
-idiom :func:`sway.bar._badge_frame` already uses -- animation is a *function
+idiom :mod:`sway.orb` uses -- animation is a *function
 of wall clock*, sampled once per frame, rather than a timer that owns state
 and has to be started, stopped and cancelled. A dropped frame or a paused
 poll loop cannot desynchronise anything, because nothing is being stepped.

@@ -8,8 +8,12 @@ dictation actually starts from).
 
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
+
 import pytest
 
+from sway.activation import Activation, ActivationLedger
 from sway.bar import RECOVERY, BarState, recovery_for
 from sway.engine import (
     Engine,
@@ -168,6 +172,7 @@ def _engine_with(bar, *, hotkey_down=False, listening=True):
     engine._bar = bar
     engine._tray = None
     engine._hotkey_down = hotkey_down
+    engine._hands_free_active = False
     engine._listening = listening
     return engine
 
@@ -443,3 +448,107 @@ def test_a_device_that_cannot_be_enumerated_does_not_raise():
         engine_module.input_devices = original
     assert opened, "a broken audio backend must still open a panel that says so"
     assert any(not i.enabled for i in opened[0])
+
+
+# -- duplicate dispatch ------------------------------------------------------
+# CLAUDE.md keeps the engine's threading out of the unit tests, and these do
+# not test threading: they test the *decision* to dispatch, which is pure and
+# is the one that went wrong. The engine is built with __new__ and given only
+# the attributes _on_release actually reads, so nothing here opens a mic,
+# hooks a key, or talks to the network.
+#
+# The regression: one hold produced two pastes. `_press_time` and
+# `_start_frame` were never cleared, so a second release passed every check and
+# re-dispatched the same audio range.
+
+
+class _Recorder:
+    """Stands in for everything _on_release touches, and counts dispatches."""
+
+    def __init__(self) -> None:
+        self.dispatched: list[Activation] = []
+
+    def set_level_metering(self, _on: bool) -> None: ...
+    def set_level(self, _level: int) -> None: ...
+
+
+def _release_only_engine(monkeypatch) -> tuple[Engine, _Recorder]:
+    engine = Engine.__new__(Engine)
+    recorder = _Recorder()
+
+    engine._activations = ActivationLedger()
+    engine._hotkey_down = False
+    engine._dictation_started_via_chord = False
+    engine._capture = recorder
+    engine._bar = recorder
+    engine._input_level = 0
+    engine._press_time = time.monotonic() - 5.0  # a comfortably long hold
+    engine._start_frame = 1000
+    engine._focused_process = "notepad.exe"
+    engine._stream_session = None
+    engine._config = SimpleNamespace(
+        hotkey=SimpleNamespace(min_hold_ms=200), streaming=SimpleNamespace(enabled=False)
+    )
+    engine._set_ui_state = lambda *a, **k: None
+    engine._coach_tap = lambda _at: None
+    engine._start_level_pump = lambda: None
+    engine._platform = SimpleNamespace(focused_process_name=lambda: "notepad.exe")
+    engine._ring = SimpleNamespace(mark=lambda: 2000)
+    engine._preroll_frames = 0
+
+    # Capture the dispatch instead of starting a worker thread.
+    class _Thread:
+        def __init__(self, *, target=None, args=(), **_kw) -> None:
+            self._args = args
+
+        def start(self) -> None:
+            recorder.dispatched.append(self._args[-1])
+
+    monkeypatch.setattr("sway.engine.threading.Thread", _Thread)
+    return engine, recorder
+
+
+def test_one_press_and_two_releases_dispatch_once(monkeypatch):
+    """The reported duplicate, at the engine boundary."""
+    engine, recorder = _release_only_engine(monkeypatch)
+    engine._on_press()
+    engine._press_time = time.monotonic() - 5.0  # a hold long enough to count
+    engine._on_release()
+    engine._on_release()
+    assert len(recorder.dispatched) == 1
+
+
+def test_a_release_with_no_press_never_dispatches(monkeypatch):
+    """A rival hook, or an event arriving after a rebind, has no press behind
+    it. Dispatching it would transcribe whatever `_start_frame` still held."""
+    engine, recorder = _release_only_engine(monkeypatch)
+    engine._on_release()
+    assert recorder.dispatched == []
+
+
+def test_each_press_and_release_pair_dispatches_once(monkeypatch):
+    engine, recorder = _release_only_engine(monkeypatch)
+    for _ in range(3):
+        engine._on_press()
+        engine._press_time = time.monotonic() - 5.0
+        engine._on_release()
+    assert len(recorder.dispatched) == 3
+    assert len({a.id for a in recorder.dispatched}) == 3
+
+
+def test_a_dispatched_activation_can_only_paste_once(monkeypatch):
+    """The injector is the last line of defence: even if two pipelines somehow
+    run for one activation, only one of them reaches the cursor."""
+    engine, recorder = _release_only_engine(monkeypatch)
+    engine._on_press()
+    engine._press_time = time.monotonic() - 5.0
+    engine._on_release()
+    activation = recorder.dispatched[0]
+
+    pasted: list[str] = []
+    engine._injector = SimpleNamespace(inject=pasted.append)
+    run = SimpleNamespace(annotate=lambda **_k: None)
+
+    assert engine._inject_with_fallback("hello", run, activation) is True
+    assert engine._inject_with_fallback("hello", run, activation) is False
+    assert pasted == ["hello"]

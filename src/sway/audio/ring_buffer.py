@@ -88,8 +88,16 @@ class RingBuffer:
         with self._lock:
             return self._total_frames
 
-    def read_since(self, start_frame: int) -> bytes:
-        """Return every frame written since ``start_frame``, oldest first.
+    def read_since(self, start_frame: int, end_frame: int | None = None) -> bytes:
+        """Return the frames in ``[start_frame, end_frame)``, oldest first.
+
+        ``end_frame`` defaults to everything written so far. Passing it
+        matters for the streaming chunker, which computes a chunk's right edge
+        and then has to be able to *read* that edge: without the bound, every
+        chunk silently ran on to the present moment, so consecutive chunks
+        overlapped by more audio than the schedule intended and the stitcher's
+        dedup window -- sized from the nominal overlap -- could not span the
+        real one. The duplicated speech was then appended verbatim.
 
         If the writer has wrapped past ``start_frame`` (the caller held the
         hotkey longer than the ring's capacity), the oldest frames are
@@ -98,7 +106,7 @@ class RingBuffer:
         """
         cap_bytes = len(self._buf)
         with self._lock:
-            end_frame = self._total_frames
+            end_frame = self._total_frames if end_frame is None else min(end_frame, self._total_frames)
             available = end_frame - start_frame
             if available <= 0:
                 return b""

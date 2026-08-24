@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -402,9 +403,50 @@ def _cmd_run(args: argparse.Namespace, config: Config) -> int:
     finally:
         # Runs on every path including a crash, which is what keeps a failed
         # run from leaving the hotkey hooked and the mic held (D1).
+        #
+        # Armed *before* the shutdown, because a shutdown that hangs is the
+        # dangerous case, not a shutdown that fails. A copy of Sway that
+        # outlives its tray icon still holds its global hotkey hooks, so the
+        # user's next launch -- which looks to them like starting the app --
+        # puts a second set of hooks on the same key and every press is served
+        # twice: two transcriptions, two model calls, two pastes. That is the
+        # duplicate-paste failure, and this is what makes "quit" mean it.
+        _arm_exit_watchdog()
         engine.stop()
         tracker.close()
     return 0
+
+
+#: How long a clean shutdown is given before it is taken by force. Generous:
+#: closing the Groq client alone is allowed five seconds, and a forced exit
+#: skips flushing anything still in progress, so this must only ever fire for a
+#: shutdown that is genuinely stuck.
+_SHUTDOWN_DEADLINE_S = 20.0
+
+
+def _arm_exit_watchdog(deadline_s: float = _SHUTDOWN_DEADLINE_S) -> threading.Thread:
+    """Guarantee the process exits, even if shutdown wedges.
+
+    ``os._exit`` rather than ``sys.exit``: the point is to be immune to
+    whatever is stuck, and a non-daemon thread or a blocked native call would
+    both survive a normal exit. Everything that must be durable (history,
+    settings, latency records) is committed at write time, so a forced exit
+    costs at most the current in-flight dictation.
+    """
+
+    def force() -> None:
+        logger.error(
+            "shutdown did not finish within %.0fs; exiting by force so no hotkey "
+            "hook outlives this process",
+            deadline_s,
+        )
+        os._exit(0)
+
+    watchdog = threading.Timer(deadline_s, force)
+    watchdog.name = "flow-exit-watchdog"
+    watchdog.daemon = True
+    watchdog.start()
+    return watchdog
 
 
 def _cmd_dashboard(args: argparse.Namespace, config: Config) -> int:

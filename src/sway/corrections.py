@@ -82,6 +82,14 @@ _EXPLICIT_MARKERS = (
 _AMBIGUOUS_MARKERS = (
     "no no no",
     "no no",
+    # "make it" is the sibling of the explicit "make that", and deliberately
+    # not in that tier. "Make that Tuesday" can only be a retraction; "make it
+    # three copies" and "make it snappy" are ordinary requests, and treating
+    # them as one would delete the clause before them. Here it must clear the
+    # same bar as "actually" -- a comparable pair (a day replaced by a day, a
+    # time by a time) or a restated noun -- which "no, no, make it Tuesday at
+    # 6 AM" does and a plain instruction does not.
+    "make it",
     "sorry",
     "actually",
     "wait",

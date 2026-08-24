@@ -232,3 +232,66 @@ class TestNumericOnlyCorrections:
 
     def test_trailing_punctuation_is_still_not_content(self) -> None:
         assert not scan("We should ship it on Tuesday, actually.").detected
+
+
+# -- "make it": the correction phrasing that was reported as broken ----------
+# "Book a meeting for Monday at 3 PM" then "No, no, make it Tuesday at 6 AM"
+# must resolve to Tuesday at 6 AM, without the speaker restating the request.
+#
+# "make it" sits in the *ambiguous* tier, not the explicit one, and these
+# tests are mostly about what it must NOT do: a false positive here silently
+# deletes the clause the speaker meant to keep.
+
+
+class TestMakeIt:
+    def test_a_spoken_correction_with_make_it_is_detected(self) -> None:
+        scan_result = scan("Book a meeting for Monday at 3 PM. No, no, make it Tuesday at 6 AM.")
+        assert scan_result.detected
+        assert "make it" in [m.marker for m in scan_result.markers]
+
+    def test_the_retracted_span_covers_the_replaced_value(self) -> None:
+        """What the guardrail needs: the old time is exempt from the
+        lost-entity check, so a rewrite that correctly drops it is not thrown
+        away for having dropped a number."""
+        scan_result = scan("Lunch at 12, make it 1.")
+        assert scan_result.detected
+        assert "12" in scan_result.retracted_text()
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The reported false-positive risk. "and then" makes this two
+            # statements, not a retraction of one.
+            "I want to book a meeting for Monday 6 am and then I'll make it Tuesday 3 pm",
+            # Ordinary instructions that happen to contain the words.
+            "Make it three copies.",
+            "Print the report, make it snappy.",
+            "Make it clear that we cannot ship on Friday.",
+        ],
+    )
+    def test_ordinary_speech_containing_make_it_is_left_alone(self, text: str) -> None:
+        result = scan(text)
+        assert not result.detected, [m.marker for m in result.markers]
+        assert result.text == text
+
+    def test_a_bare_make_it_with_no_comparable_pair_does_not_fire(self) -> None:
+        """The ambiguous tier's whole point: without a day-for-day or
+        time-for-time replacement there is nothing to say a retraction
+        happened."""
+        assert not scan("Send the deck over, make it good.").detected
+
+    def test_the_last_correction_in_a_sequence_wins(self) -> None:
+        """Several corrections in one utterance: every marker is recorded, in
+        spoken order, so the model resolves to the final value rather than an
+        arbitrary one."""
+        result = scan("Monday at 3 PM, no, make it Tuesday, actually make it Wednesday.")
+        assert result.detected
+        starts = [m.start for m in result.markers]
+        assert starts == sorted(starts)
+
+    def test_changing_only_the_time_keeps_the_day(self) -> None:
+        """A one-parameter correction must not retract the whole clause -- the
+        day was never withdrawn, so it stays protected by the entity guard."""
+        result = scan("Tuesday at 3 PM, make it 6 AM.")
+        assert result.detected
+        assert "Tuesday" not in result.retracted_text()

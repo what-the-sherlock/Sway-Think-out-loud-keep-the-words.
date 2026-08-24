@@ -24,6 +24,7 @@ from sway.settings import (
     parse,
     to_dict,
 )
+from sway.transforms import Transform
 
 
 # -- normalisation ---------------------------------------------------------
@@ -84,6 +85,38 @@ def test_blank_strings_become_none():
     assert result.hotkey is None
     assert result.audio_device is None
     assert result.language is None
+
+
+def test_hotkey_rejects_an_unknown_key_name():
+    # Unlike the free-text fields, hotkey/command_hotkey/hands_free_key must
+    # be an actual KNOWN_KEYS name -- previously this field was never
+    # validated at the settings layer at all (only implicitly, later, by
+    # config.py's validate() on the merged config).
+    assert parse({"hotkey": "not_a_real_key"}).hotkey is None
+    assert parse({"command_hotkey": "not_a_real_key"}).command_hotkey is None
+    assert parse({"hands_free_key": "not_a_real_key"}).hands_free_key is None
+
+
+def test_hotkey_chord_rejects_an_unparseable_shortcut():
+    assert parse({"hotkey_chord": "just-a-letter"}).hotkey_chord is None
+    assert parse({"command_hotkey_chord": ""}).command_hotkey_chord is None
+
+
+def test_hotkey_chord_accepts_a_valid_chord_and_canonicalises_it():
+    result = parse({"hotkey_chord": "Alt+Ctrl+p"})
+    assert result.hotkey_chord == "ctrl+alt+p"
+
+
+def test_hotkey_chord_rejects_a_reserved_chord():
+    assert parse({"hands_free_chord": "ctrl+v"}).hands_free_chord is None
+
+
+def test_hands_free_double_tap_defaults_to_none_not_false():
+    # None means "use config's default", distinct from an explicit False --
+    # unlike hands_free_enabled, this field has a config.toml equivalent.
+    assert parse({}).hands_free_double_tap is None
+    assert parse({"hands_free_double_tap": False}).hands_free_double_tap is False
+    assert parse({"hands_free_double_tap": True}).hands_free_double_tap is True
 
 
 def test_unknown_keys_survive_a_round_trip():
@@ -255,6 +288,32 @@ def test_apply_to_config_leaves_none_alone(make_config):
     assert result.hotkey.key == config.hotkey.key
 
 
+def test_apply_to_config_layers_every_new_hotkey_field(make_config):
+    config = make_config()
+    result = apply_to_config(
+        config,
+        Settings(
+            hotkey_chord="ctrl+alt+space",
+            command_hotkey="alt_l",
+            command_hotkey_chord="ctrl+alt+m",
+            hands_free_key="caps_lock",
+            hands_free_chord=None,
+            hands_free_double_tap=True,
+        ),
+    )
+    assert result.hotkey.key_chord == "ctrl+alt+space"
+    assert result.hotkey.command_key == "alt_l"
+    assert result.hotkey.command_key_chord == "ctrl+alt+m"
+    assert result.hotkey.hands_free_key == "caps_lock"
+    assert result.hotkey.hands_free_double_tap is True
+
+
+def test_apply_to_config_leaves_hands_free_double_tap_alone_when_none(make_config):
+    config = make_config()
+    result = apply_to_config(config, Settings(hands_free_double_tap=None))
+    assert result.hotkey.hands_free_double_tap == config.hotkey.hands_free_double_tap
+
+
 def test_apply_to_config_always_sets_retention(make_config):
     """Retention has a real default rather than None, so it always applies."""
     config = make_config()
@@ -268,3 +327,97 @@ def test_trigger_normalised_phrase_matches_module_helper():
 
 def test_app_rule_normalises_process():
     assert AppRule(process="  Slack.EXE ", style="casual").normalised_process() == "slack.exe"
+
+
+# -- transform output expectations, and reading back an older settings.json --
+
+
+def test_transform_expectations_round_trip(tmp_path):
+    """A user who ticks "produces a list" must still have it ticked tomorrow."""
+    store = SettingsStore(tmp_path / "settings.json")
+    custom = Transform(
+        id="mine",
+        name="Bulletise",
+        instruction="Rewrite as a list",
+        enabled=True,
+        allows_markdown=True,
+        may_shorten=True,
+    )
+    store.update(transforms=(custom,))
+
+    reloaded = SettingsStore(tmp_path / "settings.json").load()
+    assert reloaded.transforms[0].allows_markdown is True
+    assert reloaded.transforms[0].may_shorten is True
+    assert reloaded.transforms[0].may_lengthen is False
+
+
+def test_a_settings_file_written_before_expectations_existed_keeps_them(tmp_path):
+    """The migration that matters. Every settings.json in the wild stores the
+    nine built-ins without these fields; reading them back as False would
+    silently restore the bug they were added to fix -- "make that bullet
+    points" produces bullets, the markdown guardrail rejects them, and the
+    user gets plain text with no indication anything happened."""
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "transforms": [
+                    {
+                        "id": "bullets",
+                        "name": "Turn into bullet points",
+                        "instruction": "Rewrite as a bulleted list",
+                        "phrase": "make that bullet points",
+                        "enabled": True,
+                        "builtin": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = SettingsStore(path).load()
+    assert loaded.transforms[0].allows_markdown is True
+
+
+def test_a_custom_transform_with_no_expectations_stays_strict(tmp_path):
+    """Only shipped ids get a shipped default. Intent cannot be inferred from
+    a free-text instruction, so anything else keeps the full guardrails."""
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "transforms": [
+                    {"id": "mine", "name": "Mine", "instruction": "Do a thing"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = SettingsStore(path).load()
+    assert loaded.transforms[0].allows_markdown is False
+    assert loaded.transforms[0].may_shorten is False
+
+
+def test_an_explicit_false_beats_the_shipped_default(tmp_path):
+    """A user who unticks the box on a built-in keeps it unticked."""
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "transforms": [
+                    {
+                        "id": "bullets",
+                        "name": "Turn into bullet points",
+                        "instruction": "Rewrite as a bulleted list",
+                        "allows_markdown": False,
+                        "builtin": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert SettingsStore(path).load().transforms[0].allows_markdown is False

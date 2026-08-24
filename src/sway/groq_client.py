@@ -142,10 +142,12 @@ class TranscriptionResult:
     def confident(self) -> bool:
         """Whether the transcript (and its language label) can be trusted.
 
-        Drives the *conservative* branch of the cleanup stage rather than
-        rejecting anything: a doubtful transcript is still the user's words
-        and still gets pasted, it just doesn't get rewritten by a model that
-        would be guessing from the same shaky input.
+        Gates both the paste itself (see Engine._run_dictation /
+        _run_command) and the cleanup rewrite: a doubtful transcript is
+        withheld entirely rather than pasted, because the likeliest cause of
+        low confidence over a short clip is Whisper hallucinating -- often
+        echoing back the personal-dictionary prompt bias -- rather than a
+        genuine, just-hard-to-parse utterance.
         """
         if self.avg_logprob is not None and self.avg_logprob < LOW_CONFIDENCE_AVG_LOGPROB:
             return False

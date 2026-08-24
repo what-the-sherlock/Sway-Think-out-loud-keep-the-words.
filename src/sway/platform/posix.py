@@ -165,6 +165,18 @@ class PosixPlatform:
         del app_name
         return False
 
+    def animations_enabled(self) -> bool:
+        """Always True.
+
+        GNOME, KDE and macOS each expose a reduce-motion preference through a
+        different mechanism (gsettings, kreadconfig, NSWorkspace), and reading
+        the wrong one is worse than reading none: it would freeze the orb on
+        a desktop that never asked for that. Windows is the target OS; the
+        ``[overlay] reduced_motion`` config key is the manual override
+        everywhere else until a real per-desktop reader exists here.
+        """
+        return True
+
     def _run(self, argv: list[str], *, input_text: str | None = None) -> str:
         exe = argv[0]
         if shutil.which(exe) is None:

@@ -65,6 +65,115 @@ def test_only_allowlisted_fields_are_writable(store):
         actions.update_settings(store, {"triggers": [{"phrase": "x", "payload": "y"}]})
 
 
+# -- activation bindings -----------------------------------------------------
+
+
+def test_save_activation_binding_sets_a_hold_key(store):
+    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_l"})
+    assert store.get().hotkey == "ctrl_l"
+
+
+def test_save_activation_binding_sets_a_chord(store):
+    actions.save_activation_binding(store, {"target": "hands_free", "chord": "Alt+Ctrl+Space"})
+    assert store.get().hands_free_chord == "ctrl+alt+space"
+
+
+def test_save_activation_binding_rejects_an_unknown_target(store):
+    with pytest.raises(ActionError, match="unknown activation target"):
+        actions.save_activation_binding(store, {"target": "nope", "key": "ctrl_l"})
+
+
+def test_save_activation_binding_rejects_an_unknown_key(store):
+    with pytest.raises(ActionError):
+        actions.save_activation_binding(store, {"target": "dictation", "key": "not_a_real_key"})
+
+
+def test_save_activation_binding_rejects_an_unusable_chord(store):
+    with pytest.raises(ActionError):
+        actions.save_activation_binding(store, {"target": "command", "chord": "just-a-letter"})
+
+
+def test_save_activation_binding_hard_rejects_a_hold_key_collision(store):
+    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_r"})
+    with pytest.raises(ActionError, match="already"):
+        actions.save_activation_binding(store, {"target": "hands_free", "key": "ctrl_r"})
+    # The rejected save must not have partially applied.
+    assert store.get().hands_free_key is None
+
+
+def test_save_activation_binding_hard_rejects_a_hold_key_collision_against_config_default(store):
+    """Even a binding never explicitly overridden in Settings is still a
+    real collision if it's what the engine is actually using -- caught via
+    the `effective` values (normally the engine's own describe())."""
+    with pytest.raises(ActionError, match="already"):
+        actions.save_activation_binding(
+            store,
+            {"target": "hands_free", "key": "shift_r"},
+            effective={"command_hotkey": "shift_r"},
+        )
+
+
+def test_save_activation_binding_hard_rejects_a_chord_collision(store):
+    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+    with pytest.raises(ActionError, match="already"):
+        actions.save_activation_binding(store, {"target": "command", "chord": "ctrl+alt+p"})
+
+
+def test_save_activation_binding_does_not_reject_a_transform_collision(store):
+    """A hold/chord binding colliding with a *transform* shortcut is a soft
+    warning shown elsewhere (activation_view's conflicts), not a hard
+    reject here -- mirroring how the transforms UI already treats a
+    transform/transform collision as non-blocking."""
+    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+
+
+def test_save_activation_binding_a_field_left_absent_is_untouched(store):
+    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_l"})
+    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+    assert store.get().hotkey == "ctrl_l"
+    assert store.get().hotkey_chord == "ctrl+alt+p"
+
+
+def test_reset_activation_binding_clears_both_fields(store):
+    actions.save_activation_binding(
+        store, {"target": "dictation", "key": "ctrl_l", "chord": "ctrl+alt+p"}
+    )
+    actions.reset_activation_binding(store, {"target": "dictation"})
+    assert store.get().hotkey is None
+    assert store.get().hotkey_chord is None
+
+
+def test_reset_activation_binding_rejects_an_unknown_target(store):
+    with pytest.raises(ActionError, match="unknown activation target"):
+        actions.reset_activation_binding(store, {"target": "nope"})
+
+
+def test_activation_view_reports_the_default_flag(store):
+    view = actions.activation_view(store.get())
+    assert view["dictation"]["is_default"] is True
+    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_l"})
+    view = actions.activation_view(store.get())
+    assert view["dictation"]["is_default"] is False
+
+
+def test_activation_view_reports_conflicts_symmetrically(store):
+    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+    # Bypass save_activation_binding's hard reject to inspect how the view
+    # reports an existing conflict (e.g. one created by two independent
+    # settings writes, which the view -- not the save path -- is what
+    # surfaces to the user).
+    store.update(command_hotkey_chord="ctrl+alt+p")
+    view = actions.activation_view(store.get())
+    assert "the voice-command hotkey" in view["dictation"]["conflicts"]
+    assert "the dictation hotkey" in view["command"]["conflicts"]
+
+
+def test_activation_view_includes_hands_free_mode_flags(store):
+    view = actions.activation_view(store.get())
+    assert view["hands_free"]["enabled"] is False
+    assert view["hands_free"]["double_tap"] is False
+
+
 # -- triggers --------------------------------------------------------------
 
 
@@ -243,3 +352,56 @@ def test_set_key_rejects_an_empty_value():
     for payload in ({}, {"key": ""}, {"key": "   "}, {"key": 42}):
         with pytest.raises(ActionError, match="no key given"):
             actions.set_key(payload)
+
+
+# -- transform output expectations through the UI ---------------------------
+
+
+def test_saving_a_transform_records_its_expectations(store):
+    settings = actions.save_transform(
+        store,
+        {
+            "name": "Bulletise",
+            "instruction": "Rewrite as a list",
+            "allows_markdown": True,
+            "may_shorten": True,
+        },
+    )
+    saved = settings.transforms[-1]
+    assert saved.allows_markdown is True
+    assert saved.may_shorten is True
+    assert saved.may_lengthen is False
+
+
+def test_toggling_a_builtin_does_not_drop_its_expectations(store):
+    """The toggle posts the whole record back. If a round trip through the UI
+    lost these, enabling "Turn into bullet points" from the switch would
+    re-arm the markdown guardrail against it -- the original bug, restored by
+    the act of turning the feature on."""
+    bullets = next(t for t in store.get().transforms if t.id == "bullets")
+    assert bullets.allows_markdown is True
+    settings = actions.save_transform(
+        store,
+        {"id": "bullets", "name": bullets.name, "instruction": bullets.instruction, "enabled": True},
+    )
+    assert next(t for t in settings.transforms if t.id == "bullets").allows_markdown is True
+
+
+def test_unticking_a_box_is_honoured(store):
+    settings = actions.save_transform(
+        store,
+        {
+            "id": "bullets",
+            "name": "Turn into bullet points",
+            "instruction": "Rewrite as a list",
+            "allows_markdown": False,
+        },
+    )
+    assert next(t for t in settings.transforms if t.id == "bullets").allows_markdown is False
+
+
+def test_the_transform_view_exposes_the_expectations(store):
+    view = {row["id"]: row for row in actions.transform_view(store.get())}
+    assert view["bullets"]["allows_markdown"] is True
+    assert view["email"]["may_lengthen"] is True
+    assert view["polish"]["allows_markdown"] is False

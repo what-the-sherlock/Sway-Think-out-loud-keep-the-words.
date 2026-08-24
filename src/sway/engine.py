@@ -28,6 +28,7 @@ Threading model (see CLAUDE.md's architecture rules for why):
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import threading
@@ -43,12 +44,15 @@ from sway import APP_NAME, instance
 from sway.audio.capture import AudioCapture, input_devices
 from sway.analytics import SessionMetrics, count_words, pcm_duration_ms, session_metrics
 
+from sway.activation import COMMAND, DICTATION, Activation, ActivationLedger
 from sway.audio.flac import encode_flac
 from sway.audio.ring_buffer import RingBuffer
 from sway.audio.vad import VadTrimmer
 from sway.cleanup import (
+    SPOKEN_COMMAND_EXPECTATION,
     CleanupStats,
-    is_cleanup_output_safe,
+    OutputExpectation,
+    looks_hallucinated,
     normalize_cleanup_output,
     should_skip_cleanup,
     system_prompt_for_style,
@@ -56,6 +60,7 @@ from sway.cleanup import (
 )
 from sway.commands import COMMAND_SYSTEM_PROMPT, build_command_user_message
 from sway.config import Config
+from sway.config import _validate  # noqa: PLC2701 - deliberately re-validating a settings-merged config
 from sway.corrections import CorrectionScan
 from sway.corrections import scan as scan_corrections
 from sway.dashboard.server import DashboardServer, EngineControl
@@ -68,6 +73,7 @@ from sway.dictionary import (
 from sway.errors import (
     AudioError,
     ClipboardError,
+    ConfigError,
     DictionaryStoreError,
     SwayError,
     HistoryStoreError,
@@ -87,7 +93,10 @@ from sway.hotkey import (
     Chord,
     ChordError,
     ChordListener,
+    DoubleTapTracker,
     HotkeyListener,
+    TapModeTracker,
+    find_binding_conflicts,
     parse_chord,
     prettify_hotkey,
 )
@@ -108,7 +117,7 @@ from sway.profiles import CleanupStyle, style_for_process
 from sway.selection import SelectionReader
 from sway.settings import SettingsStore, apply_to_config
 from sway import transforms as transforms_module
-from sway.transforms import Transform, build_directive_block
+from sway.transforms import Transform, build_directive_block, expectation_for
 from sway.triggers import apply_triggers
 from sway.streaming import ChunkSessionResult, ChunkStreamer, max_overlap_words, stitch_transcripts
 from sway.tray import TrayIcon, TrayState
@@ -306,6 +315,7 @@ class Engine:
         #: this needs no lock and the callback never blocks (CLAUDE.md).
         self._input_level = 0
         self._hotkey_down = False
+        self._command_key_down = False
         #: When the last too-short hold happened, and how many in a row.
         #: A single tap gets a gentle correction; a second in quick
         #: succession gets a more explicit one, because the first evidently
@@ -333,8 +343,10 @@ class Engine:
             on_release=self._on_release,
         )
         self._command_hotkey: HotkeyListener | None = None
-        #: One OS hook for every transform shortcut. Rebuilt from settings at
-        #: startup and again whenever the user edits a transform.
+        #: One OS hook for every tap-shaped shortcut: transform shortcuts,
+        #: dictation's/command's optional alternate chord, and hands-free's
+        #: chord binding all share this table, rebuilt from settings at
+        #: startup and again whenever any of them changes.
         self._chords = ChordListener()
         if config.hotkey.command_key is not None:
             self._command_hotkey = HotkeyListener(
@@ -356,10 +368,47 @@ class Engine:
         self._selection_ready = threading.Event()
         self._selected_text = ""
 
+        # -- hands-free dictation (Phase 6): tap to start, tap again to stop.
+        # See _configure_hands_free for how the binding (a bare held key,
+        # double-tapped or not, vs. a chord) maps onto _hands_free_key_listener
+        # / self._chords.
+        self._hands_free_active = False
+        self._hands_free_tracker: TapModeTracker | DoubleTapTracker | None = None
+        self._hands_free_key_listener: HotkeyListener | None = None
+        self._hands_free_session: ChunkStreamer | None = None
+        self._hands_free_start_frame = 0
+        self._hands_free_focused_process: str | None = None
+        self._hands_free_timer: threading.Thread | None = None
+        self._configure_hands_free()
+
+        # Dictation's and the voice command's optional alternate chord (the
+        # reference's "+" affordance): a chord fires once per tap, so unlike
+        # the primary hold key it starts/stops a session rather than being
+        # held -- driven by the same TapModeTracker hands-free uses, and
+        # protected by the same safety ceiling (_hands_free_max_seconds is
+        # reused here as "how long a *toggle-shaped* session may run before
+        # being force-stopped", not just a hands-free-specific concept) so a
+        # missed second tap can never leave the app looking stuck recording.
+        self._dictation_chord_tracker = TapModeTracker(
+            max_active_s=float(config.hotkey.hands_free_max_seconds)
+        )
+        self._command_chord_tracker = TapModeTracker(
+            max_active_s=float(config.hotkey.hands_free_max_seconds)
+        )
+        self._dictation_started_via_chord = False
+        self._command_started_via_chord = False
+        self._activation_timer: threading.Thread | None = None
+        self._stopping = False
+        #: One user intention, one execution. Every press mints a token here
+        #: and every release claims it, so a second release with no press
+        #: behind it cannot re-dispatch the same audio. See sway.activation.
+        self._activations = ActivationLedger()
+
     # -- lifecycle -----------------------------------------------------
 
     def start(self) -> None:
         """Opens the mic, starts the network loop and Groq client, arms the hotkey(s)."""
+        self._warn_if_another_instance_is_live()
         self._capture.start()
         self._network.start()
         # A missing key is a state to be *in*, not a reason to refuse to
@@ -378,8 +427,11 @@ class Engine:
         self._hotkey.start()
         if self._command_hotkey is not None:
             self._command_hotkey.start()
+        if self._hands_free_key_listener is not None:
+            self._hands_free_key_listener.start()
         self._bind_transform_shortcuts()
         self._chords.start()
+        self._start_activation_timeout_pump()
         if self._config.tray.enabled:
             self._tray = TrayIcon(
                 on_show_history=self._open_history_window,
@@ -567,12 +619,13 @@ class Engine:
 
     def stop(self) -> None:
         """Idempotent; safe to call even if :meth:`start` only partly succeeded."""
+        self._stopping = True
         for label, action in (
             ("hotkey", self._hotkey.stop),
             ("command hotkey", self._stop_command_hotkey),
+            ("hands-free key", self._stop_hands_free_listener),
             ("transform shortcuts", self._chords.stop),
             ("tray", self._stop_tray),
-            ("instance file", self._withdraw_instance),
             ("window", self._stop_window),
             ("dashboard", self._stop_dashboard),
             ("capture", self._capture.stop),
@@ -580,6 +633,14 @@ class Engine:
             ("dictionary", self._stop_dictionary),
             ("history", self._stop_history),
             ("overlay", self._bar.stop),
+            # Withdrawn *last*, after every hotkey hook is down. Withdrawing it
+            # first -- as this used to -- opens a window in which the
+            # advertisement is gone while the hooks are still armed, so a
+            # launch arriving during a slow shutdown sees "nothing running",
+            # starts a rival, and both copies then answer the same keypress.
+            # A stale file is already handled (instance.read checks the pid is
+            # alive); a *missing* file while we are still listening is not.
+            ("instance file", self._withdraw_instance),
         ):
             try:
                 action()
@@ -605,6 +666,40 @@ class Engine:
     def _stop_command_hotkey(self) -> None:
         if self._command_hotkey is not None:
             self._command_hotkey.stop()
+
+    def _stop_hands_free_listener(self) -> None:
+        if self._hands_free_key_listener is not None:
+            self._hands_free_key_listener.stop()
+
+    def _warn_if_another_instance_is_live(self) -> None:
+        """Say so, loudly, if a copy of Sway is already running.
+
+        ``Sway.exe`` refuses a second launch behind a named mutex, but that is
+        one entry point among several -- ``python -m sway run`` takes no mutex
+        at all, and a developer or a launch-at-login entry can reach it. Two
+        engines mean two hotkey hooks on one key: every press is transcribed
+        twice, billed twice against the free tier, and pasted twice.
+
+        A warning rather than a refusal, deliberately. This reads a pid out of
+        a file, and being wrong in the refusing direction would leave the user
+        unable to start their dictation app at all. The log line is what makes
+        the condition diagnosable in ten seconds instead of by comparing
+        databases -- which is how long it took the first time.
+        """
+        try:
+            info = instance.read(self._config.data_dir)
+        except Exception:
+            logger.debug("could not check for another running instance", exc_info=True)
+            return
+        if info is None or info.pid == os.getpid():
+            return
+        logger.warning(
+            "another Sway process (pid %s) appears to be running and advertising at %s. "
+            "Two copies both hook the dictation key, so every press is transcribed and "
+            "pasted twice. Quit the other copy if you did not mean to run two.",
+            info.pid,
+            info.port,
+        )
 
     def _withdraw_instance(self) -> None:
         """Remove the advertisement before the port goes away, so a launch
@@ -662,7 +757,10 @@ class Engine:
         # that finishing worker paint "Done - 12 words" over a live recording
         # -- the bar would be reporting the *previous* utterance while the
         # user watched themselves speak the next one.
-        if self._hotkey_down and state not in (BarState.RECORDING, BarState.PAUSED):
+        if (self._hotkey_down or self._hands_free_active) and state not in (
+            BarState.RECORDING,
+            BarState.PAUSED,
+        ):
             logger.debug(
                 "suppressed a %s bar update arriving during a live hold", state
             )
@@ -716,6 +814,7 @@ class Engine:
         # it is physically held. A plain bool assignment, so the listener
         # thread is not slowed by it.
         self._hotkey_down = True
+        self._activations.begin(DICTATION)
         self._start_frame = preroll_start_frame(self._ring.mark(), self._preroll_frames)
         # Captured at press time, when the target app is unambiguously the one
         # the user is dictating into; PlatformAdapter guarantees this never
@@ -726,11 +825,27 @@ class Engine:
         self._capture.set_level_metering(True)
         self._start_level_pump()
         self._set_ui_state(BarState.RECORDING)
-        self._stream_session = self._start_streaming() if self._config.streaming.enabled else None
+        self._stream_session = (
+            self._start_streaming(self._start_frame) if self._config.streaming.enabled else None
+        )
 
     def _on_release(self) -> None:
         release_time = time.monotonic()
+        # Claimed first, before any state is touched. A release with nothing
+        # outstanding is a duplicate -- a doubled OS hook, a toggle racing its
+        # own safety timeout, a rival process's event -- and dispatching it
+        # would transcribe and paste the same audio a second time. `_press_time`
+        # and `_start_frame` are still set from the real press, so there is
+        # nothing here to stop it except this.
+        activation = self._activations.claim(DICTATION)
+        if activation is None:
+            logger.warning(
+                "ignoring a dictation release with no press behind it "
+                "(a duplicate event; this would have pasted twice)"
+            )
+            return
         self._hotkey_down = False
+        self._dictation_started_via_chord = False
         self._capture.set_level_metering(False)
         self._input_level = 0
         self._bar.set_level(0)
@@ -754,6 +869,7 @@ class Engine:
                 release_time,
                 held_ms,
                 self._press_time,
+                activation,
             ),
             daemon=True,
         ).start()
@@ -814,7 +930,7 @@ class Engine:
 
     # -- streaming (Phase 4): background chunks while the key is held ----
 
-    def _start_streaming(self) -> ChunkStreamer:
+    def _start_streaming(self, start_frame: int) -> ChunkStreamer:
         streaming = self._config.streaming
         session = ChunkStreamer(
             ring=self._ring,
@@ -823,7 +939,7 @@ class Engine:
                 pcm, self._config.audio.sample_rate, self._config.audio.channels
             ),
             submit_transcribe=self._submit_chunk_transcribe,
-            start_frame=self._start_frame,
+            start_frame=start_frame,
             sample_rate=self._config.audio.sample_rate,
             chunk_seconds=streaming.chunk_seconds,
             overlap_seconds=streaming.overlap_seconds,
@@ -845,6 +961,8 @@ class Engine:
 
     def _on_command_press(self) -> None:
         self._command_press_time = time.monotonic()
+        self._command_key_down = True
+        self._activations.begin(COMMAND)
         self._command_start_frame = preroll_start_frame(self._ring.mark(), self._preroll_frames)
         self._command_focused_process = self._platform.focused_process_name()
         self._set_ui_state(BarState.RECORDING)
@@ -871,6 +989,16 @@ class Engine:
             ready.set()
 
     def _on_command_release(self) -> None:
+        # Same rule as dictation: a release with no press behind it is a
+        # duplicate event, and running it would transform the selection twice.
+        activation = self._activations.claim(COMMAND)
+        if activation is None:
+            logger.warning(
+                "ignoring a command release with no press behind it (a duplicate event)"
+            )
+            return
+        self._command_key_down = False
+        self._command_started_via_chord = False
         held_ms = (time.monotonic() - self._command_press_time) * 1000.0
         if not should_process(held_ms, self._config.hotkey.min_hold_ms):
             self._set_ui_state(BarState.IDLE)
@@ -879,9 +1007,198 @@ class Engine:
         threading.Thread(
             name="flow-command",
             target=self._process_command,
-            args=(self._command_start_frame, self._command_focused_process, self._selection_ready),
+            args=(
+                self._command_start_frame,
+                self._command_focused_process,
+                self._selection_ready,
+                "",
+                "command",
+                SPOKEN_COMMAND_EXPECTATION,
+                activation,
+            ),
             daemon=True,
         ).start()
+
+    # -- hands-free dictation (Phase 6): tap to start, tap again to stop --
+
+    def _configure_hands_free(self) -> None:
+        """(Re)build the hands-free binding from the current effective config
+        and settings. Called at construction and again from
+        :meth:`_apply_settings` whenever anything about the binding changes.
+
+        Never tears down a session silently: if hands-free is being turned
+        off while a session is active, that session is force-stopped and
+        processed first -- the mic must never be left "hot" behind a
+        binding that no longer exists to stop it. If only the *binding*
+        (key/chord/timing) changes while a session is active, the running
+        session is left alone; the new binding takes effect on the next
+        toggle rather than retroactively reinterpreting a session that is
+        already speaking.
+        """
+        enabled = self._settings.get().hands_free_enabled
+        hotkey_cfg = self._config.hotkey
+        has_binding = hotkey_cfg.hands_free_key is not None or hotkey_cfg.hands_free_chord is not None
+        usable = enabled and has_binding
+
+        if not usable and self._hands_free_active:
+            self._stop_hands_free(timed_out=False)
+
+        if self._hands_free_key_listener is not None:
+            self._hands_free_key_listener.stop()
+            self._hands_free_key_listener = None
+
+        if usable and hotkey_cfg.hands_free_key is not None:
+            self._hands_free_key_listener = HotkeyListener(
+                key=KNOWN_KEYS[hotkey_cfg.hands_free_key],
+                on_press=lambda: None,
+                on_release=self._toggle_hands_free,
+            )
+            if self._listening:
+                self._hands_free_key_listener.start()
+
+        if usable:
+            if hotkey_cfg.hands_free_double_tap:
+                self._hands_free_tracker = DoubleTapTracker(
+                    max_active_s=float(hotkey_cfg.hands_free_max_seconds)
+                )
+            else:
+                self._hands_free_tracker = TapModeTracker(
+                    max_active_s=float(hotkey_cfg.hands_free_max_seconds)
+                )
+        else:
+            self._hands_free_tracker = None
+
+    def _toggle_hands_free(self) -> None:
+        """Fires on a hands-free tap -- either the dedicated key listener's
+        release, or the shared chord listener's tap. Runs on a listener
+        thread; must return immediately.
+        """
+        tracker = self._hands_free_tracker
+        if tracker is None:
+            return
+        outcome = tracker.tap(time.monotonic())
+        if outcome is None:
+            return  # a lone tap of a double-tap binding: nothing happens yet
+        if outcome == "start":
+            self._start_hands_free()
+        else:
+            self._stop_hands_free(timed_out=(outcome == "stop_timeout"))
+
+    def _start_hands_free(self) -> None:
+        self._hands_free_active = True
+        # Hands-free is dictation by another gesture, so it shares the
+        # dictation slot: a hands-free session and a held-key session are the
+        # same intention expressed two ways and must never both dispatch.
+        self._activations.begin(DICTATION)
+        self._hands_free_start_frame = preroll_start_frame(self._ring.mark(), self._preroll_frames)
+        self._hands_free_focused_process = self._platform.focused_process_name()
+        self._capture.set_level_metering(True)
+        self._start_level_pump()
+        self._set_ui_state(BarState.RECORDING)
+        self._hands_free_session = (
+            self._start_streaming(self._hands_free_start_frame)
+            if self._config.streaming.enabled
+            else None
+        )
+        self._start_hands_free_timeout_pump()
+
+    def _stop_hands_free(self, *, timed_out: bool) -> None:
+        # The tap and the safety-timeout pump run on different threads and can
+        # both decide to stop the same session; whichever gets here first owns
+        # it, and the loser finds nothing outstanding and returns.
+        activation = self._activations.claim(DICTATION)
+        if activation is None:
+            logger.debug("hands-free stop with nothing outstanding; ignoring the duplicate")
+            return
+        self._hands_free_active = False
+        self._capture.set_level_metering(False)
+        self._input_level = 0
+        self._bar.set_level(0)
+        session, self._hands_free_session = self._hands_free_session, None
+        if timed_out:
+            try:
+                self._bar.coach(
+                    f"Stopped automatically after {self._config.hotkey.hands_free_max_seconds}s"
+                )
+            except Exception:
+                logger.debug("could not show the hands-free timeout coach", exc_info=True)
+        self._set_ui_state(BarState.THINKING, detail="Transcribing")
+        threading.Thread(
+            name="flow-hands-free",
+            target=self._process_hands_free,
+            args=(
+                self._hands_free_start_frame,
+                self._hands_free_focused_process,
+                session,
+                timed_out,
+                activation,
+            ),
+            daemon=True,
+        ).start()
+
+    def _start_hands_free_timeout_pump(self) -> None:
+        """A session must not be able to run forever if its stop tap is
+        physically missed -- checked on a timer, not just from the next tap.
+        """
+        if self._hands_free_timer is not None and self._hands_free_timer.is_alive():
+            return
+
+        def pump() -> None:
+            while self._hands_free_active:
+                tracker = self._hands_free_tracker
+                if tracker is not None and tracker.check_timeout(time.monotonic()):
+                    self._stop_hands_free(timed_out=True)
+                    return
+                time.sleep(1.0)
+
+        self._hands_free_timer = threading.Thread(target=pump, name="flow-hands-free-timeout", daemon=True)
+        self._hands_free_timer.start()
+
+    def _start_activation_timeout_pump(self) -> None:
+        """Safety net for the two *toggle-shaped* alternate chords
+        (dictation's and command's -- hands-free has its own, per-session
+        pump above since it is the common case). Runs for the app's whole
+        lifetime rather than per-session: unlike a held key, whose release is
+        guaranteed by the OS the instant the finger lifts, a tap-started
+        session's stop signal can simply never arrive (a missed second tap,
+        the binding edited mid-session), and CLAUDE.md is explicit that the
+        app must never hang with the mic hot. A *physical hold* is never
+        touched here -- only a session this engine itself marked as having
+        started via a chord tap (see _dictation_started_via_chord /
+        _command_started_via_chord).
+        """
+        if self._activation_timer is not None and self._activation_timer.is_alive():
+            return
+
+        def pump() -> None:
+            while not self._stopping:
+                now = time.monotonic()
+                if self._dictation_started_via_chord and self._dictation_chord_tracker.check_timeout(now):
+                    self._on_release()
+                if self._command_started_via_chord and self._command_chord_tracker.check_timeout(now):
+                    self._on_command_release()
+                time.sleep(1.0)
+
+        self._activation_timer = threading.Thread(target=pump, name="flow-activation-timeout", daemon=True)
+        self._activation_timer.start()
+
+    def _process_hands_free(
+        self,
+        start_frame: int,
+        focused_process: str | None,
+        session: ChunkStreamer | None,
+        timed_out: bool,
+        activation: Activation,
+    ) -> None:
+        with self._tracker.run({"source": "hands_free", "activation": activation.id}) as run:
+            if timed_out:
+                run.annotate(hands_free_timeout=True)
+            self._run_pipeline(
+                run,
+                lambda: self._run_dictation(
+                    start_frame, focused_process, session, run, activation
+                ),
+            )
 
     # -- the pipelines (run on a per-dictation/-command worker thread) ---
 
@@ -949,8 +1266,9 @@ class Engine:
         release_time: float,
         held_ms: float,
         press_time: float,
+        activation: Activation,
     ) -> None:
-        with self._tracker.run({"source": "hotkey"}) as run:
+        with self._tracker.run({"source": "hotkey", "activation": activation.id}) as run:
             run.annotate(held_ms=round(held_ms, 1))
             # Two spans that closed before this recorder existed (D0). The
             # hold is the user's own speaking time and is not latency to
@@ -968,7 +1286,10 @@ class Engine:
             )
             run.record(Stage.DISPATCH, (time.monotonic() - release_time) * 1000.0)
             self._run_pipeline(
-                run, lambda: self._run_dictation(start_frame, focused_process, session, run)
+                run,
+                lambda: self._run_dictation(
+                    start_frame, focused_process, session, run, activation
+                ),
             )
             # The number that actually describes the wait: hotkey release to
             # text on screen. Every other stage timing is a component of it,
@@ -982,6 +1303,7 @@ class Engine:
         focused_process: str | None,
         session: ChunkStreamer | None,
         run: RunRecorder,
+        activation: Activation,
     ) -> None:
         transcript = self._transcribe(start_frame, run, session)
         if not transcript:
@@ -991,7 +1313,34 @@ class Engine:
             # and offering the device picker, turns the most confusing
             # outcome in the product into the most actionable one.
             self._set_ui_state(
-                BarState.DONE, detail="No speech detected", kind="no_speech"
+                BarState.DONE, detail="Not captured — no speech detected", kind="no_speech"
+            )
+            return
+
+        hallucinated = looks_hallucinated(transcript.text, speech_ms=transcript.speech_ms)
+        if not transcript.confident or hallucinated:
+            # VAD is an energy classifier, not a content classifier: a
+            # keyboard click or a breath can survive it as a short non-empty
+            # clip, and Whisper is prone to hallucinate by echoing back the
+            # personal-dictionary prompt bias (see _build_prompt_bias), or
+            # its own famous training-data boilerplate ("Thank you for
+            # watching!"), over audio like that. Two independent signals
+            # catch this: transcript.confident (Whisper's own avg_logprob/
+            # no_speech_prob) and looks_hallucinated (the audio was too
+            # short to physically contain this many words) -- the second
+            # exists because the classic hallucinated phrases are often
+            # reported *confidently*, so the model's own uncertainty signal
+            # alone does not reliably catch them. Either one is enough to
+            # withhold the paste: named clearly on the bar rather than
+            # silently pasted or left ambiguous, and never handed to
+            # triggers, corrections, or a cleanup model call, none of which
+            # should do real work over text that is likely not what was
+            # actually said.
+            run.annotate(
+                skipped="hallucination_suspected" if hallucinated else "low_confidence_paste_suppressed"
+            )
+            self._set_ui_state(
+                BarState.DONE, detail="Not captured — didn't catch that", kind="low_confidence"
             )
             return
 
@@ -1010,7 +1359,7 @@ class Engine:
 
         self._set_ui_state(BarState.INJECTING)
         with run.stage(Stage.INJECT):
-            pasted = self._inject_with_fallback(cleaned_text, run)
+            pasted = self._inject_with_fallback(cleaned_text, run, activation)
 
         if pasted:
             # Confirm with a fact, not a tick: the word count also silently
@@ -1024,6 +1373,7 @@ class Engine:
                 BarState.DONE, detail=f"{words} word{'' if words == 1 else 's'}"
             )
             self._refresh_bar_hint()
+            self._coach_amend_gesture()
             # A success clears the "what is wrong right now" slot, so Home
             # never shows a stale failure the user has already worked past.
             self._clear_error()
@@ -1085,7 +1435,9 @@ class Engine:
             typing_wpm=self._config.analytics.typing_wpm,
         )
 
-    def _inject_with_fallback(self, text: str, run: RunRecorder) -> bool:
+    def _inject_with_fallback(
+        self, text: str, run: RunRecorder, activation: Activation | None = None
+    ) -> bool:
         """Paste ``text``, or -- when the focused window is confidently
         elevated (:meth:`~flow.platform.PlatformAdapter.paste_likely_blocked`)
         and a synthetic paste would silently do nothing -- leave it on the
@@ -1093,6 +1445,18 @@ class Engine:
         keystroke, which UIPI does not block. Returns whether the paste
         itself succeeded (``False`` on the clipboard-only fallback).
         """
+        # The last line of defence in the one-intention-one-execution chain.
+        # Whatever produced a second run of this pipeline -- a duplicate
+        # release, a retry, a re-entered worker -- only the first holder of
+        # this activation may put text on screen.
+        if activation is not None and not self._activations.mark_injected(activation):
+            logger.warning(
+                "refusing a second paste for activation %s (this is the duplicate "
+                "that would have doubled the text)",
+                activation,
+            )
+            run.annotate(duplicate_injection_suppressed=True)
+            return False
         try:
             self._injector.inject(text)
             return True
@@ -1261,6 +1625,14 @@ class Engine:
         # _Transcript, which the caller's `if not transcript` check relies on.
         if not merged:
             return None
+        # Known gap: `confident` here is only the *tail* chunk's confidence.
+        # Earlier chunks (result.chunk_texts) were already accepted into the
+        # merge while the user was still speaking, with no per-chunk
+        # confidence gate of their own -- so the paste-gate in _run_dictation
+        # reliably protects the whole-clip path but not a hallucinated
+        # *earlier* chunk on a long streamed dictation. Retrofitting
+        # per-chunk gating into ChunkStreamer is a larger Phase 4 change and
+        # out of scope here.
         return _Transcript(text=merged, language=tail_language, confident=tail_confident)
 
     def _build_prompt_bias(self) -> str:
@@ -1494,18 +1866,21 @@ class Engine:
         # two apart -- and only the retracted span, so every other figure in
         # the utterance stays protected.
         retracted = correction.retracted_text()
-        if not is_cleanup_output_safe(
+        # What the fired transforms asked the model to do, so the guardrails
+        # can tell "it did what the user asked" apart from "it went
+        # off-script". Without this a correct bulleted rewrite is rejected by
+        # the markdown check and the user silently gets unbulleted text.
+        # Empty when nothing fired, which leaves plain dictation's guardrails
+        # exactly as they were.
+        expectation = expectation_for(transforms)
+        reason = unsafe_reason(
             raw_text,
             candidate,
             retracted=retracted,
             correction_detected=correction.detected,
-        ):
-            reason = unsafe_reason(
-                raw_text,
-                candidate,
-                retracted=retracted,
-                correction_detected=correction.detected,
-            )
+            expectation=expectation,
+        )
+        if reason:
             logger.warning(
                 "cleanup output rejected by the %s guardrail (raw %d words -> cleaned %d words); "
                 "pasting the raw transcript instead",
@@ -1525,12 +1900,23 @@ class Engine:
         selection_ready: threading.Event,
         instruction: str = "",
         source: str = "command",
+        expectation: OutputExpectation = SPOKEN_COMMAND_EXPECTATION,
+        activation: Activation | None = None,
     ) -> None:
-        with self._tracker.run({"source": source}) as run:
+        metadata: dict[str, Any] = {"source": source}
+        if activation is not None:
+            metadata["activation"] = activation.id
+        with self._tracker.run(metadata) as run:
             self._run_pipeline(
                 run,
                 lambda: self._run_command(
-                    start_frame, focused_process, selection_ready, run, instruction
+                    start_frame,
+                    focused_process,
+                    selection_ready,
+                    run,
+                    instruction,
+                    expectation,
+                    activation,
                 ),
                 label="command",
             )
@@ -1542,6 +1928,8 @@ class Engine:
         selection_ready: threading.Event,
         run: RunRecorder,
         instruction: str = "",
+        expectation: OutputExpectation = SPOKEN_COMMAND_EXPECTATION,
+        activation: Activation | None = None,
     ) -> None:
         with run.stage(Stage.SELECTION):
             selection_ready.wait(timeout=self._config.commands.selection_timeout_s + 1.0)
@@ -1560,6 +1948,20 @@ class Engine:
             spoken = self._transcribe_single_shot(start_frame, run)
             if not spoken:
                 self._set_ui_state(BarState.IDLE)
+                return
+            spoken_hallucinated = looks_hallucinated(spoken.text, speech_ms=spoken.speech_ms)
+            if not spoken.confident or spoken_hallucinated:
+                # Same hallucination risk as dictation's paste-gate above,
+                # for the spoken instruction: a doubtful or implausibly-short
+                # transcript here would still spend a full LLM call
+                # rewriting the selection from words Whisper likely never
+                # actually heard.
+                run.annotate(
+                    skipped="hallucination_suspected" if spoken_hallucinated else "low_confidence_paste_suppressed"
+                )
+                self._set_ui_state(
+                    BarState.DONE, detail="Not captured — didn't catch that", kind="low_confidence"
+                )
                 return
             instruction_text = spoken.text
 
@@ -1586,14 +1988,19 @@ class Engine:
             # one only normalised it. With a transform firing from a keystroke
             # and no spoken instruction to confirm intent, a response that
             # answered instead of rewriting would silently overwrite the
-            # selection. `correction_detected` relaxes the shrink floor because
-            # "Summarize" and "Make concise" are supposed to shrink the text.
-            if candidate and is_cleanup_output_safe(
-                selected_text, candidate, correction_detected=True
-            ):
+            # selection.
+            #
+            # `expectation` is what makes that check survivable: a shortcut
+            # carries the fired transform's own declared expectation, and a
+            # *spoken* command carries a permissive one, because the speaker
+            # stating an arbitrary instruction over text they selected is the
+            # clearest possible "I asked for this". Neither relaxes the entity,
+            # assistant-voice, or answered-a-question guards -- those catch the
+            # model doing what nobody asked for.
+            reason = unsafe_reason(selected_text, candidate, expectation=expectation)
+            if candidate and not reason:
                 transformed = candidate
             else:
-                reason = unsafe_reason(selected_text, candidate, correction_detected=True)
                 if candidate:
                     logger.warning(
                         "transform output rejected by the %s guardrail; leaving the selection alone",
@@ -1603,7 +2010,7 @@ class Engine:
                 transformed = selected_text
 
         with run.stage(Stage.INJECT):
-            pasted = self._inject_with_fallback(transformed, run)
+            pasted = self._inject_with_fallback(transformed, run, activation)
         self._set_ui_state(
             BarState.IDLE if pasted else BarState.ERROR,
             detail="" if pasted else "elevated window — copied instead",
@@ -1642,6 +2049,8 @@ class Engine:
                 self._hotkey.start()
                 if self._command_hotkey is not None:
                     self._command_hotkey.start()
+                if self._hands_free_key_listener is not None:
+                    self._hands_free_key_listener.start()
                 self._bar.set_listening(True)
                 self._set_ui_state(BarState.IDLE)
                 self._refresh_bar_hint()
@@ -1649,6 +2058,15 @@ class Engine:
                 self._hotkey.stop()
                 if self._command_hotkey is not None:
                     self._command_hotkey.stop()
+                if self._hands_free_key_listener is not None:
+                    self._hands_free_key_listener.stop()
+                if self._hands_free_active:
+                    # The mic must never stay "hot" behind a paused app --
+                    # same principle as the dictation/command hold keys,
+                    # which cannot be mid-hold when paused since pausing
+                    # disarms them; a toggled-on hands-free session has no
+                    # such guarantee, so it is force-stopped explicitly.
+                    self._stop_hands_free(timed_out=False)
                 # PAUSED, not ERROR and not IDLE-with-a-detail. ERROR would
                 # auto-expire after a few seconds and leave the bar claiming
                 # to be listening while the hotkey was disarmed; IDLE made a
@@ -1663,9 +2081,18 @@ class Engine:
 
     def describe(self) -> dict[str, object]:
         """Live engine facts the databases cannot know, for Settings."""
+        hotkey_cfg = self._config.hotkey
         return {
-            "hotkey": self._config.hotkey.key,
-            "command_hotkey": self._config.hotkey.command_key,
+            "hotkey": hotkey_cfg.key,
+            "hotkey_chord": hotkey_cfg.key_chord,
+            "command_hotkey": hotkey_cfg.command_key,
+            "command_hotkey_chord": hotkey_cfg.command_key_chord,
+            "hands_free_enabled": self._settings.get().hands_free_enabled,
+            "hands_free_key": hotkey_cfg.hands_free_key,
+            "hands_free_chord": hotkey_cfg.hands_free_chord,
+            "hands_free_double_tap": hotkey_cfg.hands_free_double_tap,
+            "hands_free_max_seconds": hotkey_cfg.hands_free_max_seconds,
+            "hands_free_active": self._hands_free_active,
             "microphone": self._config.audio.device or "system default",
             "sample_rate": f"{self._config.audio.sample_rate} Hz",
             "transcription_model": WHISPER_MODEL,
@@ -1688,7 +2115,7 @@ class Engine:
             return
 
         def pump() -> None:
-            while self._hotkey_down:
+            while self._hotkey_down or self._hands_free_active:
                 level = self._capture.level
                 if level != self._input_level:
                     self._input_level = level
@@ -1706,7 +2133,30 @@ class Engine:
         return SwayBar(
             position=self._settings.get().overlay_position,
             on_action=self._on_bar_action,
+            reduced_motion=self._reduced_motion(),
         )
+
+    def _reduced_motion(self) -> bool:
+        """Whether the bar's orb should hold still.
+
+        ``[overlay].reduced_motion`` is the override; ``"auto"`` -- the
+        default -- asks the OS, so someone who has turned animation off
+        system-wide gets a still orb without having to find a second switch
+        in a second place.
+        """
+        setting = self._config.overlay.reduced_motion
+        if setting == "on":
+            return True
+        if setting == "off":
+            return False
+        try:
+            return not self._platform.animations_enabled()
+        except Exception:
+            # Fails open, like the adapter itself: a preference we cannot
+            # read must not freeze the one part of the bar that says the app
+            # is still working.
+            logger.debug("could not read the OS animation preference", exc_info=True)
+            return False
 
     def _on_bar_action(self, action: str) -> None:
         """One click on the bar or its menu.
@@ -1967,6 +2417,36 @@ class Engine:
             # it -- which is how the old menu produced its own error message.
             self._bar.set_can_paste(True)
 
+    #: Which successful dictations teach the amend gesture. Two, early, and
+    #: then never again: this is a thing to learn once, and a tip that keeps
+    #: reappearing is an app talking over its user.
+    _AMEND_COACH_AT = (3, 10)
+
+    def _coach_amend_gesture(self) -> None:
+        """Teach the one way to change text that has already been pasted.
+
+        Corrections resolve *within* an utterance -- "Monday at 3, no, make it
+        Tuesday at 6" reaches the cursor as Tuesday at 6. Once the text has
+        landed in another application, a later dictation cannot amend it: the
+        user may have typed after it, moved the caret, or switched windows, so
+        rewriting it automatically would be a guess that can destroy work.
+        Selecting the text and holding the command key turns that guess into a
+        statement of intent, which is why this is the gesture and why it is
+        worth naming.
+
+        The mechanism already existed and was undiscoverable, which made the
+        product look as though it simply could not do this at all.
+        """
+        try:
+            if self._success_count not in self._AMEND_COACH_AT:
+                return
+            if self._command_hotkey is None or self._config.hotkey.command_key is None:
+                return
+            key = prettify_hotkey(self._config.hotkey.command_key)
+            self._bar.coach(f"Tip → select any text and hold [[{key}]] to change it")
+        except Exception:
+            logger.debug("could not show the amend-gesture coach", exc_info=True)
+
     def _refresh_bar_hint(self) -> None:
         """Coach in place until the user has actually dictated something.
 
@@ -2140,9 +2620,11 @@ class Engine:
 
         What can change live and what cannot is stated rather than guessed:
         retention and the overlay's position are read per use, so they take
-        effect immediately; the hotkey and the input device are bound into a
-        listener and an open stream at startup, so they need a restart. The
-        UI says which happened instead of silently doing nothing.
+        effect immediately; the dictation/command/hands-free bindings rebind
+        in place (see HotkeyListener.rebind / ChordListener.rebind); only the
+        input device is bound into an open PortAudio stream at startup and
+        genuinely needs a restart. The UI says which happened instead of
+        silently doing nothing.
         """
         settings = self._settings.load()
         # The key lives in the credential store rather than in settings.json,
@@ -2150,16 +2632,61 @@ class Engine:
         self._reload_api_key()
         new_config = apply_to_config(self._config, settings)
 
-        restart_required = (
-            new_config.hotkey.key != self._config.hotkey.key
-            or new_config.audio.device != self._config.audio.device
-        )
+        try:
+            _validate(new_config)
+        except ConfigError as exc:
+            # Each of these fields is validated individually where it is
+            # written (settings.parse, and the dashboard's save actions),
+            # but three independently-settable bindings (dictation, command,
+            # hands-free) can still combine into something invalid across
+            # two separate saves -- this is the door that catches that
+            # combination before it reaches a running listener. The setting
+            # itself has already been written to disk by the time this runs
+            # (see the caller in dashboard.server), so refusing to apply it
+            # here must not be mistaken for the save having failed -- it
+            # just does not take live effect until the conflict is fixed.
+            logger.error("settings produced an invalid configuration; not applying it: %s", exc)
+            return {"restart_required": False, "error": str(exc)}
+
+        restart_required = new_config.audio.device != self._config.audio.device
 
         self._config = new_config
 
-        # Transform shortcuts rebind in place rather than needing a restart:
-        # the OS hook stays up and only the dispatch table changes, so a
-        # shortcut the user just bound works on the very next keystroke.
+        self._hotkey.rebind(KNOWN_KEYS[new_config.hotkey.key])
+        if new_config.hotkey.command_key is not None:
+            if self._command_hotkey is None:
+                self._command_hotkey = HotkeyListener(
+                    key=KNOWN_KEYS[new_config.hotkey.command_key],
+                    on_press=self._on_command_press,
+                    on_release=self._on_command_release,
+                )
+                if self._listening:
+                    self._command_hotkey.start()
+            else:
+                self._command_hotkey.rebind(KNOWN_KEYS[new_config.hotkey.command_key])
+        elif self._command_hotkey is not None:
+            self._command_hotkey.stop()
+            self._command_hotkey = None
+
+        self._configure_hands_free()
+
+        # Rebuilt fresh only when no session is currently in flight through
+        # them -- resetting a tracker mid-session would desync it from
+        # self._hotkey_down/_command_key_down and the very next tap would be
+        # read as a fresh "start" instead of the stop it should be.
+        if not self._hotkey_down:
+            self._dictation_chord_tracker = TapModeTracker(
+                max_active_s=float(new_config.hotkey.hands_free_max_seconds)
+            )
+        if not self._command_key_down:
+            self._command_chord_tracker = TapModeTracker(
+                max_active_s=float(new_config.hotkey.hands_free_max_seconds)
+            )
+
+        # Transform shortcuts, and every chord-shaped activation binding,
+        # rebind in place rather than needing a restart: the OS hook stays
+        # up and only the dispatch table changes, so a shortcut the user
+        # just bound works on the very next keystroke.
         self._bind_transform_shortcuts()
 
         # Launch-at-login is the one setting that lives outside our own files,
@@ -2178,18 +2705,20 @@ class Engine:
         return {"restart_required": restart_required}
 
     def _bind_transform_shortcuts(self) -> None:
-        """Rebuild the chord table from the user's enabled transforms.
+        """Rebuild the shared chord table: transform shortcuts, plus every
+        chord-shaped activation binding (dictation's and command's optional
+        alternate chord, and hands-free's chord form).
 
         Never raises. A shortcut string that will not parse is logged and
         skipped rather than taken as a reason to start with no shortcuts at
-        all -- one bad binding must not disable the other seven.
+        all -- one bad binding must not disable the others.
         """
         bindings: dict[Chord, Callable[[], None]] = {}
         try:
             transforms = self._settings.get().transforms
         except Exception:
             logger.exception("could not read transforms; leaving shortcuts unbound")
-            return
+            transforms = ()
 
         for transform in transforms_module.enabled_with_shortcut(transforms):
             try:
@@ -2210,9 +2739,62 @@ class Engine:
                 continue
             bindings[chord] = self._transform_handler(transform.id)
 
+        hotkey_cfg = self._config.hotkey
+        hands_free_usable = self._settings.get().hands_free_enabled
+        for label, shortcut, handler in (
+            ("dictation's alternate", hotkey_cfg.key_chord, self._toggle_dictation_via_chord),
+            ("the voice command's alternate", hotkey_cfg.command_key_chord, self._toggle_command_via_chord),
+            (
+                "hands-free's",
+                hotkey_cfg.hands_free_chord if hands_free_usable else None,
+                self._toggle_hands_free,
+            ),
+        ):
+            if shortcut is None:
+                continue
+            try:
+                chord = parse_chord(shortcut)
+            except ChordError as exc:
+                logger.warning("%s shortcut %r is unusable (%s); leaving it unbound", label, shortcut, exc)
+                continue
+            if chord in bindings:
+                logger.warning("shortcut %s is bound twice; keeping the first", chord)
+                continue
+            bindings[chord] = handler
+
         self._chords.rebind(bindings)
         if bindings:
-            logger.info("bound %d transform shortcut(s)", len(bindings))
+            logger.info("bound %d shortcut(s)", len(bindings))
+
+    def _toggle_dictation_via_chord(self) -> None:
+        """Dictation's optional alternate binding: a chord fires once per
+        tap, so -- unlike the primary hold key -- it starts/stops a session
+        rather than being held. Reuses _on_press/_on_release verbatim (the
+        same setup and the same _process pipeline a physical hold uses), so
+        a chord-started dictation is indistinguishable from a held one once
+        it is running -- only how it starts and stops differs.
+        """
+        outcome = self._dictation_chord_tracker.tap(time.monotonic())
+        if outcome is None:
+            return
+        if outcome == "start":
+            self._dictation_started_via_chord = True
+            self._on_press()
+        else:
+            self._on_release()
+
+    def _toggle_command_via_chord(self) -> None:
+        """The voice command's optional alternate binding -- same start/stop
+        shape as :meth:`_toggle_dictation_via_chord`, but for Command Mode.
+        """
+        outcome = self._command_chord_tracker.tap(time.monotonic())
+        if outcome is None:
+            return
+        if outcome == "start":
+            self._command_started_via_chord = True
+            self._on_command_press()
+        else:
+            self._on_command_release()
 
     def _transform_handler(self, transform_id: str) -> Callable[[], None]:
         """A chord handler that runs one transform over the current selection.
@@ -2255,7 +2837,21 @@ class Engine:
         threading.Thread(
             name="flow-transform",
             target=self._process_command,
-            args=(self._ring.mark(), focused, selection_ready, transform.instruction, "transform"),
+            args=(
+                self._ring.mark(),
+                focused,
+                selection_ready,
+                transform.instruction,
+                "transform",
+                # Its own expectation, not the permissive spoken-command one:
+                # a shortcut fires with no spoken confirmation of intent, so
+                # only what this transform actually declares is allowed.
+                expectation_for([transform]),
+                # A shortcut is a tap, not a hold, so there is no release to
+                # claim. It still buys the injection guard, so a chord that
+                # double-fires transforms the selection once.
+                self._activations.once(COMMAND),
+            ),
             daemon=True,
         ).start()
 
@@ -2321,6 +2917,12 @@ class Engine:
                     last_error=lambda: self._last_error,
                     input_level=lambda: self._input_level,
                     hotkey_down=lambda: self._hotkey_down,
+                    bindings_down=lambda: {
+                        "command": self._command_key_down,
+                        "dictation_chord": self._dictation_chord_tracker.active,
+                        "command_chord": self._command_chord_tracker.active,
+                    },
+                    hands_free_active=lambda: self._hands_free_active,
                 ),
             )
             server.start()

@@ -70,7 +70,6 @@ from sway.branding import (
     SURFACE,
     SURFACE_RAISED,
     app_badge_image,
-    mark_image,
 )
 from sway.motion import (
     BUTTON_FILL_S,
@@ -92,8 +91,12 @@ from sway.motion import (
     ease_out_cubic,
     lerp,
     lerp_rgb,
-    pulse,
     shake_offset,
+)
+from sway.orb import (
+    REDUCED_MOTION_PHASE,
+    OrbVariant,
+    orb_image,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,7 +211,6 @@ _PAD_LEFT = 6
 _PAD_RIGHT = 8
 _GAP = 10
 _MIN_WIDTH = 132
-_BADGE_D = 15
 _FONT_SIZE = 13
 _LEVEL_W = 18
 _BUTTON_D = 28
@@ -275,10 +277,28 @@ _STYLES: dict[BarState, _Style] = {
     BarState.COACH: _Style("", ACCENT_RECORDING),
 }
 
-#: States that draw an accent ring. Only recording and error do: an ambient
-#: widget on screen all day must not have four colours competing, and these
-#: are the two the user needs to notice without looking.
-_RINGED = frozenset({BarState.RECORDING, BarState.ERROR})
+#: State -> the orb variant that says what the agent is doing. Only states
+#: the engine genuinely reports appear here; CLAUDE.md's rule is that the bar
+#: never claims an activity it is not performing, so a richer vocabulary
+#: (searching, connecting, solving) waits until there is a real stage behind
+#: each word. See :mod:`sway.orb`.
+#:
+#: DONE and ERROR are absent on purpose. They are outcomes, not activities,
+#: and there is no orb variant that could honestly animate them --
+#: :func:`_draw_state_glyph` draws those two as still shapes instead.
+_ORB_VARIANTS: dict[BarState, OrbVariant] = {
+    BarState.IDLE: OrbVariant.BREATHING,
+    BarState.COACH: OrbVariant.BREATHING,
+    BarState.PAUSED: OrbVariant.BREATHING,
+    BarState.RECORDING: OrbVariant.LISTENING,
+    BarState.THINKING: OrbVariant.WORKING,
+    BarState.INJECTING: OrbVariant.COMPOSING,
+}
+
+#: States whose orb holds a single frame. Paused is disarmed -- the hotkey
+#: does nothing -- so a moving orb would be the bar animating about work it
+#: has been told not to do.
+_ORB_FROZEN = frozenset({BarState.PAUSED})
 
 #: States that expose the control row. During a dictation the buttons would
 #: be a target the user is not aiming at, and the bar is busy saying
@@ -376,24 +396,6 @@ def _font_for(text: str, size: int, *, bold: bool = False):
         if pattern.search(text):
             return _load_font(names, size)
     return _font(size, bold=bold)
-
-
-def _badge_frame(state: BarState, now_s: float) -> int:
-    """Which animation frame to draw at wall-clock ``now_s``.
-
-    A pure function of time, so the bar needs no animation timer of its own --
-    it recomputes this per poll tick and repaints only when the value changed.
-    Kept for the processing arc, whose motion genuinely is stepwise. The
-    recording pulse no longer uses it: a two-frame alpha flip reads as a
-    blink, and :func:`sway.motion.pulse` gives it a continuous breath over the
-    same period.
-    """
-    ms = now_s * 1000.0
-    if state is BarState.RECORDING:
-        return int(ms // 500) % 2
-    if state in (BarState.THINKING, BarState.INJECTING):
-        return int(ms // 90) % 8
-    return 0
 
 
 def _elapsed_label(elapsed_s: int) -> str:
@@ -851,7 +853,7 @@ def render_bar(
     state: BarState,
     detail: str,
     *,
-    badge_frame: int = 0,
+    orb_phase_s: float = 0.0,
     elapsed_s: int | None = None,
     level: int = 0,
     hint: str = "",
@@ -864,13 +866,13 @@ def render_bar(
     width: int | None = None,
     hover_t: float = 1.0,
     press_t: float = 0.0,
-    pulse_t: float | None = None,
     level_t: tuple[float, float, float] | None = None,
     dot_accent: tuple[int, int, int] | None = None,
     dot_grow: float = 0.0,
     dot_ring: float = 0.0,
     opacity: float = 1.0,
     hollow: bool = False,
+    reduced_motion: bool = False,
 ) -> tuple[Image.Image, tuple[HitRegion, ...]]:
     """One full bar frame, plus where it can be clicked.
 
@@ -1056,8 +1058,12 @@ def render_bar(
     settled = expand >= _SETTLED
 
     if content > 0.01:
-        _draw_avatar(canvas, state, style, height, bw, bh, content, badge_frame,
-                     pulse_t=pulse_t)
+        _draw_orb(
+            canvas, state, style, height, bw, bh, content,
+            orb_phase_s=orb_phase_s,
+            amplitude=_orb_amplitude(state, level_t),
+            reduced_motion=reduced_motion,
+        )
 
     cursor = width - _PAD_RIGHT
 
@@ -1150,6 +1156,25 @@ def render_bar(
     return _finish(canvas, width, height), tuple(regions)
 
 
+def _orb_amplitude(
+    state: BarState, level_t: tuple[float, float, float] | None
+) -> float:
+    """How hard the listening orb undulates: the user's actual voice level.
+
+    The bar already measures input level for the three-bar meter, so this
+    costs nothing new and is a real signal rather than a decorative one --
+    the orb is quiet in a quiet room and moves when someone speaks. Held at
+    the neutral 1.0 everywhere else, which is upstream's own geometry.
+
+    The floor is deliberately above zero: an orb that goes perfectly still on
+    silence reads as the app having stopped listening, which is the one thing
+    it must not say while the hotkey is held.
+    """
+    if state is not BarState.RECORDING or level_t is None:
+        return 1.0
+    return 0.55 + 1.05 * _clamp01(sum(level_t) / 3.0)
+
+
 def _dot_accent(state: BarState, style: _Style) -> tuple[int, int, int]:
     """The accent a collapsed bar carries.
 
@@ -1176,7 +1201,7 @@ def _rest_stroke(state: BarState, accent: tuple[int, int, int]) -> tuple[int, in
     return accent
 
 
-def _draw_avatar(
+def _draw_orb(
     canvas: Image.Image,
     state: BarState,
     style: _Style,
@@ -1184,94 +1209,102 @@ def _draw_avatar(
     bw: int,
     bh: int,
     opacity: float,
-    badge_frame: int,
     *,
-    pulse_t: float | None,
+    orb_phase_s: float,
+    amplitude: float,
+    reduced_motion: bool,
 ) -> None:
-    """The mark on a raised disc, ringed in the state's accent.
+    """The activity orb, in the slot the logo mark and its badge used to share.
 
-    Scaled with the capsule's height so it grows with the morph rather than
-    popping in at full size. Sizes are quantised to even pixels to keep
-    :func:`sway.branding.mark_image`'s cache to a handful of entries across a
-    transition instead of one per frame.
+    The mark said "Sway"; the badge said "busy". Neither said *what*. One
+    animated orb says both -- see :mod:`sway.orb`, and the MIT notice there
+    for the Thinking Orbs work this is ported from.
+
+    There is no raised disc behind it and no corner glyph on it: the orb is
+    drawn straight onto the capsule, which is what lets a 34px mark carry
+    real motion instead of a 15px one. Sized with the capsule's height so it
+    grows with the morph rather than popping in.
     """
     scale = height / _HEIGHT
-    avatar_d = max(2, 2 * round(_AVATAR * scale / 2)) * _SS
-    avatar_cx = round(_PAD_LEFT * scale) * _SS + avatar_d // 2
-    avatar_cy = bh // 2
-    box = (
-        avatar_cx - avatar_d // 2,
-        avatar_cy - avatar_d // 2,
-        avatar_cx + avatar_d // 2,
-        avatar_cy + avatar_d // 2,
-    )
+    # Even pixels, so the orb's geometry -- and so its dot count -- changes a
+    # handful of times across a morph rather than on every frame of it.
+    orb_d = max(2, 2 * round(_AVATAR * scale / 2))
+    orb_cx = round(_PAD_LEFT * scale) * _SS + orb_d * _SS // 2
+    orb_cy = bh // 2
 
-    layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-    draw.ellipse(box, fill=_alpha(SURFACE_RAISED, opacity))
-    if state in _RINGED:
-        draw.ellipse(box, outline=_alpha(style.accent, opacity), width=2 * _SS)
-    canvas.alpha_composite(layer)
-
-    mark_size = max(1, round(avatar_d * 0.56))
-    mark = mark_image(mark_size, color=_alpha(INK, opacity))
-    canvas.alpha_composite(
-        mark, (avatar_cx - mark.width // 2, avatar_cy - mark.height // 2)
-    )
-
-    # Only once the layout is nearly settled: a badge drawn on a half-grown
-    # avatar overhangs the capsule edge.
-    if opacity > 0.9:
-        _draw_badge(canvas, state, style, badge_frame, box, bw, bh, pulse_t=pulse_t)
-
-
-def _draw_badge(
-    canvas, state, style, badge_frame, avatar_box, bw, bh, *, pulse_t=None
-) -> None:
-    """The state glyph overlapping the avatar's corner.
-
-    Shape varies as well as colour -- a breathing dot, a rotating arc, a
-    check, a warning triangle -- so state is never carried by colour alone.
-    """
-    if state in (BarState.IDLE, BarState.PAUSED, BarState.COACH):
+    variant = _ORB_VARIANTS.get(state)
+    if variant is None:
+        _draw_state_glyph(canvas, state, style, orb_cx, orb_cy, orb_d, opacity)
         return
-    bd = _BADGE_D * _SS
-    bx = avatar_box[2] - bd + 3 * _SS
-    by = avatar_box[3] - bd + 3 * _SS
-    badge = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(badge)
-    # A halo in the capsule's own colour first, so the badge reads as cut
-    # into the avatar rather than laid messily over it.
-    draw.ellipse((bx - 2 * _SS, by - 2 * _SS, bx + bd + 2 * _SS, by + bd + 2 * _SS),
-                 fill=(*SURFACE, 255))
 
-    if state is BarState.RECORDING:
-        # A continuous breath rather than the old two-frame flip, which at
-        # 500ms read as an alarm blink.
-        breath = pulse_t if pulse_t is not None else (1.0 if badge_frame == 0 else 0.0)
-        alpha = round(lerp(120, 255, _clamp01(breath)))
-        draw.ellipse((bx, by, bx + bd, by + bd), fill=(*style.accent, alpha))
-    elif state in (BarState.THINKING, BarState.INJECTING):
-        start = badge_frame * 45
-        draw.arc((bx, by, bx + bd, by + bd), start=start, end=start + 260,
-                 fill=(*style.accent, 255), width=3 * _SS)
-    elif state is BarState.DONE:
-        draw.ellipse((bx, by, bx + bd, by + bd), fill=(*SURFACE_RAISED, 255))
+    frozen = reduced_motion or state in _ORB_FROZEN
+    image = orb_image(
+        variant,
+        orb_d,
+        phase_s=REDUCED_MOTION_PHASE if frozen else orb_phase_s,
+        accent=style.accent,
+        ink=INK,
+        opacity=opacity,
+        amplitude=amplitude,
+        supersample=_SS,
+    )
+    canvas.alpha_composite(image, (orb_cx - image.width // 2, orb_cy - image.height // 2))
+
+
+def _draw_state_glyph(
+    canvas: Image.Image,
+    state: BarState,
+    style: _Style,
+    cx: int,
+    cy: int,
+    orb_d: int,
+    opacity: float,
+) -> None:
+    """A check or a warning, for the two states no orb variant can honestly say.
+
+    Upstream Thinking Orbs has no success or failure variant, and inventing
+    one would be a motion that claims an activity the agent is not performing.
+    These two are outcomes rather than activities, so they get a still shape.
+
+    Keeping them *shapes* is the point. The corner badge used to be the
+    redundant, non-colour signal for every state; with it gone, the orb's
+    motion carries that job for the activities, and these glyphs carry it for
+    the outcomes. Nothing here is distinguished by hue alone.
+    """
+    d = orb_d * _SS
+    x0 = cx - d // 2
+    y0 = cy - d // 2
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+
+    if state is BarState.DONE:
+        draw.ellipse((x0, y0, x0 + d, y0 + d), outline=_alpha(style.accent, opacity * 0.5),
+                     width=round(1.5 * _SS))
         draw.line(
             [
-                (bx + bd * 0.26, by + bd * 0.52),
-                (bx + bd * 0.44, by + bd * 0.70),
-                (bx + bd * 0.76, by + bd * 0.32),
+                (x0 + d * 0.31, y0 + d * 0.52),
+                (x0 + d * 0.44, y0 + d * 0.66),
+                (x0 + d * 0.70, y0 + d * 0.36),
             ],
-            fill=(*INK, 255), width=2 * _SS, joint="curve",
+            fill=_alpha(INK, opacity), width=round(2.2 * _SS), joint="curve",
         )
     elif state is BarState.ERROR:
-        cx = bx + bd / 2
-        draw.polygon([(cx, by), (bx, by + bd), (bx + bd, by + bd)], fill=(*style.accent, 255))
-        draw.line([(cx, by + bd * 0.38), (cx, by + bd * 0.66)], fill=(*SURFACE, 255), width=2 * _SS)
-        r = bd * 0.05
-        draw.ellipse((cx - r, by + bd * 0.76, cx + r, by + bd * 0.76 + 2 * r), fill=(*SURFACE, 255))
-    canvas.alpha_composite(badge)
+        # The triangle is inset: at the orb's full diameter it reads as a
+        # heavier mark than any orb frame, which would make a failure shout
+        # where the rest of the bar speaks.
+        t0 = d * 0.14
+        t1 = d * 0.86
+        mid = x0 + d / 2
+        draw.polygon(
+            [(mid, y0 + t0), (x0 + t0, y0 + t1), (x0 + t1, y0 + t1)],
+            fill=_alpha(style.accent, opacity),
+        )
+        draw.line([(mid, y0 + d * 0.40), (mid, y0 + d * 0.62)],
+                  fill=_alpha(SURFACE, opacity), width=round(2 * _SS))
+        r = d * 0.045
+        draw.ellipse((mid - r, y0 + d * 0.68, mid + r, y0 + d * 0.68 + 2 * r),
+                     fill=_alpha(SURFACE, opacity))
+    canvas.alpha_composite(layer)
 
 
 def _draw_button(
@@ -1794,6 +1827,7 @@ class SwayBar:
         position: str = "bottom-center",
         on_action: Callable[[str], None] | None = None,
         menu_items: tuple[MenuItem, ...] = DEFAULT_MENU,
+        reduced_motion: bool = False,
     ) -> None:
         self._queue: queue.Queue[tuple[BarState, str, str]] = queue.Queue()
         self._ui_actions: queue.Queue[Callable[[tk.Tk], None]] = queue.Queue()
@@ -1804,6 +1838,11 @@ class SwayBar:
         self._position = position
         self._on_action = on_action
         self._menu_items = menu_items
+        #: Freeze the orb on a single frame, and stop asking for 60fps to
+        #: draw it. Resolved by the caller from the OS setting and the
+        #: ``[overlay] reduced_motion`` config key -- see
+        #: :func:`sway.config.OverlayConfig`.
+        self._reduced_motion = reduced_motion
 
         self._root: tk.Tk | None = None
         self._canvas: tk.Canvas | None = None
@@ -2453,7 +2492,10 @@ class SwayBar:
         if not self._motion.settled():
             return _POLL_ACTIVE_MS
         if self._state in (BarState.RECORDING, BarState.THINKING, BarState.INJECTING):
-            return _POLL_ACTIVE_MS
+            # With the orb frozen there is nothing left in these states that
+            # moves faster than the elapsed counter, so 60fps would be spent
+            # rendering the same picture.
+            return _POLL_IDLE_MS if self._reduced_motion else _POLL_ACTIVE_MS
         if self._expanded or self._pointer_inside or self._panel_open:
             return _POLL_IDLE_MS
         return _POLL_RESTING_MS
@@ -2567,7 +2609,6 @@ class SwayBar:
             return
         now = time.monotonic()
         expand = self._motion.value("expand", 0.0)
-        badge_frame = _badge_frame(self._state, now)
         elapsed_s = (
             int(now - self._recording_started_at)
             if self._recording_started_at is not None
@@ -2601,9 +2642,9 @@ class SwayBar:
         hover_t = self._motion.value("hover", 0.0)
         press_t = self._motion.value("press", 0.0)
         level_t = tuple(self._motion.value(f"level{i}", 0.0) for i in range(3))
-        pulse_t = (
-            pulse(now, 0.5) if self._state is BarState.RECORDING else None
-        )
+        # The orb's clock restarts with the state, so each variant begins at
+        # its own beginning rather than being joined mid-gesture.
+        orb_phase_s = now - self._state_entered_at
         opacity = 0.42 if (self.hidden and expand < 0.5) else 1.0
         shake = (
             shake_offset(now - self._state_entered_at)
@@ -2614,13 +2655,25 @@ class SwayBar:
         # Quantised, so a settled tween stops producing new keys and the bar
         # genuinely stops repainting rather than merely rendering the same
         # picture at 60fps.
+        # The orb's phase enters the key ONLY when it is both animating and
+        # actually on screen. Include it unconditionally and the resting dot
+        # -- which draws no orb at all, being below the content gate --
+        # repaints forever at the resting poll rate, and a merely-hovered
+        # idle capsule repaints at 60fps for a picture nobody is watching.
+        orb_t = (
+            round(orb_phase_s, 2)
+            if (expand >= _CONTENT_GATE
+                and not self._reduced_motion
+                and self._state in _ORB_VARIANTS
+                and self._state not in _ORB_FROZEN)
+            else None
+        )
         key = (
             self._state, self._detail, self._kind, hint, self._hint_tone,
-            badge_frame, elapsed_s, level, self._hover, self._press,
+            elapsed_s, level, self._hover, self._press,
             self._can_paste, width,
             round(expand, 3), round(dot_t, 2), round(hover_t, 2),
-            round(press_t, 2),
-            None if pulse_t is None else round(pulse_t, 2),
+            round(press_t, 2), orb_t,
             tuple(round(value, 2) for value in level_t),
             round(opacity, 2), round(shake, 1),
         )
@@ -2631,7 +2684,7 @@ class SwayBar:
         image, regions = render_bar(
             self._state,
             self._detail,
-            badge_frame=badge_frame,
+            orb_phase_s=orb_phase_s,
             elapsed_s=elapsed_s,
             level=level,
             hint=hint,
@@ -2644,12 +2697,12 @@ class SwayBar:
             width=width,
             hover_t=hover_t,
             press_t=press_t,
-            pulse_t=pulse_t,
             level_t=level_t,
             dot_grow=dot_t * _REST_GROW,
             dot_ring=dot_t,
             opacity=opacity,
             hollow=self._state is BarState.PAUSED,
+            reduced_motion=self._reduced_motion,
         )
         self._regions = regions
 

@@ -89,12 +89,52 @@ _VALID_HOTKEYS = frozenset(
     }
 )
 
+#: Kept in sync with flow.hotkey.CHORD_MODIFIERS's names (checked by a test)
+#: rather than imported from it, for the same pynput-free reason
+#: _VALID_HOTKEYS exists.
+_VALID_CHORD_MODIFIERS = frozenset({"ctrl", "alt", "shift", "cmd"})
+
+#: Kept in sync with flow.hotkey.CHORD_KEYS's names (checked by a test).
+_VALID_CHORD_KEY_NAMES = frozenset(
+    {f"f{n}" for n in range(1, 21)}
+    | {"space", "enter", "tab", "backspace", "delete", "home", "end", "insert"}
+)
+
+#: Kept in sync with flow.hotkey._RESERVED_CHORDS's keys (checked by a test).
+_RESERVED_CHORD_SHAPES = frozenset({"ctrl+c", "ctrl+v", "ctrl+x", "ctrl+alt+delete", "cmd+l"})
+
+
+def _is_valid_chord_shape(shortcut: str) -> bool:
+    """Pynput-free mirror of flow.hotkey.parse_chord's acceptance rules.
+
+    Validates a chord string read from config.toml without importing
+    pynput, for the same reason _VALID_HOTKEYS exists instead of importing
+    KNOWN_KEYS. A test checks this never drifts from parse_chord's actual
+    behaviour.
+    """
+    parts = [p.strip().lower() for p in shortcut.split("+") if p.strip()]
+    if not parts:
+        return False
+    *modifier_names, key = parts
+    if not modifier_names or any(m not in _VALID_CHORD_MODIFIERS for m in modifier_names):
+        return False
+    if key in _VALID_CHORD_MODIFIERS:
+        return False
+    if key not in _VALID_CHORD_KEY_NAMES and not (len(key) == 1 and key.isalnum()):
+        return False
+    order = [m for m in ("ctrl", "alt", "shift", "cmd") if m in modifier_names]
+    canonical = "+".join([*order, key])
+    return canonical not in _RESERVED_CHORD_SHAPES
+
+
 #: webrtcvad-supported sample rates and frame durations (flow.audio.vad).
 _VALID_VAD_SAMPLE_RATES = (8000, 16000, 32000, 48000)
 _VALID_VAD_FRAME_MS = (10, 20, 30)
 #: Values Groq's chat-completions endpoint accepts for reasoning_effort on
 #: the models that support it. Blank is also valid and sends the field at all.
 _VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "default"})
+#: [overlay].reduced_motion. "auto" defers to the OS accessibility setting.
+_VALID_REDUCED_MOTION = frozenset({"auto", "on", "off"})
 
 
 class Secret:
@@ -195,6 +235,27 @@ class HotkeyConfig:
     #: Shift rather than Ctrl/Alt by default: those are common menu/accelerator
     #: modifiers in many apps and holding one risks disturbing the selection.
     command_key: str | None = "shift_r"
+    #: Optional alternate binding for dictation: a modifier chord (see
+    #: flow.hotkey.parse_chord) that starts/stops a session with a tap
+    #: instead of being held. None means dictation only answers to `key`.
+    key_chord: str | None = None
+    #: Optional alternate chord for the voice-command hotkey, same shape as
+    #: key_chord.
+    command_key_chord: str | None = None
+    #: Hands-free dictation (Phase 6): tap once to start, tap again to stop,
+    #: no holding. Bind either a single key (tapped, or double-tapped if
+    #: hands_free_double_tap is set) or a chord -- at most one binding style
+    #: is expected at a time, enforced by validate().
+    hands_free_key: str | None = None
+    hands_free_chord: str | None = None
+    #: When true, hands_free_key must be double-tapped within a short window
+    #: rather than tapped once, freeing a single tap of that key for its
+    #: ordinary use elsewhere.
+    hands_free_double_tap: bool = False
+    #: Safety ceiling: a hands-free session force-stops after this long even
+    #: if its stop tap never arrives, so the mic can never be left hot
+    #: indefinitely.
+    hands_free_max_seconds: int = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +414,15 @@ class OverlayConfig:
     """The always-on-top pill window. See flow.overlay."""
 
     enabled: bool = True
+    #: Whether the bar's activity orb animates. ``"auto"`` follows the OS
+    #: reduce-motion setting (on Windows, Settings > Accessibility > Visual
+    #: effects > Animation effects, which is the same switch Edge maps
+    #: ``prefers-reduced-motion`` onto); ``"on"`` forces the orb to hold a
+    #: single frame; ``"off"`` forces it to animate regardless.
+    #:
+    #: The name reads the way the accessibility setting does, so ``"on"``
+    #: means reduced motion is on -- i.e. less movement, not more.
+    reduced_motion: str = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -659,15 +729,64 @@ def _validate(config: Config) -> None:
     if config.audio.preroll_ms >= config.audio.ring_seconds * 1000:
         raise ConfigError("[audio].preroll_ms must be less than [audio].ring_seconds")
 
+    if config.overlay.reduced_motion not in _VALID_REDUCED_MOTION:
+        raise ConfigError(
+            f"[overlay].reduced_motion must be one of {sorted(_VALID_REDUCED_MOTION)}"
+        )
+
     if config.hotkey.key not in _VALID_HOTKEYS:
         raise ConfigError(f"[hotkey].key must be one of {sorted(_VALID_HOTKEYS)}")
     if config.hotkey.min_hold_ms < 0:
         raise ConfigError("[hotkey].min_hold_ms must be >= 0")
+    if config.hotkey.command_key is not None and config.hotkey.command_key not in _VALID_HOTKEYS:
+        raise ConfigError(f"[hotkey].command_key must be one of {sorted(_VALID_HOTKEYS)}")
+    if config.hotkey.hands_free_key is not None and config.hotkey.hands_free_key not in _VALID_HOTKEYS:
+        raise ConfigError(f"[hotkey].hands_free_key must be one of {sorted(_VALID_HOTKEYS)}")
+    if config.hotkey.hands_free_max_seconds <= 0:
+        raise ConfigError("[hotkey].hands_free_max_seconds must be > 0")
+    if config.hotkey.hands_free_key is not None and config.hotkey.hands_free_chord is not None:
+        raise ConfigError(
+            "[hotkey].hands_free_key and [hotkey].hands_free_chord are mutually exclusive "
+            "-- pick one binding style for hands-free"
+        )
+
+    # Every configured *hold-key* binding must be pairwise distinct: two
+    # hold-shaped listeners on the same physical key is genuinely broken
+    # (both fire on every press). A hold key and a chord can never collide
+    # with each other -- a chord always has a terminal key, a hold binding
+    # never does -- so chords are validated separately below. A double-tap
+    # hands-free key is exempted from this set: it needs two taps to mean
+    # anything, so sharing a key with a hold binding is a different (if
+    # confusing) gesture, not an outright conflict.
+    hold_bindings: dict[str, str] = {"key": config.hotkey.key}
     if config.hotkey.command_key is not None:
-        if config.hotkey.command_key not in _VALID_HOTKEYS:
-            raise ConfigError(f"[hotkey].command_key must be one of {sorted(_VALID_HOTKEYS)}")
-        if config.hotkey.command_key == config.hotkey.key:
-            raise ConfigError("[hotkey].command_key must differ from [hotkey].key")
+        hold_bindings["command_key"] = config.hotkey.command_key
+    if config.hotkey.hands_free_key is not None and not config.hotkey.hands_free_double_tap:
+        hold_bindings["hands_free_key"] = config.hotkey.hands_free_key
+    seen: dict[str, str] = {}
+    for field_name, value in hold_bindings.items():
+        if value in seen:
+            raise ConfigError(
+                f"[hotkey].{field_name} must differ from [hotkey].{seen[value]} (both are {value!r})"
+            )
+        seen[value] = field_name
+
+    chord_bindings: dict[str, str] = {}
+    for field_name, value in (
+        ("key_chord", config.hotkey.key_chord),
+        ("command_key_chord", config.hotkey.command_key_chord),
+        ("hands_free_chord", config.hotkey.hands_free_chord),
+    ):
+        if value is None:
+            continue
+        if not _is_valid_chord_shape(value):
+            raise ConfigError(f"[hotkey].{field_name} is not a usable shortcut: {value!r}")
+        if value in chord_bindings.values():
+            other = next(k for k, v in chord_bindings.items() if v == value)
+            raise ConfigError(
+                f"[hotkey].{field_name} must differ from [hotkey].{other} (both are {value!r})"
+            )
+        chord_bindings[field_name] = value
 
     if config.groq.timeout_s <= 0:
         raise ConfigError("[groq].timeout_s must be > 0")

@@ -14,7 +14,12 @@ from pathlib import Path
 from sway.config import Config
 
 _CONSOLE_FORMAT = "%(levelname)-7s %(name)s: %(message)s"
-_FILE_FORMAT = "%(asctime)s %(levelname)-7s %(name)s [%(threadName)s]: %(message)s"
+#: The pid is in the file format because the log file is shared: a second copy
+#: of Sway writes into the same file, and without a pid the two are
+#: indistinguishable. That ambiguity is not hypothetical -- a duplicate-paste
+#: report could not be attributed to one process or two from the log alone,
+#: which is exactly the question that needed answering.
+_FILE_FORMAT = "%(asctime)s %(process)d %(levelname)-7s %(name)s [%(threadName)s]: %(message)s"
 
 #: Root of the application's logger tree. Configuring this instead of the real
 #: root logger keeps third-party libraries from inheriting our handlers.

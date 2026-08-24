@@ -675,7 +675,8 @@ function transformCard(t) {
 }
 
 function transformDialog(existing) {
-  const t = existing || { id: '', name: '', description: '', instruction: '', phrase: '', shortcut: '', enabled: true };
+  const t = existing || { id: '', name: '', description: '', instruction: '', phrase: '', shortcut: '', enabled: true,
+    allows_markdown: false, may_shorten: false, may_lengthen: false };
   openModal({
     title: existing ? 'Edit transform' : 'New transform',
     body: `
@@ -702,6 +703,16 @@ function transformDialog(existing) {
         <label class="field-label" for="x-phrase">Spoken phrase <span class="muted">(optional)</span></label>
         <input class="input" id="x-phrase" value="${esc(t.phrase)}" placeholder="make that concise" maxlength="80">
         <div class="small muted">Say it at the end of a dictation. Folded into the cleanup request, so it costs no extra call.</div>
+      </div>
+      <div>
+        <label class="field-label">What it may do to the text</label>
+        <div class="small muted" style="margin:-3px 0 8px">Sway checks the model's answer before pasting it and keeps your own words if it looks wrong. Tick what this instruction is <em>supposed</em> to do, so a correct result is not thrown away.</div>
+        <label class="check-row"><input type="checkbox" id="x-md"${t.allows_markdown ? ' checked' : ''}>
+          <span>Produces a list or headings <span class="muted">— bullets, numbered points</span></span></label>
+        <label class="check-row"><input type="checkbox" id="x-short"${t.may_shorten ? ' checked' : ''}>
+          <span>Makes the text shorter <span class="muted">— summarize, condense</span></span></label>
+        <label class="check-row"><input type="checkbox" id="x-long"${t.may_lengthen ? ' checked' : ''}>
+          <span>Makes the text longer <span class="muted">— adds a greeting, a sign-off</span></span></label>
       </div>
       <div id="x-error" class="small" style="color:var(--red)"></div>`,
     actions: `<div class="spacer"></div>
@@ -1030,6 +1041,10 @@ function voicePanel() {
   const settings = s.settings || {};
   const engine = s.engine || {};
   const devices = (state.devices && state.devices.devices) || [];
+  // Started here rather than in a dedicated bind hook -- this panel has
+  // none -- and self-terminates the moment the tab is no longer showing
+  // (see watchActivationPreview), so a stray render never leaves it running.
+  watchActivationPreview();
 
   const deviceList = devices.length
     ? `<div class="rows" style="margin-top:14px">
@@ -1047,11 +1062,15 @@ function voicePanel() {
     // Genuinely zero, so the zero is printed (§6 strategy 2).
     : `<div style="margin-top:18px">${stat({ label: 'microphones found', value: '0', foot: 'Windows is not reporting any input device.' })}</div>`;
 
+  const activation = s.activation || {};
+
   return `
-    ${settingRow('Dictation hotkey', 'Hold it, speak, release.',
-      `${caps(engine.hotkey)} <button class="btn small" data-act="edit-hotkey">${icon('edit')} Change</button>`)}
-    ${settingRow('Voice command hotkey', 'Hold it over selected text to transform it.',
-      engine.command_hotkey ? caps(engine.command_hotkey) : '<span class="small muted">Not set</span>')}
+    <div style="margin-top:6px">
+      <span class="meta-label">Shortcuts</span>
+    </div>
+    ${activationRow(activation, 'dictation', 'Dictation hotkey', 'Hold it, speak, release.')}
+    ${activationRow(activation, 'command', 'Voice command hotkey', 'Hold it over selected text to transform it.')}
+    ${handsFreeRow(activation)}
     ${settingRow('Language', 'Leave on auto-detect unless Sway keeps guessing wrong.',
       `<select class="input" data-act="set" data-field="language">
         <option value="">Auto-detect</option>
@@ -1078,6 +1097,79 @@ function voicePanel() {
       <span class="meta-label">Input device</span>
       ${deviceList}
     </div>`;
+}
+
+/** One binding chip, wrapped so the live-preview poller (watchActivationPreview)
+ * can find it and paint .held while it is physically down right now. */
+const bindingChip = (target, value) =>
+  value ? `<span data-live-binding="${esc(target)}">${caps(value)}</span>` : '';
+
+/**
+ * The Dictation/Voice-command rows: current binding chip(s), an edit
+ * pencil, a reset icon once the row is no longer default, and a "+" to add
+ * the optional alternate chord (the reference's own affordance) once no
+ * chord is set yet.
+ */
+function activationRow(activation, target, label, hint) {
+  const a = activation[target] || {};
+  const chips = [bindingChip(target, a.key), a.chord ? bindingChip(`${target}_chord`, a.chord) : ''].filter(Boolean);
+  const bindingHtml = chips.length
+    ? chips.join(' <span class="small muted">or</span> ')
+    : '<span class="small muted">Not set</span>';
+  const hasConflict = a.conflicts && a.conflicts.length > 0;
+  return settingRow(label, hint, `
+    <div class="cap-row${hasConflict ? ' conflict' : ''}" style="flex-wrap:wrap;justify-content:flex-end;gap:8px">
+      ${bindingHtml}
+      <button class="btn small" data-act="edit-binding" data-target="${target}" data-field="key">
+        ${icon('edit')} ${a.key ? 'Change' : 'Set'}
+      </button>
+      ${!a.is_default ? iconBtn('trash', 'Reset to default', `data-act="reset-binding" data-target="${target}"`) : ''}
+      ${a.chord
+        ? iconBtn('trash', 'Remove shortcut', `data-act="clear-binding-chord" data-target="${target}"`)
+        : `<button class="btn small ghost" data-act="edit-binding" data-target="${target}" data-field="chord">+ Shortcut</button>`}
+    </div>
+    ${hasConflict ? `<div class="small" style="color:var(--red)">Same as ${esc(a.conflicts[0])} — only one will fire.</div>` : ''}
+  `);
+}
+
+/**
+ * Hands-free dictation: its own mode toggle (off by default -- this is an
+ * additional way to dictate, not a replacement for hold-to-talk), the same
+ * binding capture as the two hold-based rows, and -- only relevant to a
+ * held-key binding, not a chord -- whether it must be double-tapped.
+ */
+function handsFreeRow(activation) {
+  const a = activation.hands_free || {};
+  const chips = [bindingChip('hands_free', a.key), a.chord ? bindingChip('hands_free_chord', a.chord) : ''].filter(Boolean);
+  const bindingHtml = chips.length
+    ? chips.join(' <span class="small muted">or</span> ')
+    : '<span class="small muted">Not set</span>';
+  const hasConflict = a.conflicts && a.conflicts.length > 0;
+  const gesture = a.key
+    ? (a.double_tap ? 'Press this key twice quickly to start, twice again to stop.' : 'Tap this key to start, tap again to stop.')
+    : (a.chord ? 'Press this shortcut to start, again to stop.' : 'Tap once to start recording, tap again to stop — no holding.');
+
+  return `
+    ${settingRow('Hands-free dictation', gesture,
+      `<span data-live-hands-free></span>${toggle(!!a.enabled, 'data-act="set" data-field="hands_free_enabled"')}`)}
+    ${a.enabled ? settingRow('Hands-free binding', '', `
+      <div class="cap-row${hasConflict ? ' conflict' : ''}" style="flex-wrap:wrap;justify-content:flex-end;gap:8px">
+        ${bindingHtml}
+        <button class="btn small" data-act="edit-binding" data-target="hands_free" data-field="key">
+          ${icon('edit')} ${a.key ? 'Change' : 'Set'}
+        </button>
+        ${!a.is_default ? iconBtn('trash', 'Reset to default', 'data-act="reset-binding" data-target="hands_free"') : ''}
+        ${a.chord
+          ? iconBtn('trash', 'Remove shortcut', 'data-act="clear-binding-chord" data-target="hands_free"')
+          : `<button class="btn small ghost" data-act="edit-binding" data-target="hands_free" data-field="chord">+ Shortcut</button>`}
+      </div>
+      ${a.key ? `<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:10px;justify-content:flex-end">
+        Double-tap instead of a single tap
+        ${toggle(!!a.double_tap, 'data-act="set" data-field="hands_free_double_tap"')}
+      </label>` : ''}
+      ${hasConflict ? `<div class="small" style="color:var(--red)">Same as ${esc(a.conflicts[0])} — only one will fire.</div>` : ''}
+    `) : ''}
+  `;
 }
 
 // Named states, not a slider: "aggressiveness 0-10" tells a user nothing about
@@ -1502,6 +1594,9 @@ document.addEventListener('click', async (event) => {
             shortcut: el('x-shortcut').value,
             phrase: el('x-phrase').value,
             enabled: true,
+            allows_markdown: el('x-md').checked,
+            may_shorten: el('x-short').checked,
+            may_lengthen: el('x-long').checked,
           });
           closeModal(); await refresh(); toast('Transform saved');
         } catch (err) { error.textContent = err.message; }
@@ -1671,6 +1766,42 @@ document.addEventListener('click', async (event) => {
 
       case 'pick-device': await saveSetting('audio_device', target.dataset.device || null); break;
       case 'edit-hotkey': hotkeyDialog(); break;
+      case 'edit-binding': {
+        const bindingTarget = target.dataset.target;
+        const field = target.dataset.field;
+        if (field === 'chord') {
+          activationBindingDialog({
+            target: bindingTarget, field: 'chord', kind: 'chord',
+            title: 'Press the shortcut you want',
+            hint: 'A combination like Ctrl+Alt+Space — hold the modifier keys, then press the last one.',
+          });
+        } else {
+          activationBindingDialog({
+            target: bindingTarget, field: 'key', kind: 'hold',
+            title: 'Press the key you want to hold',
+            hint: 'Needs a key you never type with — a Ctrl, Shift, Alt, Win, Caps Lock, or F13–F18 key.',
+          });
+        }
+        break;
+      }
+      case 'reset-binding':
+        try {
+          await post('/api/shortcuts/reset', { target: target.dataset.target });
+          toast('Reset to default');
+          await refresh();
+        } catch (err) {
+          toast(err.message);
+        }
+        break;
+      case 'clear-binding-chord':
+        try {
+          await post('/api/shortcuts/save', { target: target.dataset.target, chord: '' });
+          toast('Shortcut removed');
+          await refresh();
+        } catch (err) {
+          toast(err.message);
+        }
+        break;
       case 'open-data': toast('Your data folder is shown in Settings › Data'); break;
 
       case 'set': {
@@ -1798,50 +1929,155 @@ const MODIFIER_CODES = {
   ControlLeft: 'ctrl_l', ControlRight: 'ctrl_r',
   ShiftLeft: 'shift_l', ShiftRight: 'shift_r',
   AltLeft: 'alt_l', AltRight: 'alt_r',
-  MetaLeft: 'cmd_l', MetaRight: 'cmd_r',
+  // Windows does not reliably distinguish left/right Win the way it does
+  // ctrl/alt/shift -- KNOWN_KEYS on the Python side only has a single
+  // "cmd", not "cmd_l"/"cmd_r". Both codes map to it, or a captured Win key
+  // would be sent as a name the server rejects.
+  MetaLeft: 'cmd', MetaRight: 'cmd',
   CapsLock: 'caps_lock', F13: 'f13',
 };
 
-function hotkeyDialog() {
+/** Modifier identification for a *chord* capture: position-based (ctrl/alt/
+ * shift/cmd don't vary by keyboard layout), same set flow.hotkey.Chord uses
+ * -- left and right count as the one modifier, since "which side" is not
+ * part of what a chord means. */
+const CHORD_MODIFIER_CODES = {
+  ControlLeft: 'ctrl', ControlRight: 'ctrl',
+  ShiftLeft: 'shift', ShiftRight: 'shift',
+  AltLeft: 'alt', AltRight: 'alt',
+  MetaLeft: 'cmd', MetaRight: 'cmd',
+};
+
+const CHORD_NAMED_KEYS = {
+  ' ': 'space', Enter: 'enter', Tab: 'tab', Backspace: 'backspace',
+  Delete: 'delete', Home: 'home', End: 'end', Insert: 'insert',
+};
+
+/** Mirrors flow.hotkey._RESERVED_CHORDS -- checked here too so a doomed
+ * combination is refused before the round trip, not just after. */
+const RESERVED_CHORDS = {
+  'ctrl+c': 'used internally to read a selection — pick something else',
+  'ctrl+v': 'used internally to paste — pick something else',
+  'ctrl+x': 'used internally to read a selection — pick something else',
+  'ctrl+alt+delete': "reserved by Windows and can't be used here",
+  'cmd+l': "reserved by Windows (locks the screen) and can't be used here",
+};
+
+const CHORD_MODIFIER_ORDER = ['ctrl', 'alt', 'shift', 'cmd'];
+
+function chordPartLabel(part) {
+  const labels = { ctrl: 'Ctrl', alt: 'Alt', shift: 'Shift', cmd: 'Win' };
+  if (labels[part]) return labels[part];
+  return part.length === 1 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1);
+}
+
+const chordLabel = (chord) => chord.split('+').map(chordPartLabel).join(' + ');
+
+/** The terminal (non-modifier) key of a chord, from a keydown event.
+ * event.key -- not event.code -- because event.key reflects what the OS's
+ * active keyboard layout actually produces (matching pynput's KeyCode.char
+ * server-side), while event.code is physical-position-based and would
+ * disagree with it on a non-QWERTY layout. */
+function chordTerminalKeyName(event) {
+  const key = event.key;
+  if (key.length === 1 && /[a-zA-Z0-9]/.test(key)) return key.toLowerCase();
+  if (CHORD_NAMED_KEYS[key]) return CHORD_NAMED_KEYS[key];
+  const fMatch = /^F([1-9]|1[0-9]|20)$/.exec(key);
+  return fMatch ? `f${fMatch[1]}` : null;
+}
+
+/**
+ * One capture dialog for every activation binding: a held key (kind:
+ * 'hold', dictation/command/hands-free's primary binding) or a modifier
+ * chord (kind: 'chord', the optional alternate). Derived from the
+ * reference's own hotkey screen (§1 4.png): caps go indigo *while
+ * physically held*, and the user is asked to observe that rather than
+ * being told the hook registered.
+ */
+function activationBindingDialog({ target, field, kind, title, hint }) {
+  const isChord = kind === 'chord';
   let captured = null;
+  let heldModifiers = new Set();
 
   openModal({
-    title: 'Press the key you want to hold',
+    title,
     body: `
       <div class="well" style="text-align:center;padding:26px">
-        <div id="hk-caps" style="display:flex;gap:12px;justify-content:center;min-height:76px;align-items:center">
-          <span class="muted small">Hold a modifier key…</span>
+        <div id="ab-caps" style="display:flex;gap:12px;justify-content:center;min-height:76px;align-items:center">
+          <span class="cap big capturing"></span>
         </div>
       </div>
-      <div class="small muted">
-        Hold-to-talk needs a key you never type with — a Ctrl, Shift, Alt or Win key.
-        Right-hand keys work best, since your left hand keeps using shortcuts.
-      </div>
-      <div id="hk-error" class="small" style="color:var(--red)"></div>`,
+      <div class="small muted">${hint}</div>
+      <div id="ab-error" class="small" style="color:var(--red);min-height:18px"></div>`,
     actions: `<div class="spacer"></div>
       <button class="btn" data-act="close-modal">Cancel</button>
-      <button class="btn primary" id="hk-save" disabled>Save</button>`,
+      <button class="btn primary" id="ab-save" disabled>Save</button>`,
   });
 
-  const capsBox = document.getElementById('hk-caps');
-  const error = document.getElementById('hk-error');
-  const save = document.getElementById('hk-save');
+  const capsBox = document.getElementById('ab-caps');
+  const error = document.getElementById('ab-error');
+  const save = document.getElementById('ab-save');
 
-  const onDown = (event) => {
-    const name = MODIFIER_CODES[event.code];
-    event.preventDefault();
-    if (!name) {
-      error.textContent = 'That key would be typed into your document. Pick a modifier key.';
-      return;
+  // A capture that never settles (AltGr quirks, an unmapped media key)
+  // should not leave the dialog silently stuck -- name it and invite a
+  // retry rather than leaving Save disabled with no explanation.
+  const timeout = setTimeout(() => {
+    if (!captured) {
+      error.textContent = "Couldn't detect a steady combination — try again, or pick a different key.";
     }
-    error.textContent = '';
-    captured = name;
-    // Lilac = "this key is down right now" (§1 4.png).
-    capsBox.innerHTML = `<span class="cap big held">${esc(prettyKey(name))}</span>`;
-    save.disabled = false;
+  }, 6000);
+
+  const showChordChips = (parts, cls) => {
+    capsBox.innerHTML = parts.map((p) => `<span class="cap big ${cls}">${esc(chordPartLabel(p))}</span>`).join('');
   };
 
-  const onUp = () => {
+  const onDown = (event) => {
+    if (isChord) {
+      const mod = CHORD_MODIFIER_CODES[event.code];
+      if (mod) {
+        event.preventDefault();
+        heldModifiers.add(mod);
+        showChordChips(CHORD_MODIFIER_ORDER.filter((m) => heldModifiers.has(m)), 'held');
+        return;
+      }
+      const key = chordTerminalKeyName(event);
+      if (!key) return; // an unrecognised key: not part of a chord, ignore
+      event.preventDefault();
+      if (heldModifiers.size === 0) {
+        error.textContent = 'A shortcut needs at least one modifier, like Ctrl+Alt+P.';
+        return;
+      }
+      const order = CHORD_MODIFIER_ORDER.filter((m) => heldModifiers.has(m));
+      const chord = [...order, key].join('+');
+      if (RESERVED_CHORDS[chord]) {
+        error.textContent = `${chordLabel(chord)} is ${RESERVED_CHORDS[chord]}.`;
+        return;
+      }
+      error.textContent = '';
+      captured = chord;
+      showChordChips([...order, key], 'hot');
+      save.disabled = false;
+    } else {
+      const name = MODIFIER_CODES[event.code];
+      event.preventDefault();
+      if (!name) {
+        error.textContent = 'That key would be typed into your document. Pick a modifier key.';
+        return;
+      }
+      error.textContent = '';
+      captured = name;
+      // Lilac = "this key is down right now" (§1 4.png).
+      capsBox.innerHTML = `<span class="cap big held">${esc(prettyKey(name))}</span>`;
+      save.disabled = false;
+    }
+  };
+
+  const onUp = (event) => {
+    if (isChord) {
+      const mod = CHORD_MODIFIER_CODES[event.code];
+      if (mod) heldModifiers.delete(mod);
+      return;
+    }
     if (!captured) return;
     // Amber at rest = "this is your hotkey" (§5).
     capsBox.innerHTML = `<span class="cap big hot">${esc(prettyKey(captured))}</span>`;
@@ -1853,6 +2089,7 @@ function hotkeyDialog() {
   const cleanup = () => {
     document.removeEventListener('keydown', onDown, true);
     document.removeEventListener('keyup', onUp, true);
+    clearTimeout(timeout);
   };
   // Torn down whichever way the dialog closes, so the capture handlers cannot
   // outlive it and swallow keystrokes on the page behind.
@@ -1867,8 +2104,26 @@ function hotkeyDialog() {
     cleanup();
     observer.disconnect();
     closeModal();
-    await saveSetting('hotkey', captured);
+    try {
+      await post('/api/shortcuts/save', { target, [field]: captured });
+      toast('Saved');
+      await refresh();
+    } catch (err) {
+      toast(err.message);
+    }
   };
+}
+
+/** Onboarding still only ever rebinds the dictation hold key. */
+function hotkeyDialog() {
+  activationBindingDialog({
+    target: 'dictation',
+    field: 'key',
+    kind: 'hold',
+    title: 'Press the key you want to hold',
+    hint: 'Hold-to-talk needs a key you never type with — a Ctrl, Shift, Alt or Win key. '
+      + 'Right-hand keys work best, since your left hand keeps using shortcuts.',
+  });
 }
 
 /* ----------------------------------------------------------- onboarding */
@@ -2105,6 +2360,43 @@ function watchHotkeyPreview(hotkey) {
       target.innerHTML = `<span class="cap big ${held ? 'held' : 'hot'}">${esc(prettyKey(hotkey))}</span>`;
     } catch { /* transient */ }
   }, 140);
+}
+
+/**
+ * Settings → Voice's live "is this binding physically active right now"
+ * preview: the same purpose watchHotkeyPreview serves onboarding, extended
+ * to every configurable activation binding at once. Self-terminating --
+ * checked each tick rather than torn down explicitly on navigation, since
+ * nothing else in this file currently hooks a per-tab teardown.
+ */
+let activationTimer = null;
+function watchActivationPreview() {
+  if (activationTimer) return;
+  activationTimer = setInterval(async () => {
+    if (state.view !== 'settings' || state.settingsTab !== 'voice') {
+      clearInterval(activationTimer);
+      activationTimer = null;
+      return;
+    }
+    try {
+      const status = await api('/api/status');
+      const bindings = status.bindings_down || {};
+      document.querySelectorAll('[data-live-binding]').forEach((node) => {
+        const key = node.dataset.liveBinding;
+        // Hands-free is tap-based: there is no "physically held right now"
+        // to show on its chip, only the dot below reporting a session in
+        // progress, so those two keys are left alone here.
+        if (key === 'hands_free' || key === 'hands_free_chord') return;
+        const down = key === 'dictation' ? status.hotkey_down === true : !!bindings[key];
+        node.querySelectorAll('.cap').forEach((cap) => {
+          cap.classList.toggle('held', down);
+          cap.classList.toggle('hot', !down);
+        });
+      });
+      const dot = document.querySelector('[data-live-hands-free]');
+      if (dot) dot.classList.toggle('hands-free-dot', status.hands_free_active === true);
+    } catch { /* transient; the next tick retries */ }
+  }, 200);
 }
 
 async function onboardingAction(act, target) {

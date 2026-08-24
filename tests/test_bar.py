@@ -962,3 +962,121 @@ def test_the_bar_is_clickable_at_every_point_of_the_morph(expand):
         if pixels[x, y][:3] == _KEY_RGB
     ]
     assert not holes, f"expand={expand}: {len(holes)} click-through pixels"
+
+
+# -- the activity orb ------------------------------------------------------
+#
+# The orb replaced both the logo mark and the corner badge glyph. The badge
+# was what guaranteed a state was never carried by colour alone, so that
+# guarantee has to be re-proved here against the thing that took its job.
+
+
+#: The orb's slot: the left end of the capsule, before any text starts.
+ORB_BOX = (0, 0, 46, _HEIGHT)
+
+
+def orb_patch(state, **kwargs):
+    """The orb's corner of the capsule, in greyscale.
+
+    Greyscale on purpose: it is how a test asks "would these two still be
+    distinguishable to someone who cannot use the hue?". Cropped, because
+    otherwise the state *label* would make every pair differ and the
+    assertion would prove nothing.
+    """
+    image, _ = render_bar(state, "", **kwargs)
+    return image.convert("L").crop(ORB_BOX).tobytes()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        BarState.IDLE,
+        BarState.RECORDING,
+        BarState.THINKING,
+        BarState.INJECTING,
+        BarState.DONE,
+        BarState.ERROR,
+        BarState.PAUSED,
+    ],
+)
+def test_every_state_draws_something_in_the_orb_slot(state):
+    image, _ = render_bar(state, "")
+    assert image.crop(ORB_BOX).getbbox() is not None
+
+
+def test_no_two_states_are_told_apart_by_colour_alone():
+    """The badge used to carry this. Now the orb's motion and the outcome
+    glyphs do, and it has to hold for every pair, not on average."""
+    states = [
+        BarState.IDLE,
+        BarState.RECORDING,
+        BarState.THINKING,
+        BarState.INJECTING,
+        BarState.DONE,
+        BarState.ERROR,
+    ]
+    patches = {state: orb_patch(state, orb_phase_s=0.7) for state in states}
+    for i, first in enumerate(states):
+        for second in states[i + 1 :]:
+            assert patches[first] != patches[second], f"{first} and {second} match in greyscale"
+
+
+@pytest.mark.parametrize(
+    "state", [BarState.RECORDING, BarState.THINKING, BarState.INJECTING, BarState.IDLE]
+)
+def test_the_orb_animates_with_its_phase(state):
+    assert orb_patch(state, orb_phase_s=0.1) != orb_patch(state, orb_phase_s=1.3)
+
+
+@pytest.mark.parametrize(
+    "state", [BarState.RECORDING, BarState.THINKING, BarState.INJECTING, BarState.IDLE]
+)
+def test_reduced_motion_holds_one_frame(state):
+    """The whole contract: the phase stops reaching the renderer."""
+    assert orb_patch(state, orb_phase_s=0.1, reduced_motion=True) == orb_patch(
+        state, orb_phase_s=1.3, reduced_motion=True
+    )
+
+
+def test_a_paused_bar_holds_still_even_with_motion_allowed():
+    """Paused is disarmed. An orb animating about work it has been told not
+    to do is the bar contradicting its own label."""
+    assert orb_patch(BarState.PAUSED, orb_phase_s=0.1) == orb_patch(
+        BarState.PAUSED, orb_phase_s=1.3
+    )
+
+
+def test_the_listening_orb_moves_with_the_voice():
+    quiet = orb_patch(BarState.RECORDING, orb_phase_s=0.7, level_t=(0.0, 0.0, 0.0))
+    loud = orb_patch(BarState.RECORDING, orb_phase_s=0.7, level_t=(1.0, 1.0, 1.0))
+    assert quiet != loud
+
+
+def test_only_recording_reads_the_level():
+    """A level left over from the last dictation must not perturb the rest."""
+    for state in (BarState.THINKING, BarState.INJECTING, BarState.IDLE):
+        assert orb_patch(state, orb_phase_s=0.7, level_t=(1.0, 1.0, 1.0)) == orb_patch(
+            state, orb_phase_s=0.7, level_t=(0.0, 0.0, 0.0)
+        )
+
+
+def test_the_resting_dot_draws_no_orb():
+    """Below the content gate there is no room for one, and drawing it anyway
+    is what would make the resting bar repaint forever."""
+    image, _ = render_bar(BarState.IDLE, "", expand=0.0, orb_phase_s=0.1)
+    later, _ = render_bar(BarState.IDLE, "", expand=0.0, orb_phase_s=1.3)
+    assert image.tobytes() == later.tobytes()
+
+
+def test_the_orb_did_not_move_the_layout():
+    """The orb took the avatar's slot, not a new one.
+
+    The capsule's width and every hit region are derived from the same
+    constants the mark used, so a state that fit before still fits and a
+    control the pointer was aiming at has not shifted under it.
+    """
+    for state in list(BarState):
+        before, regions = render_bar(state, "", orb_phase_s=0.0)
+        after, later_regions = render_bar(state, "", orb_phase_s=1.3)
+        assert before.size == after.size
+        assert regions == later_regions

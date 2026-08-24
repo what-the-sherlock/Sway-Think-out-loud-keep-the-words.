@@ -363,18 +363,55 @@ select.input { cursor: pointer; appearance: none;
   box-shadow: 0 1px 0 rgba(0,0,0,0.06);
   font-size: 12.5px; font-weight: 600;
   font-family: var(--sans);
+  /* The held->settled swap below used to be an instant innerHTML replace;
+     this is what gives it a moment of weight instead. */
+  transition: background-color 160ms ease-out, border-color 160ms ease-out,
+              transform 160ms ease-out;
 }
 /* Amber = "this is your hotkey" (§5, §1 7.png). */
 .cap.hot { background: var(--amber-fill); border-color: var(--amber); }
 /* Lilac = "this key is down right now" (§1 4.png). */
-.cap.held { background: var(--indigo-fill); border-color: var(--indigo); }
+.cap.held { background: var(--indigo-fill); border-color: var(--indigo); transform: scale(0.96); }
 .cap.big {
   min-width: 76px; height: 76px; border-radius: 12px;
   font-size: 14px; align-items: flex-start; justify-content: flex-start;
   padding: 9px 11px;
   box-shadow: 0 2px 4px rgba(0,0,0,0.07);
 }
+/* The empty capture box, before any key has gone down: invites the press
+   rather than sitting inert. Removed the instant a key is captured. */
+.cap.big.capturing { animation: cap-pulse 1.4s ease-in-out infinite; }
+@keyframes cap-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--indigo-fill); }
+  50% { box-shadow: 0 0 0 6px transparent; }
+}
+/* A newly-added alternate binding chip, so it reads as "just appeared"
+   rather than snapping into place. */
+.cap.entering { animation: cap-in 180ms ease-out; }
+@keyframes cap-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.9); }
+  to { opacity: 1; transform: none; }
+}
 .cap-row { display: inline-flex; align-items: center; gap: 6px; }
+/* One detected live collision while capturing a shortcut: a single shake,
+   not a persistent wobble -- re-triggered by toggling this class off and
+   back on (the standard technique for restarting a CSS animation). */
+.cap-row.conflict { animation: cap-shake 320ms ease-in-out; }
+@keyframes cap-shake {
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
+/* A hands-free session in progress: the same "listening" language the
+   overlay bar's own recording pulse uses, applied to its settings row. */
+.hands-free-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red); margin-right: 8px;
+  animation: hands-free-breathe 1.6s ease-in-out infinite;
+}
+@keyframes hands-free-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
 
 .well {
   background: var(--well);
@@ -512,6 +549,9 @@ select.input { cursor: pointer; appearance: none;
 .modal-foot .spacer { flex: 1; }
 
 .field-label { font-size: 13px; font-weight: 500; margin-bottom: 7px; display: block; }
+.check-row { display: flex; align-items: flex-start; gap: 9px; font-size: 13px;
+  padding: 5px 0; cursor: pointer; line-height: 1.45; }
+.check-row input { margin: 2px 0 0; flex: none; accent-color: var(--dark); width: 14px; height: 14px; }
 
 /* ---------------------------------------------------------------- toast */
 

@@ -28,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from sway.cleanup import NO_EXPECTATION, OutputExpectation
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Iterable, Sequence
 
@@ -64,6 +66,28 @@ class Transform:
     #: disabled like any other; the flag only drives "reset to defaults".
     builtin: bool = False
 
+    # -- output expectations -------------------------------------------------
+    # What this transform is *allowed* to do to the text, so the cleanup
+    # guardrails can tell "the model did what the user asked" apart from "the
+    # model went off-script". Without these, the guardrails reject a correct
+    # result: a bulleted rewrite trips the markdown check, a summary trips the
+    # shrink floor, and an email trips the growth ceiling -- which is exactly
+    # the bug this field set exists to fix.
+    #
+    # Deliberately three coarse booleans rather than raw ratio numbers. They
+    # are checkboxes a user can answer honestly about their own instruction
+    # ("does this produce a list?"); a float would be a number nobody can pick
+    # correctly. All default False, so a transform that says nothing keeps the
+    # full-strength guardrails, and the entity guard is never relaxed by any of
+    # them -- losing a name or a number is wrong under every instruction.
+
+    #: The instruction asks for a list, heading, or other markdown structure.
+    allows_markdown: bool = False
+    #: The instruction is expected to remove content (summarize, condense).
+    may_shorten: bool = False
+    #: The instruction is expected to add scaffolding (a greeting, a sign-off).
+    may_lengthen: bool = False
+
 
 #: Shipped transforms. **All disabled by default**, per D8.5: a transform costs
 #: a model call and free-tier quota, so nothing here starts spending either
@@ -93,6 +117,7 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
             "Say the same thing in noticeably fewer words. Every fact, name, number, "
             "and request in the original must survive; cut words, not content."
         ),
+        may_shorten=True,
         phrase="make that concise",
         builtin=True,
     ),
@@ -137,6 +162,8 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
             "Rewrite as a bulleted list, one idea per bullet, each starting with "
             "'- '. Keep every point from the original and add none."
         ),
+        allows_markdown=True,
+        may_shorten=True,
         phrase="make that bullet points",
         builtin=True,
     ),
@@ -148,6 +175,7 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
             "Rewrite as a short email with a greeting and a sign-off. Do not invent "
             "a recipient name, a sender name, or any fact the text does not contain."
         ),
+        may_lengthen=True,
         phrase="make that an email",
         builtin=True,
     ),
@@ -159,6 +187,7 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
             "Summarize in at most three sentences, keeping every decision, name, "
             "number, and date. This is the one case where losing detail is expected."
         ),
+        may_shorten=True,
         phrase="summarize that",
         builtin=True,
     ),
@@ -228,6 +257,31 @@ def as_matchable(transforms: Iterable[Transform]) -> list[Trigger]:
     ]
 
 
+def expectation_for(fired: Sequence[Transform]) -> OutputExpectation:
+    """The merged output expectation of the transforms that fired.
+
+    Permissive across the set, because every fired instruction is one the user
+    asked for: "summarize that, and make that bullet points" is entitled to
+    both shrink past the ordinary floor and contain bullets. Returns the
+    full-strength :data:`~sway.cleanup.NO_EXPECTATION` when nothing fired,
+    which is the common case and leaves plain dictation's guardrails exactly
+    as they were.
+
+    Kept beside :func:`build_directive_block` on purpose: these are the two
+    halves of one idea -- what the model is told to do, and what the guardrails
+    must therefore let it do -- and a transform that gains a directive without
+    gaining the matching expectation is precisely the bug that made "make that
+    bullet points" silently paste unbulleted text.
+    """
+    if not fired:
+        return NO_EXPECTATION
+    return OutputExpectation(
+        allows_markdown=any(t.allows_markdown for t in fired),
+        may_shorten=any(t.may_shorten for t in fired),
+        may_lengthen=any(t.may_lengthen for t in fired),
+    )
+
+
 def build_directive_block(fired: Sequence[Transform]) -> str:
     """The directive text appended to a cleanup request for the transforms that
     fired.
@@ -293,6 +347,7 @@ __all__ = [
     "by_id",
     "enabled_with_phrase",
     "enabled_with_shortcut",
+    "expectation_for",
     "find_shortcut_conflicts",
     "normalise_shortcut",
 ]

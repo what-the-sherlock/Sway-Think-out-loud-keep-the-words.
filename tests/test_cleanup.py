@@ -10,9 +10,11 @@ import logging
 from sway.cleanup import (
     CLEANUP_SYSTEM_PROMPT,
     FORMAL_CLEANUP_SYSTEM_PROMPT,
+    MIN_MS_PER_WORD,
     CleanupStats,
     has_filler_markers,
     is_cleanup_output_safe,
+    looks_hallucinated,
     should_skip_cleanup,
     system_prompt_for_style,
     word_count,
@@ -127,6 +129,51 @@ def test_word_count_boundary_is_exclusive_of_min_words():
     text = "one two three four five six seven eight"
     assert word_count(text) == 8
     assert should_skip_cleanup(text, min_words=8) is False
+
+
+# -- looks_hallucinated ---------------------------------------------------------
+
+
+def test_flags_a_multi_word_sentence_from_a_near_instant_clip():
+    """The classic case: a click or breath survives VAD as a few tens of
+    milliseconds, and Whisper hallucinates a full sentence over it."""
+    assert looks_hallucinated("Thank you for watching!", speech_ms=150.0) is True
+
+
+def test_flags_a_short_dictionary_hallucination():
+    assert looks_hallucinated("Mayfair, Aashutosh", speech_ms=120.0) is True
+
+
+def test_does_not_flag_a_plausibly_timed_short_phrase():
+    """A real "thank you" takes real time to say -- must not be punished for
+    matching a phrase that also happens to be a common hallucination."""
+    assert looks_hallucinated("Thank you", speech_ms=900.0) is False
+
+
+def test_does_not_flag_an_ordinary_long_dictation():
+    text = "Please remember to send the quarterly report to finance before Friday afternoon"
+    assert looks_hallucinated(text, speech_ms=6000.0) is False
+
+
+def test_boundary_is_exclusive():
+    # Exactly at the floor is plausible, not flagged; a hair under it is not.
+    assert looks_hallucinated("one two", speech_ms=2 * MIN_MS_PER_WORD) is False
+    assert looks_hallucinated("one two", speech_ms=2 * MIN_MS_PER_WORD - 1) is True
+
+
+def test_ignores_unmeasured_duration():
+    """speech_ms is None on the streamed-chunk-merge path, which never
+    measured it -- must not guess rather than silently pass it through."""
+    assert looks_hallucinated("Thank you for watching!", speech_ms=None) is False
+
+
+def test_ignores_empty_text():
+    assert looks_hallucinated("", speech_ms=50.0) is False
+
+
+def test_ignores_zero_or_negative_duration():
+    assert looks_hallucinated("hello", speech_ms=0.0) is False
+    assert looks_hallucinated("hello", speech_ms=-10.0) is False
 
 
 # -- CleanupStats --------------------------------------------------------------

@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from sway.hotkey import KNOWN_KEYS, ChordError, parse_chord
 from sway.transforms import (
     DEFAULT_TRANSFORMS,
     MAX_DESCRIPTION_CHARS,
@@ -48,6 +49,7 @@ from sway.transforms import (
     MAX_TRANSFORMS,
     Transform,
 )
+from sway.transforms import by_id as transforms_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +190,31 @@ class Settings:
 
     #: Hotkey override, a pynput key name (e.g. ``ctrl_r``). ``None`` = config's.
     hotkey: str | None = None
+    #: Optional alternate chord for dictation (tap to start/stop instead of
+    #: holding ``hotkey``). ``None`` = config's (or none, if config has none).
+    hotkey_chord: str | None = None
+    #: Voice-command hotkey override. ``None`` = config's ``command_key``.
+    #: Unlike ``hotkey`` this has no equivalent read/write path before this
+    #: field existed -- the voice-command key was config.toml-only.
+    command_hotkey: str | None = None
+    #: Optional alternate chord for the voice-command hotkey, same shape as
+    #: hotkey_chord.
+    command_hotkey_chord: str | None = None
+    #: Whether hands-free dictation (tap to start, tap to stop, no holding)
+    #: is on. Unlike the other hotkey fields this has no config.toml
+    #: equivalent to fall back to -- it is a pure UI on/off switch, same
+    #: pattern as auto_learn_vocabulary.
+    hands_free_enabled: bool = False
+    #: Hands-free binding override. ``None`` = config's ``hands_free_key``.
+    hands_free_key: str | None = None
+    #: Hands-free chord override. ``None`` = config's ``hands_free_chord``.
+    hands_free_chord: str | None = None
+    #: Whether hands_free_key must be double-tapped rather than tapped once.
+    #: ``None`` = config's; unlike hands_free_enabled this *does* have a
+    #: config.toml equivalent (HotkeyConfig.hands_free_double_tap), so it
+    #: needs the same "not overridden" sentinel as hotkey/audio_device
+    #: rather than a plain bool default.
+    hands_free_double_tap: bool | None = None
     #: Input device override, matching ``[audio].device``. ``None`` = system default.
     audio_device: str | None = None
     #: Dictation language hint passed to Whisper. ``None`` = auto-detect.
@@ -263,6 +290,15 @@ def _as_bool(value: Any, *, default: bool, name: str) -> bool:
     return default
 
 
+def _as_optional_bool(value: Any, *, name: str) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    logger.warning("settings: %s is not true/false (%r); ignoring", name, value)
+    return None
+
+
 def _as_optional_str(value: Any, *, name: str, max_chars: int = 200) -> str | None:
     if value is None:
         return None
@@ -273,6 +309,39 @@ def _as_optional_str(value: Any, *, name: str, max_chars: int = 200) -> str | No
     if not text:
         return None
     return text[:max_chars]
+
+
+def _as_optional_key(value: Any, *, name: str, max_chars: int = 64) -> str | None:
+    """A hold-key name from :data:`sway.hotkey.KNOWN_KEYS`, or ``None``.
+
+    A value outside that set degrades to ``None`` with a logged warning,
+    exactly like :func:`_as_optional_str` degrades an out-of-range value --
+    this file's own rule is that one bad field is replaced individually
+    rather than bricking the whole settings file.
+    """
+    text = _as_optional_str(value, name=name, max_chars=max_chars)
+    if text is None:
+        return None
+    if text in KNOWN_KEYS:
+        return text
+    logger.warning("settings: %s is not a known key (%r); ignoring", name, text)
+    return None
+
+
+def _as_optional_chord(value: Any, *, name: str, max_chars: int = 64) -> str | None:
+    """A chord string parseable by :func:`sway.hotkey.parse_chord`, or ``None``.
+
+    Stored in its canonical form (see :meth:`sway.hotkey.Chord.__str__`) so
+    two settings saves that mean the same chord always compare equal.
+    """
+    text = _as_optional_str(value, name=name, max_chars=max_chars)
+    if text is None:
+        return None
+    try:
+        return str(parse_chord(text))
+    except ChordError as exc:
+        logger.warning("settings: %s is not a usable shortcut (%r): %s; ignoring", name, text, exc)
+        return None
 
 
 def _parse_trigger(raw: Any, *, seen: set[str]) -> Trigger | None:
@@ -356,7 +425,33 @@ def _parse_transform(raw: Any, *, seen: set[str]) -> Transform | None:
         icon=_as_optional_str(raw.get("icon"), name="transform.icon", max_chars=8) or "",
         enabled=_as_bool(raw.get("enabled", False), default=False, name="transform.enabled"),
         builtin=_as_bool(raw.get("builtin", False), default=False, name="transform.builtin"),
+        allows_markdown=_expectation_flag(raw, transform_id, "allows_markdown"),
+        may_shorten=_expectation_flag(raw, transform_id, "may_shorten"),
+        may_lengthen=_expectation_flag(raw, transform_id, "may_lengthen"),
     )
+
+
+def _expectation_flag(raw: dict[str, Any], transform_id: str, field: str) -> bool:
+    """One output-expectation flag, defaulting to what the shipped transform of
+    the same id declares.
+
+    The plain default is ``False`` -- strict guardrails -- and that is what a
+    transform the user wrote gets. A *shipped* id is different: every
+    settings.json written before these fields existed stores the nine built-ins
+    without them, and reading those back as ``False`` would quietly restore the
+    exact bug the fields were added to fix ("make that bullet points" produces
+    bullets, the markdown guardrail rejects them, the user gets plain text).
+
+    The expectation describes the shipped *instruction*, so this is only right
+    while that instruction is the shipped one -- but a user who has rewritten a
+    built-in beyond recognition is served better by an expectation that matches
+    what it was designed to do than by silently losing it, and "reset to
+    defaults" restores both together.
+    """
+    if field in raw:
+        return _as_bool(raw.get(field), default=False, name=f"transform.{field}")
+    shipped = transforms_by_id(DEFAULT_TRANSFORMS, transform_id)
+    return bool(getattr(shipped, field)) if shipped is not None else False
 
 
 def _parse_app_rule(raw: Any, *, seen: set[str]) -> AppRule | None:
@@ -379,6 +474,13 @@ def _parse_app_rule(raw: Any, *, seen: set[str]) -> AppRule | None:
 _KNOWN_KEYS = {
     "version",
     "hotkey",
+    "hotkey_chord",
+    "command_hotkey",
+    "command_hotkey_chord",
+    "hands_free_enabled",
+    "hands_free_key",
+    "hands_free_chord",
+    "hands_free_double_tap",
     "audio_device",
     "language",
     "overlay_position",
@@ -466,7 +568,22 @@ def parse(raw: Any) -> Settings:
         transforms = tuple(parsed_transforms)
 
     return Settings(
-        hotkey=_as_optional_str(raw.get("hotkey"), name="hotkey", max_chars=64),
+        hotkey=_as_optional_key(raw.get("hotkey"), name="hotkey"),
+        hotkey_chord=_as_optional_chord(raw.get("hotkey_chord"), name="hotkey_chord"),
+        command_hotkey=_as_optional_key(raw.get("command_hotkey"), name="command_hotkey"),
+        command_hotkey_chord=_as_optional_chord(
+            raw.get("command_hotkey_chord"), name="command_hotkey_chord"
+        ),
+        hands_free_enabled=_as_bool(
+            raw.get("hands_free_enabled", DEFAULTS.hands_free_enabled),
+            default=DEFAULTS.hands_free_enabled,
+            name="hands_free_enabled",
+        ),
+        hands_free_key=_as_optional_key(raw.get("hands_free_key"), name="hands_free_key"),
+        hands_free_chord=_as_optional_chord(raw.get("hands_free_chord"), name="hands_free_chord"),
+        hands_free_double_tap=_as_optional_bool(
+            raw.get("hands_free_double_tap"), name="hands_free_double_tap"
+        ),
         audio_device=_as_optional_str(raw.get("audio_device"), name="audio_device"),
         language=_as_optional_str(raw.get("language"), name="language", max_chars=32),
         overlay_position=position,
@@ -521,6 +638,13 @@ def to_dict(settings: Settings) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
         "hotkey": settings.hotkey,
+        "hotkey_chord": settings.hotkey_chord,
+        "command_hotkey": settings.command_hotkey,
+        "command_hotkey_chord": settings.command_hotkey_chord,
+        "hands_free_enabled": settings.hands_free_enabled,
+        "hands_free_key": settings.hands_free_key,
+        "hands_free_chord": settings.hands_free_chord,
+        "hands_free_double_tap": settings.hands_free_double_tap,
         "audio_device": settings.audio_device,
         "language": settings.language,
         "overlay_position": settings.overlay_position,
@@ -703,6 +827,18 @@ def apply_to_config(config: Any, settings: Settings) -> Any:
     hotkey = config.hotkey
     if settings.hotkey is not None:
         hotkey = replace(hotkey, key=settings.hotkey)
+    if settings.hotkey_chord is not None:
+        hotkey = replace(hotkey, key_chord=settings.hotkey_chord)
+    if settings.command_hotkey is not None:
+        hotkey = replace(hotkey, command_key=settings.command_hotkey)
+    if settings.command_hotkey_chord is not None:
+        hotkey = replace(hotkey, command_key_chord=settings.command_hotkey_chord)
+    if settings.hands_free_key is not None:
+        hotkey = replace(hotkey, hands_free_key=settings.hands_free_key)
+    if settings.hands_free_chord is not None:
+        hotkey = replace(hotkey, hands_free_chord=settings.hands_free_chord)
+    if settings.hands_free_double_tap is not None:
+        hotkey = replace(hotkey, hands_free_double_tap=settings.hands_free_double_tap)
 
     groq = config.groq
     if settings.language is not None:

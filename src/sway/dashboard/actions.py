@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from sway import credentials
 from sway.dictionary import SOURCES
-from sway.hotkey import ChordError, parse_chord
+from sway.hotkey import KNOWN_KEYS, ChordError, find_binding_conflicts, parse_chord, prettify_hotkey
 from sway.transforms import (
     DEFAULT_IDS,
     DEFAULT_TRANSFORMS,
@@ -96,6 +96,37 @@ def _optional_str(payload: Mapping[str, Any], key: str, *, max_chars: int = 200)
     return text[:max_chars]
 
 
+def _optional_key(payload: Mapping[str, Any], key: str, *, max_chars: int = 64) -> str | None:
+    """A hold-key name from :data:`sway.hotkey.KNOWN_KEYS`, or ``None``.
+
+    Unlike :func:`_optional_str`, a value that is not a known key is a hard
+    rejection at the door -- a UI save is exactly the place to refuse
+    clearly, unlike a possibly-stale settings.json read at startup.
+    """
+    text = _optional_str(payload, key, max_chars=max_chars)
+    if text is None:
+        return None
+    if text not in KNOWN_KEYS:
+        raise ActionError(f"{prettify_hotkey(text)!r} is not a key Sway can hold -- pick a modifier key")
+    return text
+
+
+def _optional_chord(payload: Mapping[str, Any], key: str, *, max_chars: int = 64) -> str | None:
+    """A chord string parseable by :func:`sway.hotkey.parse_chord`, or ``None``.
+
+    Stored in canonical form, and rejected with ``ChordError``'s own
+    message -- already written for a person, e.g. "a shortcut needs at
+    least one modifier, like Ctrl+Alt+P".
+    """
+    text = _optional_str(payload, key, max_chars=max_chars)
+    if text is None:
+        return None
+    try:
+        return str(parse_chord(text))
+    except ChordError as exc:
+        raise ActionError(str(exc)) from exc
+
+
 def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
     value = payload.get(key)
     if not isinstance(value, bool):
@@ -122,7 +153,11 @@ def _require_int(payload: Mapping[str, Any], key: str, *, low: int, high: int) -
 #: field on :class:`Settings` is not remotely writable until someone adds it
 #: here on purpose.
 _SIMPLE_FIELDS: dict[str, Any] = {
-    "hotkey": lambda p: _optional_str(p, "hotkey", max_chars=64),
+    # hotkey, hotkey_chord, command_hotkey, command_hotkey_chord,
+    # hands_free_key, and hands_free_chord are set through
+    # save_activation_binding instead of here: those six need pairwise
+    # conflict-checking against each other, which a one-field-at-a-time save
+    # cannot do.
     "audio_device": lambda p: _optional_str(p, "audio_device"),
     "language": lambda p: _optional_str(p, "language", max_chars=32),
     "launch_at_login": lambda p: _require_bool(p, "launch_at_login"),
@@ -131,6 +166,8 @@ _SIMPLE_FIELDS: dict[str, Any] = {
     "latency_retention_days": lambda p: _require_int(p, "latency_retention_days", low=0, high=3650),
     "remove_fillers": lambda p: _require_bool(p, "remove_fillers"),
     "auto_learn_vocabulary": lambda p: _require_bool(p, "auto_learn_vocabulary"),
+    "hands_free_enabled": lambda p: _require_bool(p, "hands_free_enabled"),
+    "hands_free_double_tap": lambda p: _require_bool(p, "hands_free_double_tap"),
 }
 
 
@@ -347,6 +384,23 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
     if not isinstance(enabled, bool):
         enabled = True
 
+    # What this instruction is allowed to do to the text. Editing a built-in
+    # keeps its shipped expectation unless the payload says otherwise, for the
+    # same reason the settings parser does (see settings._expectation_flag): a
+    # form that round-trips without these keys must not quietly re-arm a
+    # guardrail against the very output the instruction asks for.
+    prior = next((t for t in current.transforms if t.id == transform_id), None) if transform_id else None
+
+    def expectation(field: str) -> bool:
+        value = payload.get(field)
+        if isinstance(value, bool):
+            return value
+        return bool(getattr(prior, field)) if prior is not None else False
+
+    allows_markdown = expectation("allows_markdown")
+    may_shorten = expectation("may_shorten")
+    may_lengthen = expectation("may_lengthen")
+
     if transform_id is None and len(current.transforms) >= MAX_TRANSFORMS:
         raise ActionError(f"you can have at most {MAX_TRANSFORMS} transforms")
 
@@ -368,6 +422,9 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
                     # Editing a built-in keeps it a built-in, so "reset to
                     # defaults" can still put it back.
                     builtin=existing.builtin,
+                    allows_markdown=allows_markdown,
+                    may_shorten=may_shorten,
+                    may_lengthen=may_lengthen,
                 )
             )
             replaced = True
@@ -388,6 +445,9 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
                 shortcut=shortcut,
                 icon=_optional_str(payload, "icon", max_chars=8) or "",
                 enabled=enabled,
+                allows_markdown=allows_markdown,
+                may_shorten=may_shorten,
+                may_lengthen=may_lengthen,
             )
         )
 
@@ -438,12 +498,181 @@ def transform_view(settings: Settings) -> list[dict[str, Any]]:
             "icon": t.icon,
             "enabled": t.enabled,
             "builtin": t.builtin,
+            "allows_markdown": t.allows_markdown,
+            "may_shorten": t.may_shorten,
+            "may_lengthen": t.may_lengthen,
             "conflicts": [
                 by_id[other].name for other in conflicts.get(t.id, []) if other in by_id
             ],
         }
         for t in settings.transforms
     ]
+
+
+# ---------------------------------------------------------------------------
+# Activation bindings: the dictation hotkey, the voice-command hotkey, and
+# hands-free dictation. Each may be bound to a held key (KNOWN_KEYS) and/or
+# an alternate chord (parse_chord). Handled together, rather than through
+# _SIMPLE_FIELDS, because the three must be checked pairwise for a
+# collision before any of them is written -- two hold-shaped listeners on
+# one physical key is genuinely broken (both fire on every press).
+# ---------------------------------------------------------------------------
+
+#: The three configurable activation bindings, and the Settings field pair
+#: (hold-key field, chord field) each one owns.
+ACTIVATION_BINDINGS: dict[str, tuple[str, str]] = {
+    "dictation": ("hotkey", "hotkey_chord"),
+    "command": ("command_hotkey", "command_hotkey_chord"),
+    "hands_free": ("hands_free_key", "hands_free_chord"),
+}
+
+_ACTIVATION_LABELS = {
+    "dictation": "the dictation hotkey",
+    "command": "the voice-command hotkey",
+    "hands_free": "hands-free dictation",
+}
+
+
+def _effective_hold_bindings(
+    settings: Settings, effective: Mapping[str, Any] | None
+) -> dict[str, str]:
+    """Every hold-key binding actually in force right now, target -> key name.
+
+    A binding not overridden in ``settings`` falls back to ``effective``
+    (the engine's :meth:`~sway.engine.Engine.describe`, which already knows
+    config.toml's defaults) when one is supplied. Without it -- a bare
+    ``store`` with no engine attached, as in a unit test -- only what
+    ``settings`` itself already holds is checked; that is a smaller but
+    still useful check, and the authoritative backstop is
+    ``sway.config._validate`` on the engine's merged config, which always
+    runs before a binding takes live effect regardless of what this
+    function could see.
+    """
+    effective = effective or {}
+    resolved: dict[str, str] = {}
+    for target, (key_field, _chord_field) in ACTIVATION_BINDINGS.items():
+        value = getattr(settings, key_field, None)
+        if value is None:
+            value = effective.get(key_field)
+        if value is not None:
+            resolved[target] = value
+    return resolved
+
+
+def _effective_chord_bindings(
+    settings: Settings, effective: Mapping[str, Any] | None
+) -> dict[str, str]:
+    effective = effective or {}
+    resolved: dict[str, str] = {}
+    for target, (_key_field, chord_field) in ACTIVATION_BINDINGS.items():
+        value = getattr(settings, chord_field, None)
+        if value is None:
+            value = effective.get(chord_field)
+        if value is not None:
+            resolved[target] = value
+    return resolved
+
+
+def save_activation_binding(
+    store: SettingsStore,
+    payload: Mapping[str, Any],
+    *,
+    effective: Mapping[str, Any] | None = None,
+) -> Settings:
+    """Set one activation binding's held key and/or alternate chord.
+
+    ``payload``: ``{"target": "dictation"|"command"|"hands_free", "key":
+    ... | None, "chord": ... | None}``. Either or both of ``key``/``chord``
+    may be present; an absent one is left untouched (matching
+    :func:`update_settings`'s partial-save contract), and an explicit
+    ``None`` (or ``""``) clears that half of the binding back to config's
+    default.
+    """
+    target = payload.get("target")
+    if target not in ACTIVATION_BINDINGS:
+        raise ActionError(f"unknown activation target: {target!r}")
+    key_field, chord_field = ACTIVATION_BINDINGS[target]
+
+    current = store.get()
+    changes: dict[str, Any] = {}
+    if "key" in payload:
+        changes[key_field] = _optional_key(payload, "key")
+    if "chord" in payload:
+        changes[chord_field] = _optional_chord(payload, "chord")
+
+    if not changes:
+        return current
+    candidate = replace(current, **changes)
+
+    hold_bindings = _effective_hold_bindings(candidate, effective)
+    this_key = hold_bindings.get(target)
+    if this_key is not None:
+        for other_target, other_key in hold_bindings.items():
+            if other_target != target and other_key == this_key:
+                raise ActionError(
+                    f"that key is already {_ACTIVATION_LABELS[other_target]} -- pick a different one"
+                )
+
+    chord_bindings = _effective_chord_bindings(candidate, effective)
+    this_chord = chord_bindings.get(target)
+    if this_chord is not None:
+        for other_target, other_chord in chord_bindings.items():
+            if other_target != target and other_chord == this_chord:
+                raise ActionError(
+                    f"that shortcut is already {_ACTIVATION_LABELS[other_target]} -- pick a different one"
+                )
+
+    try:
+        return store.update(**changes)
+    except SettingsWriteError as exc:
+        raise ActionError(str(exc)) from exc
+
+
+def reset_activation_binding(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
+    """Clear one binding's override(s) back to config's default."""
+    target = payload.get("target")
+    if target not in ACTIVATION_BINDINGS:
+        raise ActionError(f"unknown activation target: {target!r}")
+    key_field, chord_field = ACTIVATION_BINDINGS[target]
+    try:
+        return store.update(**{key_field: None, chord_field: None})
+    except SettingsWriteError as exc:
+        raise ActionError(str(exc)) from exc
+
+
+def activation_view(
+    settings: Settings, effective: Mapping[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Every activation binding's current effective state, shaped for the UI."""
+    effective = effective or {}
+    hold_bindings = _effective_hold_bindings(settings, effective)
+    chord_bindings = _effective_chord_bindings(settings, effective)
+    hold_conflicts = find_binding_conflicts(hold_bindings)
+    chord_conflicts = find_binding_conflicts(chord_bindings)
+
+    view: dict[str, dict[str, Any]] = {}
+    for target, (key_field, chord_field) in ACTIVATION_BINDINGS.items():
+        key = hold_bindings.get(target)
+        chord = chord_bindings.get(target)
+        conflicts = [
+            _ACTIVATION_LABELS[other]
+            for other in (*hold_conflicts.get(target, []), *chord_conflicts.get(target, []))
+        ]
+        view[target] = {
+            "key": key,
+            "key_label": prettify_hotkey(key) if key else "",
+            "chord": chord,
+            "chord_label": parse_chord(chord).pretty() if chord else "",
+            "is_default": getattr(settings, key_field) is None and getattr(settings, chord_field) is None,
+            "conflicts": conflicts,
+        }
+    view["hands_free"]["enabled"] = settings.hands_free_enabled
+    view["hands_free"]["double_tap"] = bool(
+        settings.hands_free_double_tap
+        if settings.hands_free_double_tap is not None
+        else effective.get("hands_free_double_tap", False)
+    )
+    return view
 
 
 # ---------------------------------------------------------------------------

@@ -288,7 +288,13 @@ class ChunkStreamer:
     def _emit_chunk(self, now: int) -> None:
         start, end = self._clock.read_range(now)
         self._clock.advance(end)
-        pcm = self._ring.read_since(start)
+        # Bounded by `end`, the right edge the clock just computed. Reading to
+        # the present instead would make the real overlap between consecutive
+        # chunks larger than `overlap_frames`, which is the width
+        # stitch_transcripts is told to search -- and an overlap wider than the
+        # search window is one it cannot find, so the repeated words survive
+        # into the merged transcript.
+        pcm = self._ring.read_since(start, end)
         if not pcm:
             return
         try:

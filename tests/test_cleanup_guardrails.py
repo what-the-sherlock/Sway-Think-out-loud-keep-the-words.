@@ -13,6 +13,9 @@ import pytest
 
 from sway.cleanup import (
     CLEANUP_SYSTEM_PROMPT,
+    NO_EXPECTATION,
+    SPOKEN_COMMAND_EXPECTATION,
+    OutputExpectation,
     has_filler_markers,
     is_cleanup_output_safe,
     normalize_cleanup_output,
@@ -21,6 +24,7 @@ from sway.cleanup import (
     unsafe_reason,
 )
 from sway.profiles import CleanupStyle
+from sway.transforms import DEFAULT_TRANSFORMS, Transform, by_id, expectation_for
 
 # Hindi fixtures, spelled out so the file stays readable in any editor.
 HI_TOMORROW_TEN = "कल सुबह दस बजे ठीक रहेगा"
@@ -361,3 +365,169 @@ def test_the_correction_directive_teaches_the_negative_cases():
     prompt = system_prompt_for_style(CleanupStyle.CASUAL, correction=True)
     assert prompt.count("I don't want to go, actually.") == 2
     assert prompt.count("We shipped Monday and, actually, Tuesday as well.") == 2
+
+
+# -- transform-aware guardrails ---------------------------------------------
+# The failure these catch was observed end-to-end and is in the user's own log:
+#
+#   transform(s) fired: Turn into bullet points
+#   cleanup output rejected by the markdown guardrail; pasting the raw
+#   transcript instead
+#
+# The transform matched, the directive reached the model, and the model
+# returned a correct bulleted list -- which the markdown guardrail then threw
+# away, because it had no way to know bullets were the point. Every case below
+# asserts both halves: the output is accepted *with* the transform's
+# expectation, and still rejected without it.
+
+
+def _expect(transform_id: str) -> OutputExpectation:
+    """The shipped expectation for one built-in, by id."""
+    transform = by_id(DEFAULT_TRANSFORMS, transform_id)
+    assert transform is not None, transform_id
+    return expectation_for([transform])
+
+
+# Representative model output for each transform, written the way the shipped
+# instruction actually asks for it.
+GROCERIES = "I want to order groceries like Kurkure, namkeen, potatoes and sugar"
+GROCERIES_BULLETED = "- Kurkure\n- Namkeen\n- Potatoes\n- Sugar"
+
+STANDUP = (
+    "so basically the deploy went out at nine this morning and then the database "
+    "migration finished around ten which took a lot longer than any of us expected "
+    "and then we found the caching bug in the checkout flow and had to roll the "
+    "whole thing back at eleven, and Priya is going to pick it up again tomorrow "
+    "morning and work out whether the invalidation logic is what actually broke it "
+    "or whether it was something in the deploy script itself, anyway that is "
+    "roughly where we have ended up"
+)
+STANDUP_SUMMARY = (
+    "Deploy at nine, migration at ten, and a checkout caching bug forced a "
+    "rollback at eleven. Priya picks it up tomorrow."
+)
+
+NOTE = "tell Ali the deck is ready"
+NOTE_AS_EMAIL = (
+    "Hi Ali,\n\nJust a quick note to let you know that the deck is ready whenever "
+    "you want to take a look at it. Do let me know if anything needs "
+    "changing.\n\nBest regards"
+)
+
+
+@pytest.mark.parametrize(
+    "transform_id, original, cleaned",
+    [
+        ("bullets", GROCERIES, GROCERIES_BULLETED),
+        ("summarize", STANDUP, STANDUP_SUMMARY),
+        ("email", NOTE, NOTE_AS_EMAIL),
+    ],
+)
+def test_a_transform_output_is_accepted_with_its_own_expectation(
+    transform_id: str, original: str, cleaned: str
+):
+    assert unsafe_reason(original, cleaned, expectation=_expect(transform_id)) == ""
+    assert is_cleanup_output_safe(original, cleaned, expectation=_expect(transform_id))
+
+
+@pytest.mark.parametrize(
+    "original, cleaned, reason",
+    [
+        (GROCERIES, GROCERIES_BULLETED, "markdown"),
+        (STANDUP, STANDUP_SUMMARY, "shrank"),
+        (NOTE, NOTE_AS_EMAIL, "grew"),
+    ],
+)
+def test_the_same_output_is_still_rejected_with_no_transform(
+    original: str, cleaned: str, reason: str
+):
+    """The relaxation must be scoped to a fired transform. Plain dictation
+    cleanup has no business inventing bullets or summarizing, and this is what
+    proves the fix did not simply switch the guardrails off."""
+    assert unsafe_reason(original, cleaned) == reason
+    assert not is_cleanup_output_safe(original, cleaned)
+
+
+def test_an_expectation_never_relaxes_the_entity_guard():
+    """Losing a number is wrong under every instruction. This is the guard that
+    stops a transform being a licence to drop what the speaker actually said."""
+    original = "order 6 packets of namkeen and 2 kilos of sugar"
+    dropped = "- Namkeen\n- Sugar"
+    reason = unsafe_reason(original, dropped, expectation=_expect("bullets"))
+    assert reason.startswith("lost_entity:")
+
+
+def test_an_expectation_never_relaxes_the_assistant_voice_guard():
+    original = GROCERIES
+    chatty = "Sure! Here are your groceries:\n- Kurkure\n- Namkeen"
+    assert unsafe_reason(original, chatty, expectation=_expect("bullets")) == "assistant_voice"
+
+
+def test_an_expectation_never_relaxes_the_language_guard():
+    """A Hindi dictation turned into a bulleted English list is a translation,
+    not a transform."""
+    original = HI_TOMORROW_TEN
+    translated = "- Tomorrow at ten in the morning works"
+    assert (
+        unsafe_reason(original, translated, expectation=_expect("bullets"))
+        == "language_changed"
+    )
+
+
+def test_expectations_merge_permissively_across_fired_transforms():
+    """Two phrases in one utterance are two things the user asked for, so both
+    relaxations apply -- "summarize that, make that bullet points" is entitled
+    to shrink *and* to contain bullets."""
+    merged = expectation_for(
+        [by_id(DEFAULT_TRANSFORMS, "summarize"), by_id(DEFAULT_TRANSFORMS, "email")]
+    )
+    assert merged.allows_markdown is False
+    assert merged.may_shorten is True
+    assert merged.may_lengthen is True
+
+
+def test_no_fired_transform_is_the_full_strength_default():
+    assert expectation_for([]) is NO_EXPECTATION
+
+
+def test_a_transform_with_no_declared_expectation_keeps_strict_guardrails():
+    """A custom transform the user wrote says nothing about its output, so it
+    is checked exactly as plain dictation is."""
+    custom = Transform(id="mine", name="Mine", instruction="Do a thing", enabled=True)
+    assert expectation_for([custom]) == NO_EXPECTATION
+    assert unsafe_reason(GROCERIES, GROCERIES_BULLETED, expectation=expectation_for([custom])) == "markdown"
+
+
+def test_polish_does_not_quietly_gain_permission_to_restructure():
+    """Only the transforms whose instruction demands it are relaxed. Polish
+    tidies wording, so bullets from Polish are still the model going
+    off-script."""
+    assert _expect("polish") == NO_EXPECTATION
+    assert unsafe_reason(GROCERIES, GROCERIES_BULLETED, expectation=_expect("polish")) == "markdown"
+
+
+def test_a_spoken_command_may_restructure_a_selection():
+    """The speaker stated an instruction over text they selected, so the
+    shape-based checks are relaxed -- but not the entity guard."""
+    assert unsafe_reason(GROCERIES, GROCERIES_BULLETED, expectation=SPOKEN_COMMAND_EXPECTATION) == ""
+    assert (
+        unsafe_reason(
+            "order 6 packets", "- packets", expectation=SPOKEN_COMMAND_EXPECTATION
+        )
+        == "lost_entity:6"
+    )
+
+
+def test_is_safe_and_unsafe_reason_cannot_disagree():
+    """They were parallel implementations of the same rules; a rejection whose
+    reason came back "" would log a fallback with no cause."""
+    cases = [
+        (GROCERIES, GROCERIES_BULLETED, NO_EXPECTATION),
+        (GROCERIES, GROCERIES_BULLETED, _expect("bullets")),
+        (STANDUP, STANDUP_SUMMARY, _expect("summarize")),
+        (NOTE, NOTE_AS_EMAIL, NO_EXPECTATION),
+        (GROCERIES, "", NO_EXPECTATION),
+    ]
+    for original, cleaned, expectation in cases:
+        reason = unsafe_reason(original, cleaned, expectation=expectation)
+        assert is_cleanup_output_safe(original, cleaned, expectation=expectation) == (reason == "")

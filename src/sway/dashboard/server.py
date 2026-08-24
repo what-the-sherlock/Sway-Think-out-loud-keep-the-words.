@@ -117,6 +117,15 @@ class EngineControl:
     #: that the mic and the hook work rather than being told they do.
     input_level: Callable[[], int] | None = None
     hotkey_down: Callable[[], bool] | None = None
+    #: Whether each *other* configurable activation binding is physically
+    #: held right now, keyed "command"/"dictation_chord"/"command_chord" --
+    #: the same live-preview purpose as hotkey_down, generalised for the
+    #: Shortcuts settings surface (Phase 6) once more than one binding is
+    #: user-visible at a time.
+    bindings_down: Callable[[], dict[str, bool]] | None = None
+    #: Whether a hands-free (tap to start/stop) dictation session is
+    #: currently in progress.
+    hands_free_active: Callable[[], bool] | None = None
 
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -350,6 +359,7 @@ class DashboardServer:
             payload["settings"] = settings_to_dict(settings)
             payload["triggers"] = actions.trigger_view(settings)
             payload["transforms"] = actions.transform_view(settings)
+            payload["activation"] = actions.activation_view(settings, engine)
             payload["app_rules"] = [
                 {"process": r.process, "style": r.style} for r in settings.app_rules
             ]
@@ -438,6 +448,8 @@ class DashboardServer:
             "today": date.today().isoformat(),
             "level": _safe_call(self._control.input_level, 0),
             "hotkey_down": _safe_call(self._control.hotkey_down, False),
+            "bindings_down": _safe_call(self._control.bindings_down, {}),
+            "hands_free_active": _safe_call(self._control.hands_free_active, False),
             "last_error": _safe_call(self._control.last_error, None),
         }
 
@@ -482,6 +494,16 @@ class DashboardServer:
             return self.settings_payload()
         if path == "/api/transforms/reset":
             actions.reset_transforms(self._require_settings())
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/shortcuts/save":
+            actions.save_activation_binding(
+                self._require_settings(), payload, effective=_safe_call(self._control.describe, {})
+            )
+            self._notify_settings_changed()
+            return self.settings_payload()
+        if path == "/api/shortcuts/reset":
+            actions.reset_activation_binding(self._require_settings(), payload)
             self._notify_settings_changed()
             return self.settings_payload()
         if path == "/api/app-rules/save":

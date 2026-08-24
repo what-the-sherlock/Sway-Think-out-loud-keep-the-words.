@@ -21,6 +21,7 @@ import logging
 import re
 import threading
 import unicodedata
+from dataclasses import dataclass
 
 from sway.profiles import CleanupStyle
 
@@ -247,6 +248,36 @@ def should_skip_cleanup(text: str, *, language: str | None = None, min_words: in
     return word_count(text) < min_words and not has_filler_markers(text, language=language)
 
 
+#: Below this many milliseconds of speech per word, the audio physically
+#: could not have contained what Whisper transcribed -- even sustained,
+#: unusually fast speech rarely exceeds ~500 words per minute (120ms/word).
+#: Below the floor, the far likelier explanation is the well-documented
+#: Whisper failure mode of hallucinating fluent, confident-sounding text
+#: (famously "Thank you for watching!", or a personal-dictionary proper
+#: noun, see flow.dictionary) over near-silent or noise-only audio -- a
+#: failure mode that does not reliably show up in avg_logprob/no_speech_prob
+#: (see flow.groq_client.TranscriptionResult.confident): the model is not
+#: *unsure* about a hallucination, it is confidently wrong.
+MIN_MS_PER_WORD = 120.0
+
+
+def looks_hallucinated(text: str, *, speech_ms: float | None) -> bool:
+    """Whether ``text`` is implausible for how little speech it came from.
+
+    ``speech_ms`` is the VAD-trimmed duration the transcript was decoded
+    from. ``None`` means it was never measured on this particular path (the
+    streamed-chunk merge does not track it -- see the comment at its return
+    site), and this returns ``False`` rather than guessing at a duration
+    that was never captured.
+    """
+    if speech_ms is None or speech_ms <= 0:
+        return False
+    words = word_count(text)
+    if words == 0:
+        return False
+    return speech_ms < words * MIN_MS_PER_WORD
+
+
 # ---------------------------------------------------------------------------
 # Output normalization: undo the small, harmless ways a model ignores "reply
 # with only the text". Done before the safety checks so a good rewrite behind
@@ -311,6 +342,99 @@ _CORRECTION_MIN_LENGTH_RATIO = 0.2
 #: little (capitalization, punctuation, expanding "don't"), but turning a
 #: couple of words into a paragraph means it answered rather than rewrote.
 _MAX_ABSOLUTE_WORD_GROWTH = 6
+
+
+#: The floor when a fired transform is *expected* to remove content. "Summarize
+#: in at most three sentences" applied to a two-minute dictation legitimately
+#: lands near a tenth of the original, which the ordinary floor rejects as the
+#: model having summarized something it was only asked to tidy. Still a floor
+#: and not an absence of one: a rewrite that returns almost nothing is a
+#: failure under any instruction.
+_SHORTENING_MIN_LENGTH_RATIO = 0.1
+#: The ceiling when a fired transform is expected to *add* scaffolding.
+_LENGTHENING_MAX_LENGTH_RATIO = 4.0
+#: ...and the absolute allowance that goes with it. Scaffolding is roughly a
+#: *fixed* cost, not a proportional one: a greeting, a line of politeness and a
+#: sign-off is about the same forty words whether the note underneath is six
+#: words or six hundred. A ratio alone therefore gets short input badly wrong --
+#: "tell Ali the deck is ready" legitimately becomes a 34-word email, a ratio of
+#: 5.7 that no sane proportional ceiling would admit -- so under this
+#: expectation a rewrite passes if it is within *either* bound.
+_LENGTHENING_ABSOLUTE_WORD_GROWTH = 60
+
+
+@dataclass(frozen=True, slots=True)
+class OutputExpectation:
+    """What a rewrite is *allowed* to do, so a guardrail can tell a correct
+    result apart from a model going off-script.
+
+    Plain dictation cleanup uses :data:`NO_EXPECTATION` -- every guardrail at
+    full strength, which is the behaviour this module shipped with. A fired
+    transform supplies its own (see :func:`sway.transforms.expectation_for`),
+    relaxing only the specific check its instruction is bound to trip.
+
+    What is deliberately *not* here: any relaxation of the entity guard, the
+    assistant-voice check, the language check, or the answered-a-question
+    check. Those catch the model doing something no instruction asked for, so
+    no instruction may switch them off. Dropping a number is wrong even when
+    the user asked for bullet points.
+    """
+
+    #: The instruction asks for a list, heading, or other markdown structure.
+    allows_markdown: bool = False
+    #: The instruction is expected to remove content.
+    may_shorten: bool = False
+    #: The instruction is expected to add scaffolding.
+    may_lengthen: bool = False
+
+    def min_ratio(self, *, correction_detected: bool) -> float:
+        if self.may_shorten:
+            return _SHORTENING_MIN_LENGTH_RATIO
+        return _CORRECTION_MIN_LENGTH_RATIO if correction_detected else _MIN_LENGTH_RATIO
+
+    def max_ratio(self) -> float:
+        return _LENGTHENING_MAX_LENGTH_RATIO if self.may_lengthen else _MAX_LENGTH_RATIO
+
+    def absolute_word_growth(self) -> int:
+        return (
+            _LENGTHENING_ABSOLUTE_WORD_GROWTH
+            if self.may_lengthen
+            else _MAX_ABSOLUTE_WORD_GROWTH
+        )
+
+    def grew_too_much(self, *, original_words: int, cleaned_words: int) -> bool:
+        """Whether this much growth is more than the instruction can explain.
+
+        Two bounds, and under :attr:`may_lengthen` clearing *either* is enough:
+        proportional growth catches a long text being padded out, absolute
+        growth allows the fixed cost of scaffolding on a short one. Without the
+        second, every short note turned into an email is rejected; without the
+        first, a long dictation could be quadrupled unnoticed.
+        """
+        within_absolute = cleaned_words <= original_words + self.absolute_word_growth()
+        if original_words < _RATIO_GUARD_MIN_WORDS:
+            return not within_absolute
+        within_ratio = cleaned_words / original_words <= self.max_ratio()
+        if self.may_lengthen:
+            return not (within_ratio or within_absolute)
+        return not within_ratio
+
+
+#: The full-strength guardrails: what plain dictation cleanup is checked
+#: against, and the default everywhere, so a caller that passes nothing gets
+#: exactly the behaviour that shipped.
+NO_EXPECTATION = OutputExpectation()
+
+#: What a *spoken* voice command is checked against. The speaker stated an
+#: arbitrary instruction over text they had selected, which is the clearest
+#: "I asked for this" the app ever gets, and the instruction is unknowable in
+#: advance -- so every shape-based check is relaxed. The guards that catch the
+#: model doing what nobody asked for (lost entities, assistant voice, a
+#: question answered rather than rewritten) stay fully armed, and those are the
+#: ones that protect the selection from being overwritten with rubbish.
+SPOKEN_COMMAND_EXPECTATION = OutputExpectation(
+    allows_markdown=True, may_shorten=True, may_lengthen=True
+)
 
 #: Structures a dictation-cleanup rewrite has no business inventing. Checked
 #: only when the raw transcript did not already contain them, so dictating
@@ -451,6 +575,7 @@ def is_cleanup_output_safe(
     *,
     retracted: str = "",
     correction_detected: bool = False,
+    expectation: OutputExpectation = NO_EXPECTATION,
 ) -> bool:
     """Whether a cleanup rewrite may be pasted, or must be discarded in favor
     of the raw transcript.
@@ -480,42 +605,23 @@ def is_cleanup_output_safe(
 
     ``correction_detected`` additionally lowers the shrink floor, since a
     retraction legitimately removes more text than a tidy-up does.
+
+    ``expectation`` is what a fired transform asked the model to do (see
+    :class:`OutputExpectation`). It relaxes only the checks that instruction is
+    bound to trip -- a bulleted rewrite is allowed to contain bullets -- and
+    never the checks that catch the model going off-script.
+
+    Defined as the negation of :func:`unsafe_reason` rather than as a second
+    copy of the rules: the two used to be parallel implementations, and a
+    rejection whose reason came back ``""`` would log a fallback with no cause.
     """
-    text = cleaned.strip()
-    if not text:
-        return False
-
-    original_words = word_count(original)
-    cleaned_words = word_count(text)
-    floor = _CORRECTION_MIN_LENGTH_RATIO if correction_detected else _MIN_LENGTH_RATIO
-    if original_words < _RATIO_GUARD_MIN_WORDS:
-        if cleaned_words > original_words + _MAX_ABSOLUTE_WORD_GROWTH:
-            return False
-    else:
-        ratio = cleaned_words / original_words
-        if not floor <= ratio <= _MAX_LENGTH_RATIO:
-            return False
-
-    if _ASSISTANT_VOICE_PATTERN.match(text) and not _ASSISTANT_VOICE_PATTERN.match(original.strip()):
-        return False
-
-    for pattern in _MARKDOWN_PATTERNS:
-        if pattern.search(text) and not pattern.search(original):
-            return False
-
-    # The speaker asked something and the rewrite is no longer question-
-    # shaped: the model answered it instead of tidying it.
-    if _answered_instead_of_rewriting(original, text):
-        return False
-
-    # A script present in the speech but absent from the rewrite means the
-    # model translated it away. The reverse (a new script appearing) is left
-    # alone: that is usually just a quotation mark or symbol classified oddly.
-    if _scripts(original) - _scripts(text):
-        return False
-
-    missing = _protected_entities(original) - _protected_entities(text) - _protected_entities(retracted)
-    return not missing
+    return not unsafe_reason(
+        original,
+        cleaned,
+        retracted=retracted,
+        correction_detected=correction_detected,
+        expectation=expectation,
+    )
 
 
 def unsafe_reason(
@@ -524,39 +630,51 @@ def unsafe_reason(
     *,
     retracted: str = "",
     correction_detected: bool = False,
+    expectation: OutputExpectation = NO_EXPECTATION,
 ) -> str:
-    """A short label for *why* :func:`is_cleanup_output_safe` rejected a
-    rewrite, for the latency record and the log line. Returns ``""`` when the
-    rewrite is in fact safe.
+    """A short label for *why* a rewrite must be rejected, for the latency
+    record and the log line. Returns ``""`` when the rewrite is safe.
 
-    Takes the same correction context as :func:`is_cleanup_output_safe` and
-    must be kept in step with it: a reason of ``""`` for a rewrite the check
-    rejected would log a rejection with no cause.
+    The single source of truth for both this and
+    :func:`is_cleanup_output_safe`; see that function for what each rule is
+    for and for what ``expectation`` may and may not relax.
     """
     text = cleaned.strip()
     if not text:
         return "empty"
+
     original_words = word_count(original)
     cleaned_words = word_count(text)
-    floor = _CORRECTION_MIN_LENGTH_RATIO if correction_detected else _MIN_LENGTH_RATIO
-    if original_words < _RATIO_GUARD_MIN_WORDS:
-        if cleaned_words > original_words + _MAX_ABSOLUTE_WORD_GROWTH:
-            return "grew"
-    else:
-        ratio = cleaned_words / original_words
-        if ratio < floor:
-            return "shrank"
-        if ratio > _MAX_LENGTH_RATIO:
-            return "grew"
+    if (
+        original_words >= _RATIO_GUARD_MIN_WORDS
+        and cleaned_words / original_words
+        < expectation.min_ratio(correction_detected=correction_detected)
+    ):
+        return "shrank"
+    if expectation.grew_too_much(original_words=original_words, cleaned_words=cleaned_words):
+        return "grew"
+
     if _ASSISTANT_VOICE_PATTERN.match(text) and not _ASSISTANT_VOICE_PATTERN.match(original.strip()):
         return "assistant_voice"
-    for pattern in _MARKDOWN_PATTERNS:
-        if pattern.search(text) and not pattern.search(original):
-            return "markdown"
+
+    # A transform that asks for a list is asking for exactly what this check
+    # otherwise treats as the model inventing structure.
+    if not expectation.allows_markdown:
+        for pattern in _MARKDOWN_PATTERNS:
+            if pattern.search(text) and not pattern.search(original):
+                return "markdown"
+
+    # The speaker asked something and the rewrite is no longer question-
+    # shaped: the model answered it instead of tidying it.
     if _answered_instead_of_rewriting(original, text):
         return "answered_question"
+
+    # A script present in the speech but absent from the rewrite means the
+    # model translated it away. The reverse (a new script appearing) is left
+    # alone: that is usually just a quotation mark or symbol classified oddly.
     if _scripts(original) - _scripts(text):
         return "language_changed"
+
     missing = _protected_entities(original) - _protected_entities(text) - _protected_entities(retracted)
     if missing:
         return f"lost_entity:{sorted(missing)[0][:32]}"
@@ -620,9 +738,14 @@ __all__ = [
     "CORRECTION_DIRECTIVE",
     "KEEP_FILLERS_DIRECTIVE",
     "FORMAL_CLEANUP_SYSTEM_PROMPT",
+    "MIN_MS_PER_WORD",
     "CleanupStats",
+    "NO_EXPECTATION",
+    "SPOKEN_COMMAND_EXPECTATION",
+    "OutputExpectation",
     "has_filler_markers",
     "is_cleanup_output_safe",
+    "looks_hallucinated",
     "normalize_cleanup_output",
     "should_skip_cleanup",
     "system_prompt_for_style",

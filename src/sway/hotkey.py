@@ -61,6 +61,107 @@ class KeyHoldTracker:
         return True
 
 
+class TapModeTracker:
+    """Pure state machine for a tap-to-start/tap-to-stop (toggle) binding.
+
+    No pynput, no threads, no ``time.monotonic()`` calls of its own -- the
+    caller passes ``now``, so this is trivially testable and reused for both
+    hands-free dictation and a chord-shaped alternate binding for dictation
+    or the voice command (a chord fires once per tap, so it is honestly a
+    toggle gesture rather than a hold, unlike the primary key).
+    """
+
+    __slots__ = ("_active", "_max_active_s", "_started_at")
+
+    def __init__(self, *, max_active_s: float) -> None:
+        self._active = False
+        self._started_at: float | None = None
+        self._max_active_s = max_active_s
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def tap(self, now: float) -> str:
+        """Advance the state machine on one tap.
+
+        Returns ``"start"`` (a session just began), ``"stop"`` (a session
+        just ended normally), or ``"stop_timeout"`` (this tap arrived after
+        the active session had already run past ``max_active_s`` -- the
+        caller treats that session as force-closed rather than starting a
+        new one on the same tap; a genuinely new session needs its own,
+        separate tap).
+        """
+        if self._active and self._started_at is not None and now - self._started_at > self._max_active_s:
+            self._active = False
+            self._started_at = None
+            return "stop_timeout"
+        if self._active:
+            self._active = False
+            self._started_at = None
+            return "stop"
+        self._active = True
+        self._started_at = now
+        return "start"
+
+    def check_timeout(self, now: float) -> bool:
+        """Force-close a session that has run past ``max_active_s``.
+
+        Called by a periodic safety timer, not just from ``tap()`` -- a
+        session must not be able to run forever if the stop tap is
+        physically missed. Returns whether a session was just force-closed;
+        idempotent (a second call after that returns ``False``).
+        """
+        if self._active and self._started_at is not None and now - self._started_at > self._max_active_s:
+            self._active = False
+            self._started_at = None
+            return True
+        return False
+
+
+class DoubleTapTracker:
+    """Pure logic: two taps of the same binding within ``window_s`` toggle a
+    session; a lone tap with nothing following it within the window does
+    nothing and is not itself treated as an activation.
+
+    Composes :class:`TapModeTracker` for the actual start/stop/timeout
+    bookkeeping rather than duplicating it -- double-tap only changes *how*
+    a qualifying tap is recognised, not what happens once it is.
+    """
+
+    __slots__ = ("_last_tap_at", "_mode", "_window_s")
+
+    def __init__(self, *, max_active_s: float, window_s: float = 0.35) -> None:
+        self._mode = TapModeTracker(max_active_s=max_active_s)
+        self._window_s = window_s
+        self._last_tap_at: float | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._mode.active
+
+    def tap(self, now: float) -> str | None:
+        """Register one physical tap.
+
+        Returns the underlying :meth:`TapModeTracker.tap` outcome on a
+        *qualifying* second tap (one that lands within ``window_s`` of the
+        previous tap), or ``None`` otherwise -- a lone tap, or a second tap
+        that arrived too late and is instead treated as a fresh potential
+        first tap (recorded via ``_last_tap_at``, never silently dropped).
+        """
+        previous = self._last_tap_at
+        self._last_tap_at = now
+        if previous is None or (now - previous) > self._window_s:
+            return None
+        # A qualifying pair: consume it so a third, unrelated tap does not
+        # pair with this one again.
+        self._last_tap_at = None
+        return self._mode.tap(now)
+
+    def check_timeout(self, now: float) -> bool:
+        return self._mode.check_timeout(now)
+
+
 class HotkeyListener:
     """Wraps a pynput global listener around a single held key."""
 
@@ -83,6 +184,12 @@ class HotkeyListener:
 
     def start(self) -> None:
         if self._listener is not None:
+            # Not merely redundant: a second pynput hook on the same callbacks
+            # would deliver every press and release *twice*, and nothing
+            # downstream could tell the copies apart. Logged rather than
+            # silently returned, because reaching here means some stop/start
+            # pairing is wrong.
+            logger.warning("hotkey listener is already running; not starting a second hook")
             return
         self._listener = keyboard.Listener(
             on_press=self._handle_press, on_release=self._handle_release
@@ -90,10 +197,40 @@ class HotkeyListener:
         self._listener.start()
 
     def stop(self) -> None:
+        """Tear the OS hook down, and wait for it to actually be down.
+
+        The join matters. ``pynput``'s ``stop()`` only asks the listener
+        thread to finish, so without waiting, a ``stop()`` immediately
+        followed by a ``start()`` -- which is what a settings change does --
+        can leave the outgoing hook still delivering events to the same
+        callbacks while the incoming one delivers them too. Every keypress is
+        then handled twice for the rest of the session.
+
+        Bounded, because shutdown must not hang on a wedged OS hook: a hook
+        that will not come down in a second is not going to, and the activation
+        ledger is what protects correctness if one somehow lingers.
+        """
         if self._listener is None:
             return
         listener, self._listener = self._listener, None
         listener.stop()
+        try:
+            listener.join(timeout=1.0)
+        except RuntimeError:  # never started; nothing to wait for
+            pass
+
+    def rebind(self, key: keyboard.Key) -> None:
+        """Swap the bound key without tearing down the OS hook.
+
+        Mirrors :meth:`ChordListener.rebind` -- same reasoning: recreating
+        the pynput hook on Windows can drop keystrokes in the gap. The
+        tracker is reset rather than carried over: a hold in flight under
+        the old key must not straddle the swap, or a stale ``_held = True``
+        would either eat the next legitimate press on the new key or never
+        fire release for the old one.
+        """
+        self._key = key
+        self._tracker = KeyHoldTracker()
 
     def _handle_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
         if key != self._key or not self._tracker.press():
@@ -171,6 +308,30 @@ CHORD_KEYS: dict[str, keyboard.Key] = {
 }
 
 
+#: Chords that must never be bindable, and why. Checked by both
+#: :func:`parse_chord` (server-side) and its client-side mirror in the
+#: dashboard, so a rejection happens before the round trip either way.
+#:
+#: ctrl+c / ctrl+v / ctrl+x are Sway's own internal keystrokes -- selection
+#: capture sends a synthetic Ctrl+C (see flow.selection) and paste injection
+#: sends a synthetic Ctrl+V. Binding either as an activation chord would mean
+#: Sway's own clipboard round-trip could re-trigger the very shortcut it is
+#: mid-flight on.
+#:
+#: ctrl+alt+delete is trapped by the OS below any user-mode hook and pynput
+#: never sees it; cmd+l is Windows' lock-screen shortcut and fires
+#: regardless of what else is bound to it. Both are listed anyway so the
+#: rejection message is specific rather than the shortcut silently never
+#: firing.
+_RESERVED_CHORDS: dict[str, str] = {
+    "ctrl+c": "used internally to read a selection -- pick something else",
+    "ctrl+v": "used internally to paste -- pick something else",
+    "ctrl+x": "used internally to read a selection -- pick something else",
+    "ctrl+alt+delete": "reserved by Windows and can't be used here",
+    "cmd+l": "reserved by Windows (locks the screen) and can't be used here",
+}
+
+
 class ChordError(ValueError):
     """A shortcut string that cannot be bound."""
 
@@ -244,7 +405,11 @@ def parse_chord(shortcut: str) -> Chord:
         raise ChordError("a shortcut needs a key as well as its modifiers")
     if key not in CHORD_KEYS and not (len(key) == 1 and key.isalnum()):
         raise ChordError(f"{key!r} cannot be used as a shortcut key")
-    return Chord(frozenset(modifier_names), key)
+    chord = Chord(frozenset(modifier_names), key)
+    reserved_reason = _RESERVED_CHORDS.get(str(chord))
+    if reserved_reason is not None:
+        raise ChordError(f"{chord.pretty()} is {reserved_reason}")
+    return chord
 
 
 def format_chord(shortcut: str) -> str:
@@ -341,6 +506,26 @@ def _modifier_name(key: object) -> str | None:
     return None
 
 
+def find_binding_conflicts(bindings: dict[str, str]) -> dict[str, list[str]]:
+    """Map binding id -> ids of other bindings on the exact same key/chord.
+
+    ``bindings`` is e.g. ``{"dictation": "ctrl_r", "command": "shift_r",
+    "hands_free": "ctrl+alt+space"}`` -- a mix of :data:`KNOWN_KEYS` names
+    (hold bindings) and chord strings is fine: the two namespaces never
+    collide syntactically (a hold-key name has no ``+``, a chord string
+    always does), so a plain string comparison is a correct check across
+    both. Reported symmetrically, matching
+    :func:`sway.transforms.find_shortcut_conflicts`'s contract, so callers
+    can flag every row involved rather than arbitrarily blaming one.
+    """
+    conflicts: dict[str, list[str]] = {}
+    for outer, value in bindings.items():
+        for inner, other in bindings.items():
+            if inner != outer and value == other:
+                conflicts.setdefault(outer, []).append(inner)
+    return conflicts
+
+
 def _key_name(key: object) -> str | None:
     """The chord-key name for a pressed key, or ``None`` if it cannot be one.
 
@@ -364,8 +549,11 @@ __all__ = [
     "Chord",
     "ChordError",
     "ChordListener",
+    "DoubleTapTracker",
     "HotkeyListener",
     "KeyHoldTracker",
+    "TapModeTracker",
+    "find_binding_conflicts",
     "format_chord",
     "parse_chord",
     "prettify_hotkey",

@@ -447,6 +447,15 @@ parsing, key-repeat debouncing, clipboard injection against a fake platform,
 chunk-boundary dedup, voice-command message building, selection reading against
 a fake platform, the history store — not the audio callback or the pynput/Tk/
 pystray listener wiring themselves.
+
+## Credits
+
+The floating bar's activity orb is a Python/Pillow port of
+[Thinking Orbs](https://github.com/Jakubantalik/thinking-orbs) by Jakub
+Antalik, used under the MIT licence and verified against the golden
+vectors that project publishes for native ports. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full notice and
+the list of modifications.
 #   S w a y - - - T h i n k - o u t - l o u d - k e e p - t h e - w o r d s . 
  
  

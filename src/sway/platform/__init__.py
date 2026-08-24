@@ -105,6 +105,15 @@ class PlatformAdapter(Protocol):
         here means dictation silently stops working, which is worse than an
         occasional paste that fails anyway."""
 
+    def animations_enabled(self) -> bool:
+        """Whether the OS wants interface animation at all.
+
+        The desktop equivalent of the web's ``prefers-reduced-motion``: the
+        overlay's orb reads this and holds a single frame when it is False.
+        Fails *open* (``True``) whenever the setting cannot be read -- an
+        unreadable preference must not silently freeze the one part of the
+        bar that tells the user it is still working."""
+
 
 @lru_cache(maxsize=1)
 def get_platform() -> PlatformAdapter:

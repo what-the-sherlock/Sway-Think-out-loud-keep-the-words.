@@ -111,6 +111,58 @@ class TestSpokenMatching:
         result = apply_triggers("Tidy this up, polish that", as_matchable(_on("polish")))
         assert [h.trigger_id for h in result.hits] == ["polish"]
 
+    # -- the reported case ---------------------------------------------
+    # "I want to order groceries like Kurkure, namkeen, potatoes, sugar, make
+    # that bullet points." The transform was enabled, the user got no bullets,
+    # and the phrase was reported as not being detected at all. It *was*
+    # detected -- these pin that down so a future change to _may_fire_here
+    # cannot quietly move the goalposts under the same sentence.
+
+    @pytest.mark.parametrize(
+        "transform_id, text",
+        [
+            (
+                "bullets",
+                "I want to order groceries like Kurkure, namkeen, potatoes, "
+                "sugar, make that bullet points.",
+            ),
+            ("concise", "Let the team know the release slipped, make that concise."),
+            ("grammar", "we was going to ship it on friday, fix the grammar"),
+            ("summarize", "Here is everything that happened on the deploy. Summarize that."),
+            ("email", "tell Ali the deck is ready, make that an email"),
+            ("professional", "tell them it is not happening, make that professional"),
+            ("casual", "The engagement is hereby concluded. Make that casual."),
+            ("clarity", "the thing with the thing did not work, make that clearer"),
+            ("polish", "we shipped it and it went fine, polish that"),
+        ],
+    )
+    def test_a_natural_request_ending_in_a_phrase_fires(
+        self, transform_id: str, text: str
+    ) -> None:
+        """Every shipped transform, invoked the way it is actually spoken: at
+        the end of a real sentence rather than on its own."""
+        result = apply_triggers(text, as_matchable(_on(transform_id)))
+        assert result.fired, transform_id
+        assert [h.trigger_id for h in result.hits] == [transform_id]
+
+    def test_the_phrase_is_excised_from_a_natural_request(self) -> None:
+        result = apply_triggers(
+            "I want to order groceries like Kurkure, namkeen, potatoes, sugar, "
+            "make that bullet points.",
+            as_matchable(_on("bullets")),
+        )
+        assert "bullet points" not in result.text
+        assert "Kurkure" in result.text and "sugar" in result.text
+
+    def test_two_phrases_in_one_utterance_both_fire(self) -> None:
+        """Only the trailing one can fire -- a transform is trailing-only -- so
+        this pins that the *last* phrase wins rather than neither."""
+        result = apply_triggers(
+            "Write up the outage, summarize that",
+            as_matchable(_on("summarize", "bullets")),
+        )
+        assert [h.trigger_id for h in result.hits] == ["summarize"]
+
     def test_excision_does_not_strand_a_comma_against_a_full_stop(self) -> None:
         result = apply_triggers(
             "Tell them the release slipped, make that professional.",

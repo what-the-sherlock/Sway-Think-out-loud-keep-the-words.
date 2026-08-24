@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from sway.audio.ring_buffer import RingBuffer
 from sway.streaming import ChunkClock, max_overlap_words, stitch_transcripts
 
 # -- ChunkClock --------------------------------------------------------------
@@ -169,3 +170,53 @@ def test_max_overlap_words_scales_with_overlap_seconds():
 
 def test_max_overlap_words_has_a_floor_for_tiny_overlaps():
     assert max_overlap_words(0.0) == 3
+
+
+# -- the unbounded chunk read ------------------------------------------------
+# ChunkClock computes a chunk's right edge, but read_since used to ignore it
+# and read to the present moment. Consecutive chunks therefore shared more
+# audio than the schedule intended, while stitch_transcripts is told to search
+# only the *nominal* overlap -- and an overlap wider than the search window is
+# one it cannot find, so the repeated words were appended verbatim.
+
+
+def test_read_since_honours_an_end_bound():
+    ring = RingBuffer(capacity_frames=1000)
+    ring.write(b"\x01\x00" * 100)
+    bounded = ring.read_since(0, 40)
+    assert len(bounded) == 40 * 2
+    assert len(ring.read_since(0)) == 100 * 2
+
+
+def test_read_since_clamps_an_end_bound_past_what_exists():
+    ring = RingBuffer(capacity_frames=1000)
+    ring.write(b"\x01\x00" * 10)
+    assert len(ring.read_since(0, 9999)) == 10 * 2
+
+
+def test_a_chunk_reads_only_its_own_range():
+    """The bug, expressed in frames: two consecutive chunks must overlap by
+    the scheduled amount and no more."""
+    clock = ChunkClock(start_frame=0, chunk_length_frames=100, overlap_frames=20)
+    first_start, first_end = clock.read_range(100)
+    clock.advance(first_end)
+    # Time passes while the next chunk is still pending.
+    second_start, second_end = clock.read_range(260)
+    assert first_end == 100
+    assert second_start == first_end - 20
+    overlap = first_end - second_start
+    assert overlap == 20
+
+
+def test_stitch_cannot_dedup_an_overlap_wider_than_its_window():
+    """Why the bound matters rather than just being tidier. This is the
+    duplication the unbounded read produced: the repeated span is longer than
+    max_overlap_words, so it survives into the merged transcript."""
+    first = "the deploy went out at nine and the migration finished at ten"
+    second = "and the migration finished at ten and Priya will look at it tomorrow"
+    # A window too small to span the six repeated words.
+    merged_narrow = stitch_transcripts([first, second], max_overlap_words=3)
+    assert merged_narrow.count("the migration finished") == 2
+    # A window wide enough finds it and drops it.
+    merged_wide = stitch_transcripts([first, second], max_overlap_words=8)
+    assert merged_wide.count("the migration finished") == 1
