@@ -9,24 +9,48 @@ colour-key contract that makes the rounded shape possible at all.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from sway.bar import (
+    ACTION_COPY,
     ACTION_LANGUAGE,
     ACTION_MENU,
     ACTION_MIC,
+    ACTION_PASTE,
+    ACTION_RESUME,
+    ACTION_SETTINGS,
     DEFAULT_MENU,
     SEPARATOR,
     BarState,
+    HintTone,
     HitRegion,
     MenuItem,
+    build_menu,
+    clamp_to_area,
+    measure_rich,
     menu_height,
+    natural_width,
     place,
+    recovery_for,
     render_bar,
     render_dot,
     render_menu,
+    render_tooltip,
+    rich_segments,
 )
-from sway.bar import _KEY_RGB, _MENU_ROW_H
+from sway.bar import SwayBar
+from sway.bar import (
+    _HEIGHT,
+    _KEY_RGB,
+    _MENU_ROW_H,
+    _REST_H,
+    _REST_PAD,
+    _REST_W,
+    _font,
+    _font_for,
+)
 
 
 def actions(regions):
@@ -68,11 +92,49 @@ def test_place_keeps_the_bar_clear_of_the_taskbar():
 # -- the resting dot -------------------------------------------------------
 
 
-def test_dot_is_small_and_square():
+def test_the_resting_tray_is_small_and_says_nothing():
+    """At rest the bar is an empty outline. A filled shape is a coloured
+    pixel competing for attention all day, and there is nothing at rest worth
+    competing for."""
     image, regions = render_dot()
-    assert image.width == image.height
-    assert image.width <= 30, "the resting state must be easy to ignore"
+    assert image.size == (_REST_W + 2 * _REST_PAD, _REST_H + 2 * _REST_PAD)
+    assert image.height <= 24, "the resting state must be easy to ignore"
     assert actions(regions) == [ACTION_MENU]
+
+
+def test_the_resting_tray_is_see_through():
+    """The whole point of it: the desktop shows through the middle, so the
+    bar is an outline rather than an object sitting on top of things."""
+    image, _ = render_dot()
+    pixels = image.load()
+    centre_row = [
+        pixels[x, image.height // 2][:3]
+        for x in range(image.width // 3, 2 * image.width // 3)
+    ]
+    assert all(pixel == _KEY_RGB for pixel in centre_row), "the tray is not empty"
+
+
+def test_the_resting_tray_still_draws_an_outline():
+    image, _ = render_dot()
+    pixels = image.load()
+    column = [pixels[image.width // 2, y][:3] for y in range(image.height)]
+    assert any(pixel != _KEY_RGB for pixel in column), "no outline at all"
+
+
+def test_the_resting_outline_reads_on_a_light_desktop_and_a_dark_one():
+    """It floats over a desktop we do not control. A single hairline can only
+    contrast with backgrounds it happens to differ from, so the stroke is a
+    dark tone just outside a light one."""
+    image, _ = render_dot()
+    pixels = image.load()
+    column = [
+        pixels[image.width // 2, y][:3]
+        for y in range(image.height)
+        if pixels[image.width // 2, y][:3] != _KEY_RGB
+    ]
+    assert column, "no stroke"
+    assert max(sum(p) for p in column) > 330, "nothing light enough for a dark desktop"
+    assert min(sum(p) for p in column) < 130, "nothing dark enough for a light desktop"
 
 
 def test_dot_is_entirely_clickable():
@@ -217,6 +279,7 @@ def test_the_dot_keys_out_most_of_its_box():
 def test_default_menu_matches_the_intended_shape():
     labels = [item.label for item in DEFAULT_MENU if not item.is_separator]
     assert labels == [
+        "Pause dictation",
         "Hide for 1 hour",
         "Settings",
         "Language",
@@ -228,7 +291,7 @@ def test_default_menu_matches_the_intended_shape():
 
 
 def test_the_menu_is_grouped():
-    """Five verbs in three groups: dismiss/configure, switch, recover."""
+    """Six verbs in three groups: arm/dismiss/configure, switch, recover."""
     assert sum(1 for item in DEFAULT_MENU if item.is_separator) == 2
 
 
@@ -289,3 +352,539 @@ def test_hit_region_contains_is_inclusive_of_its_edges():
     assert region.contains(20, 30)
     assert not region.contains(9, 30)
     assert not region.contains(31, 30)
+
+
+# -- the morph -------------------------------------------------------------
+#
+# The dot and the capsule are one renderer, so the interesting cases are the
+# frames in between: they are what the user actually watches, and they are
+# where a layout written for only the two endpoints falls apart.
+
+
+def test_expand_runs_from_the_resting_tray_to_the_capsule():
+    rest, _ = render_bar(BarState.IDLE, "", expand=0.0)
+    full, _ = render_bar(BarState.IDLE, "", expand=1.0)
+    assert rest.size == (_REST_W + 2 * _REST_PAD, _REST_H + 2 * _REST_PAD)
+    assert full.height == _HEIGHT
+    assert full.width == natural_width(BarState.IDLE, "")
+
+
+def test_render_dot_is_the_collapsed_capsule():
+    """One renderer, so the two names cannot drift apart visually."""
+    named, named_regions = render_dot()
+    collapsed, collapsed_regions = render_bar(BarState.IDLE, "", expand=0.0)
+    assert named.tobytes() == collapsed.tobytes()
+    assert actions(named_regions) == actions(collapsed_regions)
+
+
+@pytest.mark.parametrize("expand", [0.6, 0.75, 0.9, 1.0])
+def test_the_morph_never_punches_a_hole_in_itself(expand):
+    """Once the surface has wiped in, the key colour anywhere inside the body
+    would key out to a transparent slit straight through the bar. Checked
+    across the frames the user watches, not only at the settled end.
+
+    Below ~0.5 the interior is *meant* to be key -- that is the resting tray
+    being see-through -- so those frames are covered by
+    test_the_resting_tray_is_see_through instead."""
+    image, _ = render_bar(BarState.IDLE, "", expand=expand)
+    pixels = image.load()
+    # Strictly inside the rounded body: from the left cap's centre to the
+    # right cap's centre, across the middle third. Everything outside that is
+    # allowed -- and required -- to be key.
+    half = image.height / 2
+    for y in range(round(image.height * 0.35), round(image.height * 0.65) + 1):
+        for x in range(round(half), round(image.width - half) + 1):
+            assert pixels[x, y][:3] != _KEY_RGB, f"hole at {(x, y)}, expand={expand}"
+
+
+@pytest.mark.parametrize("expand", [0.0, 0.3, 0.6, 1.0])
+def test_the_morph_always_keys_out_its_corners(expand):
+    image, _ = render_bar(BarState.IDLE, "", expand=expand)
+    pixels = image.load()
+    assert pixels[0, 0][:3] == _KEY_RGB
+    assert pixels[image.width - 1, image.height - 1][:3] == _KEY_RGB
+
+
+def test_the_capsule_top_is_lighter_than_its_body():
+    """The sheen must *add* light. Drawn with ImageDraw's fill it replaced
+    the opaque surface with a nearly transparent one instead, which showed
+    the desktop through the top half of the bar."""
+    image, _ = render_bar(BarState.IDLE, "")
+    pixels = image.load()
+    x = image.width // 2
+    top = sum(pixels[x, 6][:3])
+    bottom = sum(pixels[x, image.height - 8][:3])
+    assert top > bottom
+
+
+def test_the_morph_grows_monotonically():
+    widths = [render_bar(BarState.IDLE, "", expand=i / 20)[0].width for i in range(21)]
+    heights = [render_bar(BarState.IDLE, "", expand=i / 20)[0].height for i in range(21)]
+    assert all(b >= a for a, b in zip(widths, widths[1:]))
+    assert all(b >= a for a, b in zip(heights, heights[1:]))
+
+
+def test_controls_are_not_hit_testable_while_moving():
+    """A target the pointer cannot land on must not claim to be one."""
+    _image, moving = render_bar(BarState.IDLE, "", expand=0.8)
+    assert actions(moving) == [ACTION_MENU]
+    _image, settled = render_bar(BarState.IDLE, "", expand=1.0)
+    assert ACTION_MIC in actions(settled)
+
+
+# -- press, hover and the dot ---------------------------------------------
+
+
+def test_press_changes_the_render():
+    plain, _ = render_bar(BarState.IDLE, "", hover=ACTION_MIC, hover_t=1.0)
+    pressed, _ = render_bar(
+        BarState.IDLE, "", hover=ACTION_MIC, hover_t=1.0, press=ACTION_MIC, press_t=1.0
+    )
+    assert plain.tobytes() != pressed.tobytes()
+
+
+def test_a_press_on_one_control_leaves_the_other_alone():
+    a, _ = render_bar(BarState.IDLE, "", press=ACTION_MIC, press_t=1.0)
+    b, _ = render_bar(BarState.IDLE, "", press=ACTION_LANGUAGE, press_t=1.0)
+    assert a.tobytes() != b.tobytes()
+
+
+def test_the_dot_acknowledges_a_hover_without_resizing_its_window():
+    """Growing the window on hover would move the bar under the pointer."""
+    plain, _ = render_dot()
+    hovered, _ = render_dot(grow=2.0, ring=1.0)
+    assert plain.size == hovered.size
+    assert plain.tobytes() != hovered.tobytes()
+
+
+def test_a_hidden_tray_is_dimmer_but_still_there():
+    normal, _ = render_dot()
+    dimmed, _ = render_dot(opacity=0.42)
+    assert normal.tobytes() != dimmed.tobytes()
+
+    def ink(image):
+        pixels = image.load()
+        return [
+            pixels[image.width // 2, y][:3]
+            for y in range(image.height)
+            if pixels[image.width // 2, y][:3] != _KEY_RGB
+        ]
+
+    assert ink(dimmed), "hidden means quiet, not gone"
+    # Dimmer means the light half of the stroke is closer to the background.
+    assert max(sum(p) for p in ink(dimmed)) < max(sum(p) for p in ink(normal))
+
+
+def test_paused_is_quieter_than_idle_at_rest():
+    """At 16 pixels tall there is no room for a second silhouette, so paused
+    dims the tray instead. The state is spelled out in words -- and offers
+    Resume -- the moment the pointer arrives, which is the tier that can
+    carry it."""
+    idle, _ = render_dot()
+    paused, _ = render_dot(hollow=True)
+    assert idle.tobytes() != paused.tobytes()
+
+    def brightest(image):
+        pixels = image.load()
+        return max(
+            sum(pixels[image.width // 2, y][:3])
+            for y in range(image.height)
+            if pixels[image.width // 2, y][:3] != _KEY_RGB
+        )
+
+    assert brightest(paused) < brightest(idle)
+
+
+def test_paused_expands_to_say_so_in_words():
+    _image, regions = render_bar(BarState.PAUSED, "")
+    assert ACTION_RESUME in actions(regions)
+
+
+# -- recovery --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "action"),
+    [
+        ("paste_blocked", ACTION_COPY),
+        ("clipboard", ACTION_PASTE),
+        ("audio", ACTION_MIC),
+        ("auth", ACTION_SETTINGS),
+        ("no_key", ACTION_SETTINGS),
+    ],
+)
+def test_every_failure_with_a_way_out_offers_it(kind, action):
+    assert recovery_for(BarState.ERROR, kind) == (
+        recovery_for(BarState.ERROR, kind)[0],
+        action,
+    )
+    _image, regions = render_bar(BarState.ERROR, "x", kind=kind)
+    assert action in actions(regions)
+
+
+def test_rate_limiting_offers_nothing_because_there_is_nothing_to_do():
+    """A button that cannot help is worse than no button."""
+    assert recovery_for(BarState.ERROR, "rate_limited") is None
+    _image, regions = render_bar(BarState.ERROR, "rate limited", kind="rate_limited")
+    assert actions(regions) == [ACTION_MENU]
+
+
+def test_recovery_is_withheld_when_there_is_nothing_to_recover():
+    """This is how the old menu produced its own error: it offered Copy with
+    nothing on the clipboard and then complained."""
+    assert recovery_for(BarState.ERROR, "paste_blocked", can_paste=False) is None
+    assert recovery_for(BarState.ERROR, "audio", can_paste=False) is not None
+
+
+def test_no_speech_points_at_the_microphone():
+    assert recovery_for(BarState.DONE, "no_speech") == ("Mic", ACTION_MIC)
+
+
+def test_paused_always_offers_resume():
+    assert recovery_for(BarState.PAUSED, "") == ("Resume", ACTION_RESUME)
+    _image, regions = render_bar(BarState.PAUSED, "")
+    assert ACTION_RESUME in actions(regions)
+
+
+def test_an_unknown_kind_is_not_an_error():
+    assert recovery_for(BarState.ERROR, "something-new") is None
+    assert recovery_for(BarState.IDLE, "paste_blocked") is None
+
+
+def test_a_recovery_button_widens_the_capsule():
+    plain = natural_width(BarState.ERROR, "failed")
+    with_action = natural_width(BarState.ERROR, "failed", kind="paste_blocked")
+    assert with_action > plain
+
+
+# -- keycaps ---------------------------------------------------------------
+
+
+def test_rich_segments_splits_keycaps_out():
+    assert rich_segments("hold [[Right Ctrl]] now") == (
+        (False, "hold "),
+        (True, "Right Ctrl"),
+        (False, " now"),
+    )
+
+
+def test_rich_segments_handles_the_plain_and_empty_cases():
+    assert rich_segments("") == ()
+    assert rich_segments("just text") == ((False, "just text"),)
+    assert rich_segments("[[Ctrl]]") == ((True, "Ctrl"),)
+
+
+def test_a_keycap_costs_more_width_than_its_letters():
+    """It is a drawn key, not a word, so it has to be measured as one or the
+    label runs off the end of the capsule."""
+    assert measure_rich("hold [[Ctrl]]") > measure_rich("hold Ctrl")
+
+
+def test_a_keycap_renders_differently_from_its_own_text():
+    plain, _ = render_bar(BarState.COACH, "hold Right Ctrl")
+    capped, _ = render_bar(BarState.COACH, "hold [[Right Ctrl]]")
+    assert plain.tobytes() != capped.tobytes()
+
+
+def test_a_warn_toned_hint_renders_differently():
+    info, _ = render_bar(BarState.IDLE, "", hint="x", tone=HintTone.INFO)
+    warn, _ = render_bar(BarState.IDLE, "", hint="x", tone=HintTone.WARN)
+    assert info.tobytes() != warn.tobytes()
+
+
+# -- the menu, as it actually reads ---------------------------------------
+
+
+def test_pause_becomes_resume_when_the_agent_is_off():
+    paused = build_menu(listening=False)
+    labels = [item.label for item in paused]
+    assert "Resume dictation" in labels
+    assert "Pause dictation" not in labels
+
+
+def test_hide_becomes_unhide_while_hidden():
+    """There was previously no way to un-hide before the hour was up."""
+    hidden = build_menu(hidden_for_s=57 * 60)
+    row = next(item for item in hidden if item.action == "unhide")
+    assert "57m" in row.label
+    brief = next(i for i in build_menu(hidden_for_s=20) if i.action == "unhide")
+    assert "under a minute" in brief.label
+
+
+def test_recovery_rows_are_disabled_rather_than_failing():
+    empty = build_menu(can_paste=False)
+    rows = [item for item in empty if item.action in (ACTION_PASTE, ACTION_COPY)]
+    assert len(rows) == 2
+    assert all(not row.enabled for row in rows)
+    assert all(not row.selectable for row in rows)
+
+
+def test_a_disabled_row_cannot_be_clicked():
+    _image, regions = render_menu(build_menu(can_paste=False))
+    assert ACTION_PASTE not in actions(regions)
+    assert ACTION_COPY not in actions(regions)
+
+
+def test_a_full_menu_offers_every_row():
+    _image, regions = render_menu(build_menu(can_paste=True))
+    assert ACTION_PASTE in actions(regions)
+    assert ACTION_COPY in actions(regions)
+
+
+def test_build_menu_leaves_a_healthy_menu_alone():
+    assert build_menu(listening=True, can_paste=True, hidden_for_s=0.0) == DEFAULT_MENU
+
+
+def test_a_disabled_row_still_renders_its_label():
+    plain, _ = render_menu((MenuItem("x", "Paste"),))
+    disabled, _ = render_menu((MenuItem("x", "Paste", enabled=False),))
+    assert plain.size == disabled.size
+    assert plain.tobytes() != disabled.tobytes()
+
+
+# -- popovers --------------------------------------------------------------
+
+
+def test_a_checked_row_is_marked():
+    plain, _ = render_menu((MenuItem("en", "English"),))
+    checked, _ = render_menu((MenuItem("en", "English", checked=True),))
+    assert plain.tobytes() != checked.tobytes()
+
+
+def test_a_footer_is_a_caption_not_a_row():
+    items = (MenuItem("a", "A"), MenuItem("", label="Applies after a restart", footer=True))
+    _image, regions = render_menu(items)
+    assert actions(regions) == ["a"]
+    assert menu_height(items) > menu_height((MenuItem("a", "A"),))
+
+
+def test_a_footer_is_shorter_than_a_row():
+    footer = menu_height((MenuItem("", label="note", footer=True),))
+    row = menu_height((MenuItem("a", "A"),))
+    assert footer < row
+
+
+def test_keyboard_focus_reads_differently_from_hover():
+    """Otherwise a user who arrowed down cannot tell whether Enter acts on
+    the row they arrowed to or the one the pointer is resting on."""
+    hovered, _ = render_menu(DEFAULT_MENU, hover=ACTION_SETTINGS)
+    focused, _ = render_menu(DEFAULT_MENU, focus=ACTION_SETTINGS)
+    assert hovered.tobytes() != focused.tobytes()
+
+
+def test_a_popover_can_be_narrower_than_the_menu():
+    narrow, _ = render_menu((MenuItem("a", "A"),), width=200)
+    assert narrow.width == 200
+
+
+def test_a_row_detail_changes_the_render():
+    plain, _ = render_menu((MenuItem("a", "Headset"),))
+    detailed, _ = render_menu((MenuItem("a", "Headset", detail="default"),))
+    assert plain.tobytes() != detailed.tobytes()
+
+
+# -- panel placement -------------------------------------------------------
+
+
+def test_a_panel_is_kept_on_screen():
+    """A popover anchored under a control at the screen edge must not open
+    half off it -- the rows that fall outside are the ones being reached
+    for."""
+    x, y = clamp_to_area(1900, -40, (268, 400), FULL_HD)
+    assert 0 <= x <= 1920 - 268
+    assert y >= 0
+    assert y + 400 <= 1040
+
+
+def test_a_panel_that_already_fits_is_left_where_it_is():
+    assert clamp_to_area(500, 500, (268, 300), FULL_HD) == (500, 500)
+
+
+def test_clamping_a_panel_larger_than_the_screen_still_returns_it_on_screen():
+    x, y = clamp_to_area(0, 0, (4000, 4000), FULL_HD)
+    assert (x, y) == (8, 8)
+
+
+# -- tooltips --------------------------------------------------------------
+
+
+def test_a_tooltip_is_dark_like_the_bar_not_light_like_the_menu():
+    """It belongs to the control it describes, not to the panel layer."""
+    tooltip = render_tooltip("Microphone")
+    menu, _ = render_menu(DEFAULT_MENU)
+    tip_mid = tooltip.load()[tooltip.width // 2, tooltip.height // 2][:3]
+    menu_mid = menu.load()[menu.width // 2, menu.height // 2][:3]
+    assert sum(tip_mid) < sum(menu_mid)
+
+
+def test_a_tooltip_grows_with_its_text():
+    assert render_tooltip("Microphone").width > render_tooltip("Mic").width
+
+
+def test_tooltip_corners_key_out():
+    tooltip = render_tooltip("Microphone")
+    assert tooltip.load()[0, 0][:3] == _KEY_RGB
+
+
+# -- width targets ---------------------------------------------------------
+
+
+def test_natural_width_is_what_the_settled_capsule_measures():
+    """The tween animates toward this number, so a mismatch is a bar that
+    never quite arrives."""
+    for state, detail, kind in (
+        (BarState.IDLE, "", ""),
+        (BarState.RECORDING, "", ""),
+        (BarState.DONE, "12 words", ""),
+        (BarState.ERROR, "Couldn't paste here", "paste_blocked"),
+        (BarState.PAUSED, "", ""),
+    ):
+        image, _ = render_bar(state, detail, kind=kind)
+        assert image.width == natural_width(state, detail, kind=kind), state
+
+
+def test_natural_width_accounts_for_the_elapsed_counter():
+    assert natural_width(BarState.RECORDING, "", elapsed_s=605) > natural_width(
+        BarState.RECORDING, "", elapsed_s=1
+    )
+
+
+# -- script coverage -------------------------------------------------------
+#
+# PIL has no font fallback: a glyph the chosen face lacks renders as .notdef,
+# a hollow box. The language popover lists languages by their own name, so
+# without a per-script face every non-Latin row -- the rows a user most needs
+# to recognise -- is tofu.
+
+
+def test_latin_uses_the_ui_font():
+    assert _font_for("English", 14) is _font(14, bold=False)
+    assert _font_for("Português", 14) is _font(14, bold=False)
+
+
+@pytest.mark.parametrize("label", ["हिन्दी", "日本語", "中文", "한국어"])
+def test_a_non_latin_label_gets_a_face_that_can_draw_it(label):
+    assert _font_for(label, 14) is not _font(14, bold=False)
+
+
+def test_a_non_latin_row_is_measured_with_the_face_it_is_drawn_with():
+    """Measuring with one face and painting with another lays the row out for
+    the wrong width, which is how a label ends up clipped."""
+    assert measure_rich("日本語") > 0
+    narrow, _ = render_menu((MenuItem("a", "中文"),))
+    wide, _ = render_menu((MenuItem("a", "中文中文中文"),))
+    assert narrow.tobytes() != wide.tobytes()
+
+
+def test_a_non_latin_label_actually_puts_ink_on_the_panel():
+    blank, _ = render_menu((MenuItem("a", ""),))
+    hindi, _ = render_menu((MenuItem("a", "हिन्दी"),))
+    assert blank.size == hindi.size
+    assert blank.tobytes() != hindi.tobytes()
+
+
+# -- dismissing a panel by clicking elsewhere ------------------------------
+#
+# A menu that survives a click somewhere else is a menu you have to dismiss
+# before getting on with your work, which is backwards: clicking the thing
+# you actually want *is* the dismissal everywhere else on the desktop.
+#
+# The bar must never take focus (paste targets the focused window), so this
+# cannot use a Tk grab or a focus-out event. It samples the mouse instead --
+# and _mouse_press_point is the only part that touches the OS, so the
+# decision around it is testable without a mouse.
+
+
+class FakePanel:
+    def __init__(self, rect):
+        self.rect = rect
+        self.closed = False
+
+    def contains(self, x, y):
+        left, top, right, bottom = self.rect
+        return left <= x <= right and top <= y <= bottom
+
+    def close(self):
+        self.closed = True
+
+
+def _dismissable_bar(press_at, *, bar_rect=(500, 900, 640, 944), opened_ago=10.0):
+    bar = SwayBar.__new__(SwayBar)
+    bar._menu = FakePanel((520, 700, 788, 890))
+    bar._popover = None
+    bar._popover_anchor = ""
+    bar._panel_opened_at = time.monotonic() - opened_ago
+    bar._mouse_press_point = lambda: press_at
+    bar._point_in_bar = lambda x, y: (
+        bar_rect[0] <= x <= bar_rect[2] and bar_rect[1] <= y <= bar_rect[3]
+    )
+    return bar
+
+
+def test_a_click_elsewhere_dismisses_the_panel():
+    bar = _dismissable_bar((120, 120))
+    menu = bar._menu
+    bar._dismiss_on_outside_click()
+    assert bar._menu is None
+    assert menu.closed
+
+
+def test_a_click_inside_the_panel_is_left_to_the_panel():
+    bar = _dismissable_bar((600, 750))
+    bar._dismiss_on_outside_click()
+    assert bar._menu is not None
+
+
+def test_a_click_on_the_bar_is_left_to_the_bar():
+    """The bar toggles its own menu shut; dismissing here as well would close
+    and immediately reopen it."""
+    bar = _dismissable_bar((560, 920))
+    bar._dismiss_on_outside_click()
+    assert bar._menu is not None
+
+
+def test_no_click_changes_nothing():
+    bar = _dismissable_bar(None)
+    bar._dismiss_on_outside_click()
+    assert bar._menu is not None
+
+
+def test_a_panel_is_not_killed_by_the_click_that_opened_it():
+    """GetAsyncKeyState latches "pressed since last call", so the opening
+    click can still be waiting to be read on the first tick afterwards."""
+    bar = _dismissable_bar((120, 120), opened_ago=0.0)
+    bar._dismiss_on_outside_click()
+    assert bar._menu is not None, "dismissed itself inside the grace period"
+
+
+def test_the_grace_period_does_expire():
+    bar = _dismissable_bar((120, 120), opened_ago=0.4)
+    bar._dismiss_on_outside_click()
+    assert bar._menu is None
+
+
+def test_nothing_happens_when_no_panel_is_open():
+    bar = _dismissable_bar((120, 120))
+    bar._menu = None
+    bar._dismiss_on_outside_click()  # must not raise
+
+
+def test_a_popover_is_dismissed_the_same_way():
+    bar = _dismissable_bar((120, 120))
+    bar._menu = None
+    bar._popover = FakePanel((520, 700, 760, 860))
+    bar._popover_anchor = ACTION_MIC
+    popover = bar._popover
+    bar._dismiss_on_outside_click()
+    assert bar._popover is None
+    assert popover.closed
+    assert bar._popover_anchor == ""
+
+
+def test_dismissing_dispatches_no_action():
+    """Clicking away is not choosing a row."""
+    dispatched = []
+    bar = _dismissable_bar((120, 120))
+    bar._on_action = dispatched.append
+    bar._dismiss_on_outside_click()
+    assert dispatched == []

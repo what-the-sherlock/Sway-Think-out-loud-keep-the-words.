@@ -283,6 +283,23 @@ views.home = {
 };
 
 /**
+ * Split a location hash into a view and, for Settings, a tab.
+ *
+ * The bar's microphone and language controls ask for "#settings/voice"
+ * specifically. Before this, the tab was parsed off and thrown away by the
+ * engine, so every control that promised a particular settings page opened
+ * the general one.
+ *
+ * Returns null when the hash names no view we have.
+ */
+function routeFor(hash) {
+  const [view, tab] = (hash || '').replace('#', '').split('/');
+  if (!views[view]) return null;
+  if (view === 'settings' && tab) state.settingsTab = tab;
+  return view;
+}
+
+/**
  * Agent status — the merged health banner and on/off control. Red is used
  * only where the user must act (§5); a transient condition gets no colour.
  */
@@ -291,6 +308,10 @@ function agentCard(d) {
   const health = d.health || {};
   const listening = status.listening;
   const keyMissing = state.settings && state.settings.key && !state.settings.key.configured;
+  // The engine's richest error copy (engine._describe_failure) has always
+  // been served here and has never been read by anything. It is the only
+  // place that says *what* broke and whether the user can do something.
+  const failure = status.last_error;
 
   let dot = 'ok';
   let headline = 'Listening for your hotkey';
@@ -306,10 +327,23 @@ function agentCard(d) {
     dot = 'warn';
     headline = 'Paused';
     detail = 'Your hotkey is disarmed. Nothing is being recorded.';
-  } else if (health.status === 'error') {
+  } else if (failure) {
+    // Actionability decides the colour, not severity (§2.1): red is reserved
+    // for a condition only the user can clear.
+    dot = failure.actionable ? 'act' : 'warn';
+    headline = failure.headline || 'That dictation failed';
+    detail = failure.detail || detail;
+    if (failure.kind === 'auth' || failure.kind === 'no_key') {
+      action = '<button class="btn primary" data-act="go-key">Fix this</button>';
+    } else if (failure.kind === 'audio') {
+      action = '<button class="btn" data-act="go-voice">Check microphone</button>';
+    }
+  } else if (health.status === 'problem') {
+    // These two used to test for 'error' and 'warn', which queries.health()
+    // never returns, so neither branch could ever run.
     dot = 'act';
     headline = health.headline || 'Recent dictations are failing';
-  } else if (health.status === 'warn') {
+  } else if (health.status === 'degraded') {
     dot = 'warn';
     headline = health.headline || 'Degraded';
   }
@@ -1438,6 +1472,7 @@ document.addEventListener('click', async (event) => {
       case 'close-modal': closeModal(); break;
       case 'go-history': await go('history'); break;
       case 'go-key': state.settingsTab = 'general'; await go('settings'); break;
+      case 'go-voice': state.settingsTab = 'voice'; await go('settings'); break;
 
       case 'toggle-agent': {
         const on = target.getAttribute('aria-checked') === 'true';
@@ -2140,14 +2175,15 @@ function startOnboarding() {
   }
   // The tray's Settings item opens the window on #settings rather than as a
   // second surface, so configuration lives in exactly one place.
-  const requested = (location.hash || '').replace('#', '');
-  await go(views[requested] ? requested : 'home');
+  await go(routeFor(location.hash) || 'home');
 
-  // A later navigation to #settings (the tray item, on an already-open
-  // window) has to be honoured too.
+  // A later navigation (the tray item, or the bar's mic button, on an
+  // already-open window) has to be honoured too -- including a repeat of the
+  // hash already showing, which fires no hashchange but must still switch
+  // tabs.
   window.addEventListener('hashchange', () => {
-    const next = (location.hash || '').replace('#', '');
-    if (views[next] && next !== state.view) go(next);
+    const next = routeFor(location.hash);
+    if (next) go(next);
   });
 
   // Live updates without a manual refresh (D6). Slow enough to be free, fast

@@ -29,6 +29,7 @@ import json
 import logging
 import mimetypes
 import secrets
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -118,6 +119,29 @@ class EngineControl:
     hotkey_down: Callable[[], bool] | None = None
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` that does not shout when a client walks away.
+
+    ``socketserver.handle_error`` prints a full traceback straight to stderr
+    for any exception that escapes a handler, and a client vanishing mid
+    request raises one before our handler is even entered -- while
+    ``handle_one_request`` is reading the next keep-alive request line.
+
+    That happens constantly here and is never a fault. The dashboard polls
+    (Home every 5s, onboarding every 140-220ms), and the window navigates,
+    hides and closes underneath those polls -- so there is nearly always a
+    request in flight when the connection goes. Printing a traceback for each
+    one buries the failures that do matter.
+    """
+
+    def handle_error(self, request, client_address):  # noqa: D102 - stdlib naming
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ConnectionError):
+            logger.debug("dashboard client %s disconnected: %s", client_address, exc)
+            return
+        super().handle_error(request, client_address)
+
+
 class DashboardServer:
     """Serves the dashboard on loopback. Start it, open :attr:`url`, stop it."""
 
@@ -158,7 +182,7 @@ class DashboardServer:
         self._ensure_schema()
 
         handler = _make_handler(self)
-        self._httpd = ThreadingHTTPServer((self._host, self._port), handler)
+        self._httpd = _QuietThreadingHTTPServer((self._host, self._port), handler)
         # daemon_threads: a browser tab holding a keep-alive connection open
         # must never stop the app from exiting when the user picks Quit.
         self._httpd.daemon_threads = True
@@ -616,6 +640,23 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
 
         # -- responses -----------------------------------------------------
 
+        def _client_gone(self, exc: Exception) -> None:
+            """Note a disconnect and say nothing further on a dead socket.
+
+            The dashboard polls: Home every 5s, onboarding every 140-220ms.
+            So there is almost always a request in flight when the window
+            navigates, is hidden, or is closed -- and the webview drops the
+            connection mid-response. That surfaced as a full ``ConnectionAborted``
+            traceback logged at ERROR, and then a *second*, uglier one from
+            socketserver, because the handler answered the failure by trying
+            to write an error response down the same dead socket.
+
+            Neither is a fault. The client left; there is nobody to tell.
+            """
+            logger.debug("dashboard client disconnected mid-response: %s", exc)
+            # Stop socketserver from trying to reuse a connection that is gone.
+            self.close_connection = True
+
         def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -648,6 +689,10 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                     return
                 try:
                     self._json(HTTPStatus.OK, server.handle_api(path, params))
+                except ConnectionError as exc:
+                    # Ordered before the handlers below: a disconnect is not a
+                    # query failure, and answering it would raise again.
+                    self._client_gone(exc)
                 except LookupError as exc:
                     self._error(HTTPStatus.NOT_FOUND, f"no such session: {exc}")
                 except KeyError:
@@ -657,7 +702,7 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                     self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
                 except Exception:
                     logger.exception("dashboard request failed")
-                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal error")
+                    self._safe_error()
                 return
 
             self._serve_static(path)
@@ -680,6 +725,8 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 self._json(HTTPStatus.OK, server.handle_command(parsed.path, payload))
+            except ConnectionError as exc:
+                self._client_gone(exc)
             except ActionError as exc:
                 # A problem with what was asked for, not a bug. The message is
                 # already written for a human, so it goes straight to the UI.
@@ -695,7 +742,20 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             except Exception:
                 logger.exception("dashboard command failed")
+                self._safe_error()
+
+        def _safe_error(self) -> None:
+            """Report an internal error, unless the client has already gone.
+
+            Every error path needs this: the failure that put us here is very
+            often the write itself, and a second write on the same socket
+            raises straight out of the handler and into socketserver's own
+            traceback.
+            """
+            try:
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal error")
+            except ConnectionError as exc:
+                self._client_gone(exc)
 
         def _serve_static(self, path: str) -> None:
             relative = "index.html" if path in ("", "/") else path.lstrip("/")
@@ -713,7 +773,12 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
             content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
             if content_type.startswith(("text/", "application/javascript")):
                 content_type += "; charset=utf-8"
-            self._send(HTTPStatus.OK, target.read_bytes(), content_type)
+            try:
+                self._send(HTTPStatus.OK, target.read_bytes(), content_type)
+            except ConnectionError as exc:
+                # A reload or a navigation abandons in-flight asset requests
+                # just as readily as API ones.
+                self._client_gone(exc)
 
     return Handler
 

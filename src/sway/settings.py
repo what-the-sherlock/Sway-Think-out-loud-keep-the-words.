@@ -67,6 +67,44 @@ OVERLAY_POSITIONS = ("top-center", "bottom-center", "top-right", "bottom-right")
 #: loadable in contexts that never touch the profile resolver.
 CLEANUP_STYLES = ("casual", "formal", "verbatim")
 
+#: The shortlist the bar's language popover offers, as
+#: ``(whisper_code, endonym)``. Deliberately short: this is the switcher for
+#: the language someone is *about to speak*, reached in one click from the
+#: bar, not the full catalogue. Whisper accepts far more than these, and
+#: ``language`` remains a free string (see :func:`parse`), so a code typed
+#: into Settings that is absent here still works and is shown by its code.
+#:
+#: ``None`` -- auto-detect -- leads, because it is both the default and the
+#: right answer for anyone who has not thought about it.
+LANGUAGES: tuple[tuple[str | None, str], ...] = (
+    (None, "Auto-detect"),
+    ("en", "English"),
+    ("hi", "हिन्दी"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("pt", "Português"),
+    ("it", "Italiano"),
+    ("nl", "Nederlands"),
+    ("ja", "日本語"),
+    ("zh", "中文"),
+)
+
+
+def language_label(code: str | None) -> str:
+    """The display name for a Whisper language code.
+
+    Falls back to the code itself upper-cased, so a language configured
+    outside :data:`LANGUAGES` renders as ``SV`` rather than as blank or as a
+    wrong name.
+    """
+    if not code:
+        return "Auto-detect"
+    for known, label in LANGUAGES:
+        if known == code:
+            return label
+    return code.upper()
+
 #: How hard the self-correction pass looks. Mirrors
 #: :data:`sway.corrections.MODES` without importing it, for the same reason
 #: CLEANUP_STYLES mirrors CleanupStyle: settings must stay loadable in contexts

@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from sway import APP_NAME, instance
-from sway.audio.capture import AudioCapture
+from sway.audio.capture import AudioCapture, input_devices
 from sway.analytics import SessionMetrics, count_words, pcm_duration_ms, session_metrics
 
 from sway.audio.flac import encode_flac
@@ -95,7 +95,14 @@ from sway.inject import TextInjector
 from sway.latency.models import Stage
 from sway.latency.tracker import LatencyTracker, RunRecorder
 from sway.net_loop import NetworkLoop
-from sway.bar import BarState, NullBar, SwayBar
+from sway.bar import (
+    ACTION_LANGUAGE,
+    ACTION_MIC,
+    BarState,
+    MenuItem,
+    NullBar,
+    SwayBar,
+)
 from sway.platform import PlatformAdapter, get_platform
 from sway.profiles import CleanupStyle, style_for_process
 from sway.selection import SelectionReader
@@ -203,6 +210,12 @@ def _describe_failure(exc: Exception) -> dict[str, Any]:
     }
 
 
+#: How many microphones the bar's popover lists before deferring to Settings.
+#: A picker is a shortcut; a machine with a dozen inputs should not get a
+#: panel taller than the window it is floating over.
+_MIC_POPOVER_ROWS = 6
+
+
 def _short_failure(exc: Exception) -> str:
     """A pill-sized label. The pill is ~34 characters wide at most."""
     if isinstance(exc, PasteBlockedError):
@@ -293,6 +306,15 @@ class Engine:
         #: this needs no lock and the callback never blocks (CLAUDE.md).
         self._input_level = 0
         self._hotkey_down = False
+        #: When the last too-short hold happened, and how many in a row.
+        #: A single tap gets a gentle correction; a second in quick
+        #: succession gets a more explicit one, because the first evidently
+        #: did not land.
+        self._last_tap_at = 0.0
+        self._tap_streak = 0
+        #: Successful dictations this session. Coaching retires after a few:
+        #: guidance that never stops is just instructional chrome.
+        self._success_count = 0
         #: The most recent pasted text, for the bar's paste/copy actions.
         #: Memory only -- history.db holds the durable record.
         self._last_transcript = ""
@@ -374,6 +396,13 @@ class Engine:
         # first would otherwise find no instance file and show the "already
         # running" dialog instead of focusing us.
         self._publish_instance()
+        # The bar's opening posture. _refresh_bar_hint was written to coach a
+        # first-run user and was only ever called *after* a successful paste,
+        # where its first branch clears the hint -- so the coaching it exists
+        # for had never once rendered.
+        self._bar.set_listening(self.is_listening)
+        self._bar.set_can_paste(False)
+        self._refresh_bar_hint()
         logger.info("Sway ready. Hold %s to dictate.", prettify_hotkey(self._config.hotkey.key))
         if self._command_hotkey is not None:
             logger.info(
@@ -606,19 +635,39 @@ class Engine:
         BarState.IDLE: TrayState.IDLE,
         BarState.RECORDING: TrayState.LISTENING,
         BarState.THINKING: TrayState.PROCESSING,
+        BarState.INJECTING: TrayState.PROCESSING,
         BarState.ERROR: TrayState.ERROR,
+        BarState.PAUSED: TrayState.DISABLED,
+        # Coaching is not engine state. The tray keeps saying "ready",
+        # because that is what is true while the bar is teaching.
+        BarState.COACH: TrayState.IDLE,
     }
 
-    def _set_ui_state(self, state: BarState, *, detail: str = "") -> None:
+    def _set_ui_state(
+        self, state: BarState, *, detail: str = "", kind: str = ""
+    ) -> None:
         """Drive the overlay and the tray icon together.
 
         A paused engine always shows DISABLED in the tray regardless of the
-        overlay state it was given. set_listening deliberately puts the
-        overlay into IDLE-with-detail rather than ERROR when pausing (see
-        there for why), and without this override the tray would inherit that
-        IDLE and claim to be armed while the hotkey was disarmed.
+        overlay state it was given, so the two surfaces cannot disagree about
+        whether the hotkey is armed.
+
+        ``kind`` is the machine-readable failure category from
+        :func:`_describe_failure`. It was previously computed on every error
+        path and then dropped; passing it through is what lets the bar offer
+        the one action that actually helps.
         """
-        self._bar.set_state(state, detail=detail) if detail else self._bar.set_state(state)
+        # A dictation in flight owns the bar. Without this, holding the
+        # hotkey again while the previous transcription is still running lets
+        # that finishing worker paint "Done - 12 words" over a live recording
+        # -- the bar would be reporting the *previous* utterance while the
+        # user watched themselves speak the next one.
+        if self._hotkey_down and state not in (BarState.RECORDING, BarState.PAUSED):
+            logger.debug(
+                "suppressed a %s bar update arriving during a live hold", state
+            )
+            return
+        self._bar.set_state(state, detail, kind=kind)
         if self._tray is None:
             return
         tray_state = self._TRAY_STATE_FOR.get(state, TrayState.IDLE)
@@ -690,7 +739,7 @@ class Engine:
         if not should_process(held_ms, self._config.hotkey.min_hold_ms):
             if session is not None:
                 session.stop(timeout=0.5)
-            self._set_ui_state(BarState.IDLE)
+            self._coach_tap(release_time)
             return
         self._set_ui_state(BarState.THINKING, detail="Transcribing")
         # Hand off immediately: the listener thread must stay free for the
@@ -708,6 +757,60 @@ class Engine:
             ),
             daemon=True,
         ).start()
+
+    def _coach_tap(self, at: float) -> None:
+        """Answer a too-short hold instead of silently ignoring it.
+
+        This is the single most common first-run mistake -- a dictation
+        hotkey is the one control on the desktop that a tap does *not*
+        operate -- and it previously produced no feedback whatsoever, which
+        reads as the app being broken rather than as the gesture being wrong.
+
+        A repeat inside ten seconds escalates the wording, because the first
+        phrasing evidently did not land -- and a repeat is answered for every
+        user, however experienced, because it is evidence of someone trying
+        rather than of a key being brushed.
+        """
+        self._tap_streak = self._tap_streak + 1 if at - self._last_tap_at < 10.0 else 1
+        self._last_tap_at = at
+        repeated = self._tap_streak >= 2
+
+        # A first-run user is told straight away. An experienced one is not:
+        # a single stray tap is almost always the key being brushed, and
+        # explaining the product every time it happens is noise. But a
+        # *second* tap in ten seconds means they are trying to do something
+        # and it is not working, and that is worth answering no matter how
+        # long they have used it.
+        if not (repeated or self._should_coach()):
+            self._set_ui_state(BarState.IDLE)
+            return
+
+        key = prettify_hotkey(self._config.hotkey.key)
+        if repeated:
+            text = f"Hold [[{key}]] down, speak, then let go"
+        else:
+            text = f"Don't tap — hold [[{key}]] while you speak"
+        try:
+            self._bar.coach(text)
+        except Exception:
+            logger.debug("could not show the tap coach", exc_info=True)
+            self._set_ui_state(BarState.IDLE)
+
+    def _should_coach(self) -> bool:
+        """Whether the user still needs teaching.
+
+        Two independent signals, and both have to say yes: they have not
+        finished onboarding, and they have not already succeeded several
+        times this session. Someone who dictates fluently and fumbles one
+        keypress does not need to be told how the product works.
+        """
+        if self._success_count >= 3:
+            return False
+        try:
+            return not self._settings.get().onboarding_complete
+        except Exception:
+            logger.debug("could not read onboarding state for coaching", exc_info=True)
+            return False
 
     # -- streaming (Phase 4): background chunks while the key is held ----
 
@@ -808,7 +911,7 @@ class Engine:
                 actionable=False,
                 retry_after_s=exc.retry_after_s,
             )
-            self._set_ui_state(BarState.ERROR, detail=detail)
+            self._set_ui_state(BarState.ERROR, detail=detail, kind="rate_limited")
         except TimeoutError as exc:
             run.mark_failed(exc)
             logger.error("%s timed out: %s", label, exc)
@@ -818,12 +921,15 @@ class Engine:
                 detail="Retrying next time. Check your connection if it keeps happening.",
                 actionable=False,
             )
-            self._set_ui_state(BarState.ERROR, detail="timed out")
+            self._set_ui_state(BarState.ERROR, detail="timed out", kind="timeout")
         except (GroqError, SwayError) as exc:
             run.mark_failed(exc)
             logger.error("%s failed: %s", label, exc)
-            self._record_error(**_describe_failure(exc))
-            self._set_ui_state(BarState.ERROR, detail=_short_failure(exc))
+            described = _describe_failure(exc)
+            self._record_error(**described)
+            self._set_ui_state(
+                BarState.ERROR, detail=_short_failure(exc), kind=described["kind"]
+            )
         except Exception as exc:  # never let a bug hang the app with the mic hot
             run.mark_failed(exc)
             logger.exception("unexpected %s failure", label)
@@ -833,7 +939,7 @@ class Engine:
                 detail="The details are in Sway's log file.",
                 actionable=False,
             )
-            self._set_ui_state(BarState.ERROR, detail="failed")
+            self._set_ui_state(BarState.ERROR, detail="failed", kind="unexpected")
 
     def _process(
         self,
@@ -879,7 +985,14 @@ class Engine:
     ) -> None:
         transcript = self._transcribe(start_frame, run, session)
         if not transcript:
-            self._set_ui_state(BarState.IDLE)
+            # Previously a silent return to idle, which is indistinguishable
+            # from the app having ignored the user entirely -- and it is the
+            # visible symptom of a muted or misrouted microphone. Naming it,
+            # and offering the device picker, turns the most confusing
+            # outcome in the product into the most actionable one.
+            self._set_ui_state(
+                BarState.DONE, detail="No speech detected", kind="no_speech"
+            )
             return
 
         # Local, zero-cost substitutions happen before the model sees the
@@ -904,6 +1017,8 @@ class Engine:
             # answers "did anything actually land?", which is the failure the
             # user is most likely to be watching for.
             words = count_words(cleaned_text)
+            self._success_count += 1
+            self._tap_streak = 0
             self._remember_transcript(cleaned_text)
             self._set_ui_state(
                 BarState.DONE, detail=f"{words} word{'' if words == 1 else 's'}"
@@ -914,7 +1029,9 @@ class Engine:
             self._clear_error()
         else:
             self._set_ui_state(
-                BarState.ERROR, detail="elevated window — copied instead"
+                BarState.ERROR,
+                detail="elevated window — copied instead",
+                kind="paste_blocked",
             )
 
         # Everything below runs *after* the text is on screen, so none of it
@@ -1490,6 +1607,7 @@ class Engine:
         self._set_ui_state(
             BarState.IDLE if pasted else BarState.ERROR,
             detail="" if pasted else "elevated window — copied instead",
+            kind="" if pasted else "paste_blocked",
         )
 
         run.annotate(characters=len(transformed))
@@ -1497,7 +1615,7 @@ class Engine:
             kind=KIND_COMMAND,
             text=transformed,
             raw_text=selected_text,
-            instruction=instruction.text,
+            instruction=instruction_text,
             focused_process=focused_process,
         )
 
@@ -1524,18 +1642,21 @@ class Engine:
                 self._hotkey.start()
                 if self._command_hotkey is not None:
                     self._command_hotkey.start()
+                self._bar.set_listening(True)
                 self._set_ui_state(BarState.IDLE)
+                self._refresh_bar_hint()
             else:
                 self._hotkey.stop()
                 if self._command_hotkey is not None:
                     self._command_hotkey.stop()
-                # IDLE, not ERROR: a pause is a deliberate state, not a
-                # failure, and the overlay auto-clears ERROR back to IDLE
-                # after a few seconds -- which would leave the pill claiming
-                # to be listening while the hotkey was still disarmed. IDLE
-                # renders its detail text as the label, so this reads
-                # "Paused" and stays there until resumed.
-                self._set_ui_state(BarState.IDLE, detail="Paused")
+                # PAUSED, not ERROR and not IDLE-with-a-detail. ERROR would
+                # auto-expire after a few seconds and leave the bar claiming
+                # to be listening while the hotkey was disarmed; IDLE made a
+                # paused app and an armed one the same dot on screen. PAUSED
+                # renders a hollow dot and offers Resume, so the state is
+                # legible at every tier.
+                self._bar.set_listening(False)
+                self._set_ui_state(BarState.PAUSED)
             logger.info("dictation %s", "resumed" if listening else "paused")
         except Exception:
             logger.exception("could not change the listening state")
@@ -1597,20 +1718,173 @@ class Engine:
         """
         handlers: dict[str, Callable[[], None]] = {
             "hide": lambda: self._bar.hide_for(3600),
+            "unhide": self._bar.unhide,
+            "pause": lambda: self.set_listening(False),
+            "resume": lambda: self.set_listening(True),
             "settings": self._open_settings,
             "history": self._open_history,
             "paste": self.paste_last_transcript,
             "copy": self.copy_last_transcript,
-            "language": lambda: self._open_settings_at("voice"),
-            "microphone": lambda: self._open_settings_at("voice"),
+            # These two no longer navigate the user away from what they were
+            # doing. They answer in place, with the choices themselves.
+            ACTION_LANGUAGE: self._open_language_popover,
+            ACTION_MIC: self._open_microphone_popover,
         }
-        handler = handlers.get(action)
+        handler = handlers.get(action) or self._popover_choice_handler(action)
         if handler is None:
             logger.debug("bar action %r is not wired up", action)
             return
         threading.Thread(
             target=self._run_bar_action, args=(action, handler), name="sway-bar-action", daemon=True
         ).start()
+
+    # -- the two switchers -------------------------------------------------
+
+    #: Popover rows carry their value in the action string. A prefix keeps
+    #: the bar entirely ignorant of what a language or a device is: it
+    #: renders rows and reports which one was clicked, exactly as it already
+    #: does for the menu.
+    _LANGUAGE_PREFIX = "lang:"
+    _DEVICE_PREFIX = "dev:"
+
+    def _open_language_popover(self) -> None:
+        """The dictation language, switchable in one click.
+
+        Genuinely live -- ``language`` is re-read into the Groq call on the
+        next dictation (see :meth:`_apply_settings`) -- so this popover needs
+        no caveat, and deliberately does not invent one.
+        """
+        from sway.settings import LANGUAGES, language_label
+
+        current = self._settings.get().language
+        rows = [
+            MenuItem(
+                self._LANGUAGE_PREFIX + (code or ""),
+                label,
+                checked=code == current,
+            )
+            for code, label in LANGUAGES
+        ]
+        if current and all(code != current for code, _ in LANGUAGES):
+            # A language set outside the shortlist still has to show as the
+            # current one, or the popover claims a value that is not in
+            # effect.
+            rows.insert(
+                1,
+                MenuItem(
+                    self._LANGUAGE_PREFIX + current,
+                    language_label(current),
+                    checked=True,
+                ),
+            )
+        rows.append(MenuItem("settings", "More languages...", "gear"))
+        self._bar.open_popover(ACTION_LANGUAGE, tuple(rows), width=232)
+
+    def _open_microphone_popover(self) -> None:
+        """The input device, with an honest note about when it applies.
+
+        ``audio_device`` is bound into a stream that CLAUDE.md requires to be
+        opened once at startup and held for the process's life, so switching
+        it really does need a restart. The footer says so, rather than
+        letting the picker look broken.
+        """
+        try:
+            devices = input_devices()
+        except Exception:
+            logger.exception("could not list input devices for the bar")
+            devices = []
+
+        current = self._settings.get().audio_device
+        if not devices:
+            # The mic-unavailable state the product previously had no answer
+            # for: an empty list rendered as nothing at all.
+            self._bar.open_popover(
+                ACTION_MIC,
+                (
+                    MenuItem("none", "No microphone found", enabled=False),
+                    MenuItem("settings", "Open settings", "gear"),
+                ),
+                width=248,
+            )
+            return
+
+        # PortAudio enumerates every device once per host API, so a single
+        # microphone arrives three or four times under the same name. The
+        # setting stores a *name*, so those rows are not merely redundant --
+        # they are indistinguishable, and picking any of them writes the same
+        # value. Collapse them.
+        seen: set[str] = set()
+        unique: list[dict[str, object]] = []
+        for device in devices:
+            name = str(device.get("name", "")).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            unique.append(device)
+
+        # Most-likely first: whatever is selected, then the system default.
+        # A picker is for switching, and the row you are switching *from*
+        # belongs where you can see it.
+        unique.sort(
+            key=lambda device: (
+                str(device.get("name")) != current,
+                not device.get("default"),
+            )
+        )
+
+        rows = [
+            MenuItem(self._DEVICE_PREFIX, "System default", checked=current is None)
+        ]
+        for device in unique[:_MIC_POPOVER_ROWS]:
+            name = str(device.get("name", "")).strip()
+            rows.append(
+                MenuItem(
+                    self._DEVICE_PREFIX + name,
+                    name if len(name) <= 26 else name[:25] + "…",
+                    checked=name == current,
+                    detail="default" if device.get("default") else "",
+                )
+            )
+        if len(unique) > _MIC_POPOVER_ROWS:
+            # Truncating silently would hide a device the user owns. Say that
+            # the rest exist, and where.
+            rows.append(MenuItem("settings", "All microphones…", "gear"))
+        rows.append(MenuItem("", label="Applies after a restart", footer=True))
+        self._bar.open_popover(ACTION_MIC, tuple(rows), width=272)
+
+    def _popover_choice_handler(self, action: str) -> Callable[[], None] | None:
+        """Turn a popover row back into a settings write, or ``None``."""
+        if action.startswith(self._LANGUAGE_PREFIX):
+            language = action[len(self._LANGUAGE_PREFIX) :] or None
+            return lambda: self._choose_language(language)
+        if action.startswith(self._DEVICE_PREFIX):
+            device = action[len(self._DEVICE_PREFIX) :] or None
+            return lambda: self._choose_device(device)
+        return None
+
+    def _choose_language(self, code: str | None) -> None:
+        from sway.settings import language_label
+
+        try:
+            self._settings.update(language=code)
+        except Exception:
+            logger.exception("could not change the dictation language")
+            self._set_ui_state(BarState.ERROR, detail="could not save that", kind="settings")
+            return
+        self._apply_settings()
+        # Confirm with the value, not with a tick: the user chose a language,
+        # so the confirmation is that language.
+        self._set_ui_state(BarState.DONE, detail=language_label(code))
+
+    def _choose_device(self, name: str | None) -> None:
+        try:
+            self._settings.update(audio_device=name)
+        except Exception:
+            logger.exception("could not change the input device")
+            self._set_ui_state(BarState.ERROR, detail="could not save that", kind="settings")
+            return
+        self._apply_settings()
+        self._set_ui_state(BarState.DONE, detail="Restart to apply")
 
     def _run_bar_action(self, action: str, handler: Callable[[], None]) -> None:
         try:
@@ -1624,8 +1898,9 @@ class Engine:
     def _open_settings_at(self, tab: str) -> None:
         # The window reads the fragment on load and again on hashchange, so
         # this focuses an already-open window rather than making a second one.
-        self._open_dashboard(fragment="settings")
-        del tab
+        # The tab used to be discarded here, which is why every control that
+        # claimed to open a particular settings page opened the general one.
+        self._open_dashboard(fragment=f"settings/{tab}" if tab else "settings")
 
     # -- recovering the last transcript ------------------------------------
 
@@ -1638,13 +1913,20 @@ class Engine:
         """
         text = self._last_transcript
         if not text:
+            # Reachable only from the HTTP API now: the bar disables both
+            # recovery rows and withholds the inline button when there is
+            # nothing stored, so a user cannot ask for this and be refused.
             self._set_ui_state(BarState.ERROR, detail="nothing to paste yet")
             return False
         try:
             self._injector.inject(text)
         except SwayError as exc:
             logger.warning("could not paste the last transcript: %s", exc)
-            self._set_ui_state(BarState.ERROR, detail=_short_failure(exc))
+            self._set_ui_state(
+                BarState.ERROR,
+                detail=_short_failure(exc),
+                kind=_describe_failure(exc)["kind"],
+            )
             return False
         words = count_words(text)
         self._set_ui_state(BarState.DONE, detail=f"{words} word{'' if words == 1 else 's'}")
@@ -1665,7 +1947,9 @@ class Engine:
             self._platform.clipboard_set(text)
         except Exception as exc:
             logger.warning("could not copy the last transcript: %s", exc)
-            self._set_ui_state(BarState.ERROR, detail="clipboard unavailable")
+            self._set_ui_state(
+                BarState.ERROR, detail="clipboard unavailable", kind="clipboard"
+            )
             return False
         self._set_ui_state(BarState.DONE, detail="copied")
         return True
@@ -1678,6 +1962,10 @@ class Engine:
         """
         if text:
             self._last_transcript = text
+            # Both the menu rows and the capsule's inline recovery button
+            # read this, so neither can offer an action with nothing behind
+            # it -- which is how the old menu produced its own error message.
+            self._bar.set_can_paste(True)
 
     def _refresh_bar_hint(self) -> None:
         """Coach in place until the user has actually dictated something.
@@ -1688,14 +1976,20 @@ class Engine:
         the moment the user succeeds once.
         """
         try:
-            if self._last_transcript:
+            if not self.is_listening:
                 self._bar.set_hint("")
                 return
             if not self._config.groq_api_key:
                 self._bar.set_hint("Add your Groq key in Settings to start")
                 return
+            if self._last_transcript or not self._should_coach():
+                self._bar.set_hint("")
+                return
             key = prettify_hotkey(self._config.hotkey.key)
-            self._bar.set_hint(f"Next step: click a textbox, then hold {key}")
+            # [[...]] renders as a keycap chip in amber -- the token whose
+            # one job is "this is your hotkey" -- rather than as four more
+            # words in a sentence the user has to parse.
+            self._bar.set_hint(f"Next step → click a textbox, hold [[{key}]]")
         except Exception:
             logger.debug("could not set the bar hint", exc_info=True)
 
@@ -1874,6 +2168,12 @@ class Engine:
             self._sync_launch_at_login(settings.launch_at_login)
         except Exception:
             logger.warning("could not update the launch-at-login setting", exc_info=True)
+
+        # The bar's coaching depends on the API key and on onboarding, both of
+        # which are changed from exactly here. Without this, a user who
+        # finishes onboarding keeps being coached until the next restart, and
+        # one who adds their key keeps being told to add it.
+        self._refresh_bar_hint()
 
         return {"restart_required": restart_required}
 
