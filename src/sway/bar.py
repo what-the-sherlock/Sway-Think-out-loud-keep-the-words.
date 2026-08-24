@@ -193,6 +193,12 @@ _REST_PAD = 3
 #: How far the tray swells under the pointer, in pixels per side. Small on
 #: purpose: this is an acknowledgement, not an invitation.
 _REST_GROW = 1.5
+#: How opaque the resting tray's interior is. Not a look, a hit target:
+#: see-through pixels on a colour-keyed window pass the mouse through,
+#: so a truly empty tray cannot be clicked. Low enough to read as empty
+#: on a dark desktop, high enough that Windows hit-tests it.
+_REST_SCRIM = 0.30
+
 #: The resting window's outer size, and the width the morph starts from.
 _DOT_BOX = _REST_W + 2 * _REST_PAD
 
@@ -937,6 +943,20 @@ def render_bar(
         )
         body_draw.rounded_rectangle(box, radius=_safe_radius(box, radius + pad), **kwargs)
 
+    if fill_t < 0.999:
+        # A scrim across the resting tray, and it is load-bearing rather than
+        # decorative: Windows hit-tests a colour-keyed window by its
+        # *transparency*, so a pixel that keys out does not merely look
+        # see-through, it passes the mouse straight through to whatever is
+        # behind. An outline with a genuinely empty middle therefore has a
+        # hit target the width of its own stroke -- hovering or clicking the
+        # centre of the bar lands in the app underneath it, which makes the
+        # product's one always-present control almost impossible to use.
+        #
+        # The scrim is opaque enough to hit-test and dark enough to read as
+        # nothing on a dark desktop. On a light one it is a faint dark tray,
+        # which is the honest cost of the tray being clickable at all.
+        _capsule(0.0, fill=_alpha(SURFACE, _REST_SCRIM * opacity))
     if fill_t > 0.01:
         # The surface *wipes* in from the centre line rather than fading in,
         # and this is forced by the window, not a stylistic choice. Windows'

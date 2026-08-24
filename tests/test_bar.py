@@ -102,16 +102,24 @@ def test_the_resting_tray_is_small_and_says_nothing():
     assert actions(regions) == [ACTION_MENU]
 
 
-def test_the_resting_tray_is_see_through():
-    """The whole point of it: the desktop shows through the middle, so the
-    bar is an outline rather than an object sitting on top of things."""
+def test_the_resting_tray_reads_as_empty_without_being_click_through():
+    """The tray has to *look* like an outline and still *behave* like a
+    target.
+
+    An earlier version of this test asserted the interior was exactly the key
+    colour, which is the same thing as asserting the bar cannot be clicked --
+    Windows hit-tests a colour-keyed window by its transparency, so those
+    pixels went to the window behind. The interior is now a very dark scrim:
+    nothing to look at on a dark desktop, but solid to the mouse.
+    """
     image, _ = render_dot()
     pixels = image.load()
     centre_row = [
         pixels[x, image.height // 2][:3]
         for x in range(image.width // 3, 2 * image.width // 3)
     ]
-    assert all(pixel == _KEY_RGB for pixel in centre_row), "the tray is not empty"
+    assert all(pixel != _KEY_RGB for pixel in centre_row), "would be click-through"
+    assert all(sum(pixel) < 90 for pixel in centre_row), "too solid to read as empty"
 
 
 def test_the_resting_tray_still_draws_an_outline():
@@ -260,17 +268,22 @@ def test_the_capsule_interior_is_never_the_key_colour():
         assert pixels[x, mid_y][:3] != _KEY_RGB
 
 
-def test_the_dot_keys_out_most_of_its_box():
-    """The resting state is a circle, not a square."""
+def test_the_resting_tray_is_a_rounded_shape_not_a_rectangle():
+    """The corners have to key out, or the bar is a box.
+
+    Deliberately checks the corners rather than a share of the whole window:
+    the tray now fills most of a tight box by design, so a percentage
+    threshold would only measure the padding.
+    """
     image, _ = render_dot()
     pixels = image.load()
-    keyed = sum(
-        1
-        for y in range(image.height)
-        for x in range(image.width)
-        if pixels[x, y][:3] == _KEY_RGB
-    )
-    assert keyed / (image.width * image.height) > 0.4
+    for x, y in (
+        (0, 0),
+        (image.width - 1, 0),
+        (0, image.height - 1),
+        (image.width - 1, image.height - 1),
+    ):
+        assert pixels[x, y][:3] == _KEY_RGB, f"corner {(x, y)} would not key out"
 
 
 # -- the menu --------------------------------------------------------------
@@ -888,3 +901,64 @@ def test_dismissing_dispatches_no_action():
     bar._on_action = dispatched.append
     bar._dismiss_on_outside_click()
     assert dispatched == []
+
+
+# -- the resting tray has to be clickable ----------------------------------
+#
+# Windows hit-tests a colour-keyed window by its transparency, not by its
+# window rect: a pixel that keys out passes the mouse *through* to whatever
+# is behind it. So "see-through" and "clickable" are the same property here,
+# and an outline with a genuinely empty middle has a hit target the width of
+# its own stroke. Measured on the real thing, the tray's centre eight rows
+# were landing in the browser behind it.
+
+
+def test_the_resting_tray_has_no_click_through_holes():
+    image, _ = render_dot()
+    pixels = image.load()
+    # Inside the tray's own silhouette, allowing for the rounded ends.
+    holes = [
+        (x, y)
+        for y in range(_REST_PAD + 2, image.height - _REST_PAD - 2)
+        for x in range(_REST_PAD + 9, image.width - _REST_PAD - 9)
+        if pixels[x, y][:3] == _KEY_RGB
+    ]
+    assert not holes, f"{len(holes)} pixels would pass the mouse through, e.g. {holes[:4]}"
+
+
+def test_the_resting_tray_is_still_visually_quiet():
+    """Hittable, but only just visible: on a dark desktop the interior has to
+    read as nothing at all."""
+    image, _ = render_dot()
+    interior = image.load()[image.width // 2, image.height // 2][:3]
+    assert interior != _KEY_RGB, "not hittable"
+    assert sum(interior) < 90, "too solid to read as an empty tray"
+
+
+def test_a_hidden_tray_is_still_clickable():
+    """Hidden dims the tray; it must not dim it into being click-through, or
+    there is no way left to reach the menu and un-hide it."""
+    image, _ = render_dot(opacity=0.42)
+    pixels = image.load()
+    row = image.height // 2
+    interior = [
+        pixels[x, row][:3]
+        for x in range(_REST_PAD + 9, image.width - _REST_PAD - 9)
+    ]
+    assert all(pixel != _KEY_RGB for pixel in interior)
+
+
+@pytest.mark.parametrize("expand", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+def test_the_bar_is_clickable_at_every_point_of_the_morph(expand):
+    """A target that is solid at both ends and porous in between is worse
+    than one that is porous throughout, because it fails only sometimes."""
+    image, _ = render_bar(BarState.IDLE, "", expand=expand)
+    pixels = image.load()
+    half = image.height / 2
+    holes = [
+        (x, y)
+        for y in range(round(image.height * 0.35), round(image.height * 0.65) + 1)
+        for x in range(round(half), round(image.width - half) + 1)
+        if pixels[x, y][:3] == _KEY_RGB
+    ]
+    assert not holes, f"expand={expand}: {len(holes)} click-through pixels"
