@@ -105,12 +105,15 @@ _RESERVED_CHORD_SHAPES = frozenset({"ctrl+c", "ctrl+v", "ctrl+x", "ctrl+alt+dele
 
 
 def _is_valid_chord_shape(shortcut: str) -> bool:
-    """Pynput-free mirror of flow.hotkey.parse_chord's acceptance rules.
+    """Pynput-free mirror of the "modifiers + key" chord acceptance rules in
+    flow.hotkey.parse_binding (config.toml can only express this one binding
+    shape -- the richer ones, like a modifier-only combo or a mouse button,
+    are settings.json/UI-only; see sway.hotkey.effective_bindings).
 
     Validates a chord string read from config.toml without importing
     pynput, for the same reason _VALID_HOTKEYS exists instead of importing
-    KNOWN_KEYS. A test checks this never drifts from parse_chord's actual
-    behaviour.
+    KNOWN_KEYS. A test checks this never drifts from parse_binding's actual
+    behaviour for this shape.
     """
     parts = [p.strip().lower() for p in shortcut.split("+") if p.strip()]
     if not parts:
@@ -236,7 +239,7 @@ class HotkeyConfig:
     #: modifiers in many apps and holding one risks disturbing the selection.
     command_key: str | None = "shift_r"
     #: Optional alternate binding for dictation: a modifier chord (see
-    #: flow.hotkey.parse_chord) that starts/stops a session with a tap
+    #: flow.hotkey.parse_binding) that starts/stops a session with a tap
     #: instead of being held. None means dictation only answers to `key`.
     key_chord: str | None = None
     #: Optional alternate chord for the voice-command hotkey, same shape as

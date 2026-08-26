@@ -18,10 +18,13 @@ from sway.bar import RECOVERY, BarState, recovery_for
 from sway.engine import (
     Engine,
     _describe_failure,
+    _drop_duplicate_bindings,
     _failure_label,
+    frames_before,
     preroll_start_frame,
     should_process,
 )
+from sway.hotkey import parse_binding
 from sway.errors import AudioError, ClipboardError, PasteBlockedError, SwayError
 from sway.groq_client import GroqError, GroqRateLimitError
 
@@ -60,6 +63,71 @@ def test_preroll_is_clamped_at_the_start_of_the_stream():
 
 def test_zero_preroll_is_the_old_behaviour():
     assert preroll_start_frame(mark=12_345, preroll_frames=0) == 12_345
+
+
+# -- prefix-grace back-date ---------------------------------------------------
+# A dictation engage deferred by sway.hotkey's prefix grace (up to
+# PREFIX_GRACE_S, see BindingListener._begin_hold_locked) must not cost the
+# user any audio -- the mic has been writing throughout regardless. Composed
+# with preroll_start_frame at the engage site: frames_before reclaims the
+# grace delay, then preroll_start_frame reaches back further still.
+
+
+def test_frames_before_reclaims_the_grace_delay():
+    # 180ms (PREFIX_GRACE_S) at 16kHz is 2880 frames.
+    assert frames_before(mark=100_000, seconds=0.18, sample_rate=16_000) == 97_120
+
+
+def test_frames_before_is_a_no_op_for_zero_delay():
+    assert frames_before(mark=100_000, seconds=0.0, sample_rate=16_000) == 100_000
+
+
+def test_frames_before_clamped_at_the_start_of_the_stream():
+    assert frames_before(mark=1000, seconds=0.18, sample_rate=16_000) == 0
+
+
+def test_frames_before_treats_a_negative_delay_as_zero():
+    # An undeferred press computes now - press_time == 0 exactly, but a
+    # caller must not accidentally seek *forward* on any float imprecision.
+    assert frames_before(mark=100_000, seconds=-0.001, sample_rate=16_000) == 100_000
+
+
+# -- duplicate-binding backstop ----------------------------------------------
+# Two actions accidentally bound to the exact same physical gesture: the save
+# paths already refuse or flag this, so this is only a defensive backstop --
+# but it is also what feeds the registration ledger's "duplicate" status
+# (see Engine._rebind_all_bindings), so it must say *which* binding won.
+
+
+def test_drop_duplicate_bindings_keeps_the_first_and_reports_no_drops_when_disjoint():
+    mapping = {"dictation:0": (parse_binding("ctrl_r"), None, None)}
+    kept, dropped = _drop_duplicate_bindings(mapping, kind="binding")
+    assert kept == mapping
+    assert dropped == {}
+
+
+def test_drop_duplicate_bindings_drops_the_later_registration_and_names_the_winner():
+    mapping = {
+        "dictation:0": (parse_binding("ctrl_r"), "first", None),
+        "hands_free:0": (parse_binding("ctrl_r"), "second", None),
+    }
+    kept, dropped = _drop_duplicate_bindings(mapping, kind="binding")
+    assert list(kept) == ["dictation:0"]
+    assert dropped == {"hands_free:0": "dictation:0"}
+
+
+def test_drop_duplicate_bindings_insertion_order_is_registration_priority():
+    """dictation registers before hands_free in Engine._rebind_all_bindings,
+    so when both claim the same gesture dictation must be the one kept --
+    this pins that the function itself has no independent ordering rule of
+    its own; it trusts caller insertion order."""
+    mapping = {
+        "hands_free:0": (parse_binding("shift_r"), "first-in-dict-order", None),
+        "dictation:0": (parse_binding("shift_r"), "second-in-dict-order", None),
+    }
+    kept, dropped = _drop_duplicate_bindings(mapping, kind="binding")
+    assert list(kept) == ["hands_free:0"]  # whichever came first in the mapping wins
+    assert dropped == {"dictation:0": "hands_free:0"}
 
 
 # -- failure labelling -------------------------------------------------------
@@ -256,14 +324,18 @@ class FakeSettings:
         self._onboarded = onboarded
 
     def get(self):
-        return type("S", (), {"onboarding_complete": self._onboarded})()
+        return type(
+            "S",
+            (),
+            {"onboarding_complete": self._onboarded, "dictation_bindings": None},
+        )()
 
 
 def _tap_engine(bar, *, onboarded, successes=0):
     engine = _engine_with(bar)
     engine._settings = FakeSettings(onboarded)
     engine._config = type(
-        "C", (), {"hotkey": type("H", (), {"key": "ctrl_r"})()}
+        "C", (), {"hotkey": type("H", (), {"key": "ctrl_r", "key_chord": None})()}
     )()
     engine._last_tap_at = 0.0
     engine._tap_streak = 0
@@ -487,7 +559,9 @@ def _release_only_engine(monkeypatch) -> tuple[Engine, _Recorder]:
     engine._focused_process = "notepad.exe"
     engine._stream_session = None
     engine._config = SimpleNamespace(
-        hotkey=SimpleNamespace(min_hold_ms=200), streaming=SimpleNamespace(enabled=False)
+        hotkey=SimpleNamespace(min_hold_ms=200),
+        streaming=SimpleNamespace(enabled=False),
+        audio=SimpleNamespace(sample_rate=16000),
     )
     engine._set_ui_state = lambda *a, **k: None
     engine._coach_tap = lambda _at: None

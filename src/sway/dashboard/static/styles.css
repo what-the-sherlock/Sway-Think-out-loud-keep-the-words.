@@ -548,6 +548,55 @@ select.input { cursor: pointer; appearance: none;
 .modal-foot { padding: 0 30px 26px; display: flex; gap: 10px; align-items: center; }
 .modal-foot .spacer { flex: 1; }
 
+/* The transform editor: a wide two-pane sheet rather than a form-in-a-modal
+   (§ transforms). Same scrim/close/Escape machinery as .modal -- only the
+   size and internal layout differ. */
+.modal.wide { width: 920px; max-height: 88vh; }
+.modal.wide .modal-body { padding: 30px 34px; gap: 0; }
+
+.sheet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
+.sheet-col { display: flex; flex-direction: column; min-width: 0; }
+.sheet-name-input {
+  border: 0; background: none; padding: 0; font: inherit;
+  font-family: var(--serif); font-size: 28px; font-weight: 400;
+  width: 100%; color: var(--ink);
+}
+.sheet-name-input:focus { outline: none; }
+.sheet-prompt { flex: 1; min-height: 220px; font-size: 14.5px; line-height: 1.6; }
+
+.transform-example {
+  line-height: 1.7; font-size: 14px;
+  max-height: 260px; overflow-y: auto;
+  -webkit-user-select: text; user-select: text; cursor: auto;
+}
+.diff-del { color: var(--muted); text-decoration: line-through; }
+.diff-ins { background: var(--teal-fill); color: var(--ink); border-radius: 3px; padding: 0 1px; text-decoration: none; }
+
+/* ------------------------------------------------------------ transform cards */
+
+.transform-card { display: flex; flex-direction: column; gap: 4px; cursor: pointer; text-align: left; }
+.transform-card-caps { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; }
+.transform-card-preview {
+  margin-top: 4px; line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.transform-card-actions { display: flex; gap: 6px; margin-top: auto; padding-top: 10px; }
+
+/* The dashed "create your own" tile: same grid slot as a card, invites the
+   one action a checkbox list never could. */
+.transform-tile {
+  border: 1.5px dashed var(--hairline); border-radius: var(--r-card);
+  background: none; font: inherit; color: var(--ink);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 22px 24px; cursor: pointer; min-height: 148px; text-align: center;
+}
+.transform-tile:hover { background: var(--well); border-color: var(--muted); }
+.transform-tile-plus {
+  width: 34px; height: 34px; border-radius: 50%; background: var(--well);
+  display: flex; align-items: center; justify-content: center; color: var(--muted);
+}
+.transform-tile-plus svg { width: 16px; height: 16px; }
+
 .field-label { font-size: 13px; font-weight: 500; margin-bottom: 7px; display: block; }
 .check-row { display: flex; align-items: flex-start; gap: 9px; font-size: 13px;
   padding: 5px 0; cursor: pointer; line-height: 1.45; }

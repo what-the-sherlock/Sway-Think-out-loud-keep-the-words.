@@ -6,11 +6,12 @@ Threading model (see CLAUDE.md's architecture rules for why):
 
 * :class:`~flow.audio.capture.AudioCapture` opens the mic once at
   :meth:`Engine.start` and its callback only writes into the ring buffer.
-* :class:`~flow.hotkey.HotkeyListener` runs pynput's own listener thread, one
-  for the dictation key and one for the command key (Phase 5). Each
-  ``on_release`` hands its recorded span off to a fresh worker thread rather
-  than processing inline, so the listener is free to see the next key event
-  immediately.
+* :class:`~flow.hotkey.BindingListener` runs one pynput keyboard hook and one
+  mouse hook for every binding at once: dictation's, the command's,
+  hands-free's, and every transform's, however many each holds. A
+  hold-shaped binding's "disengage" hands its recorded span off to a fresh
+  worker thread rather than processing inline, so the listener is free to
+  see the next event immediately.
 * :class:`~flow.streaming.ChunkStreamer` (Phase 4) runs its own background
   thread, started on press and stopped on release, that ships overlapping
   audio chunks to Groq while the user is still speaking. See
@@ -89,15 +90,14 @@ from sway.groq_client import (
 from sway.history import KIND_COMMAND, KIND_DICTATION, HistoryStore
 from sway.history_window import HistoryWindow
 from sway.hotkey import (
-    KNOWN_KEYS,
-    Chord,
-    ChordError,
-    ChordListener,
+    Binding,
+    BindingError,
+    BindingListener,
     DoubleTapTracker,
-    HotkeyListener,
+    RefCountedGate,
     TapModeTracker,
-    find_binding_conflicts,
-    parse_chord,
+    effective_bindings,
+    parse_binding,
     prettify_hotkey,
 )
 from sway.inject import TextInjector
@@ -111,10 +111,12 @@ from sway.bar import (
     MenuItem,
     NullBar,
     SwayBar,
+    TransformReviewPanel,
 )
+from sway.diff import change_count, word_diff
 from sway.platform import PlatformAdapter, get_platform
 from sway.profiles import CleanupStyle, style_for_process
-from sway.selection import SelectionReader
+from sway.selection import SelectionReader, selection_budget_s
 from sway.settings import SettingsStore, apply_to_config
 from sway import transforms as transforms_module
 from sway.transforms import Transform, build_directive_block, expectation_for
@@ -143,6 +145,44 @@ def should_process(held_ms: float, min_hold_ms: int) -> bool:
     return held_ms >= min_hold_ms
 
 
+def _drop_duplicate_bindings(
+    mapping: dict[str, tuple], *, kind: str
+) -> tuple[dict[str, tuple], dict[str, str]]:
+    """Keep the first registration of each distinct :class:`~sway.hotkey.Binding`
+    value, dropping any later one that repeats it.
+
+    Two different actions accidentally bound to the exact same physical
+    gesture is genuinely broken -- BindingListener would otherwise register
+    both, and only one could ever actually claim a given press. The save
+    paths (``save_activation_binding``, ``save_transform``) already refuse
+    an activation-target collision outright and flag a transform collision
+    as a visible warning, so this should rarely trigger in practice; it
+    exists as the same defensive backstop :meth:`_bind_transform_shortcuts`
+    (the module this replaced) always had, now covering hold-shaped
+    bindings too. Insertion order is registration priority: dictation, then
+    command, then hands-free, then transforms, in the order
+    :meth:`Engine._rebind_all_bindings` registers them.
+
+    Returns ``(kept, dropped)`` -- ``dropped`` maps a losing slot id to the
+    slot id that won, so the registration ledger (see
+    :meth:`Engine._rebind_all_bindings`) can say not just *that* a binding
+    was dropped but *which* one it lost to.
+    """
+    seen: dict[Any, str] = {}
+    result: dict[str, tuple] = {}
+    dropped: dict[str, str] = {}
+    for slot_id, entry in mapping.items():
+        binding = entry[0]
+        if binding in seen:
+            winner = seen[binding]
+            logger.warning("%s %s is bound twice; keeping %s", kind, binding, winner)
+            dropped[slot_id] = winner
+            continue
+        seen[binding] = slot_id
+        result[slot_id] = entry
+    return result, dropped
+
+
 def preroll_start_frame(mark: int, preroll_frames: int) -> int:
     """Where a dictation should actually start reading from the ring buffer.
 
@@ -155,6 +195,46 @@ def preroll_start_frame(mark: int, preroll_frames: int) -> int:
     frames exist than the pre-roll asks for.
     """
     return max(0, mark - preroll_frames)
+
+
+def frames_before(mark: int, seconds: float, sample_rate: int) -> int:
+    """The ring position ``seconds`` before ``mark``, clamped at 0.
+
+    A dictation engage can be deferred by ``sway.hotkey``'s prefix grace (up
+    to PREFIX_GRACE_S) so a chord sharing the same bare hold key can be told
+    apart first -- see BindingListener._begin_hold_locked. The mic stream
+    has been writing throughout regardless (CLAUDE.md), so that grace window
+    is already sitting in the ring buffer and costs nothing to reclaim: this
+    is what makes the deferral free rather than a hole at the front of the
+    dictation. ``seconds`` is negative-clamped to 0 so a caller passing
+    ``now - press_time`` for an *undeferred* press (where the two are equal)
+    is a no-op, not a forward seek.
+    """
+    return max(0, mark - int(max(0.0, seconds) * sample_rate))
+
+
+@dataclass(frozen=True, slots=True)
+class BindingRecord:
+    """One configured binding's registration status, for the dashboard's
+    read-only "Registered shortcuts" table (see :meth:`Engine.describe`) and
+    for the one-line-per-binding log :meth:`Engine._rebind_all_bindings`
+    writes on every rebind.
+
+    Built in the engine, not in :class:`~sway.hotkey.BindingListener`: the
+    listener only ever sees already-parsed :class:`~sway.hotkey.Binding`
+    objects, with no idea of raw strings, parse failures, or which action a
+    slot id belongs to -- ``_rebind_all_bindings`` is the one place that
+    sees all of that at once.
+    """
+
+    slot_id: str  # e.g. "dictation:0", "transform:<id>:1"
+    owner: str  # "dictation" | "command" | "hands_free" | "transform:<id>"
+    label: str  # human name, e.g. 'the "Turn into an email" transform'
+    value: str  # the raw stored binding string
+    pretty: str  # Binding.pretty(), or "" when it did not parse
+    shape: str  # "hold" | "tap" | "" (empty when it did not parse)
+    status: str  # "registered" | "invalid" | "duplicate"
+    detail: str  # the BindingError text, or the slot id that won, or ""
 
 
 def _failure_label(exc: Exception) -> str:
@@ -261,6 +341,27 @@ class _Transcript:
     audio_ms: float | None = None
 
 
+@dataclass
+class PendingTransformResult:
+    """One shortcut-run transform's result, held between the review panel
+    opening and the user acting on it (Apply, Copy, Retry, Undo, or simply
+    dismissing it).
+
+    Mutable (not frozen) on purpose: Retry replaces ``transformed`` in place
+    for a panel that is already open, and Apply flips ``applied`` so a
+    second Apply is a no-op and Undo knows there is something to undo.
+    """
+
+    transform_id: str
+    transform_name: str
+    original: str
+    transformed: str
+    instruction: str
+    focused_process: str | None
+    activation: Activation | None
+    applied: bool = False
+
+
 class Engine:
     """Owns every long-lived resource for one run of the app."""
 
@@ -288,9 +389,43 @@ class Engine:
             mode=config.audio.vad_mode,
             padding_ms=config.audio.vad_padding_ms,
         )
-        self._injector = TextInjector(self._platform, restore_delay_ms=config.paste.restore_delay_ms)
+        #: One OS-level hook (one keyboard listener, one mouse listener) for
+        #: every binding in the app at once: dictation's, the voice command's,
+        #: hands-free's, and every transform's -- however many each holds.
+        #: Rebuilt from settings by :meth:`_rebind_all_bindings` at startup
+        #: and again whenever any of them changes. Constructed here, ahead of
+        #: TextInjector/SelectionReader below, because both need
+        #: self._bindings.suspended to guard their own synthetic keystrokes.
+        self._bindings = BindingListener(modifier_probe=self._platform.modifier_keys_down)
+        #: Every configured binding's registration status, rebuilt on every
+        #: :meth:`_rebind_all_bindings` call -- what `describe()` exposes to
+        #: the dashboard's read-only "Registered shortcuts" table.
+        self._binding_ledger: list[BindingRecord] = []
+        #: slot_id -> (fire_count, last_fired_at as time.time()). Survives a
+        #: rebind for any slot id that still exists afterward -- see
+        #: _rebind_all_bindings's pruning.
+        self._binding_fires: dict[str, tuple[int, float]] = {}
+        #: Guards against two shortcut-run transforms overlapping -- see
+        #: _run_transform, which would otherwise reset _selected_text under
+        #: a still-running capture.
+        self._transform_lock = threading.Lock()
+        self._transform_running = False
+        self._injector = TextInjector(
+            self._platform,
+            restore_delay_ms=config.paste.restore_delay_ms,
+            suspend_input=self._bindings.suspended,
+        )
         self._selection_reader = SelectionReader(
-            self._platform, timeout_s=config.commands.selection_timeout_s
+            self._platform,
+            timeout_s=config.commands.selection_timeout_s,
+            suspend_input=self._bindings.suspended,
+            # The same probe self._bindings uses to heal its own hook state
+            # (see BindingListener's own modifier_probe= above), here doing
+            # a different job: not sending the synthetic Ctrl+C while the
+            # user is still holding the Shift/Alt/Win of the chord that
+            # fired the transform. Every shipped transform shortcut is
+            # Ctrl+Alt+N, and Ctrl+Alt+C is not copy anywhere.
+            modifier_probe=self._platform.modifier_keys_down,
         )
         #: The same store the config above was built from, handed to the
         #: dashboard so both read one source rather than two that could drift.
@@ -303,6 +438,11 @@ class Engine:
         self._dictionary: DictionaryStore | None = None
         self._history: HistoryStore | None = None
         self._history_window: HistoryWindow | None = None
+        #: The review panel for a shortcut-run transform's before/after, and
+        #: the result it is currently showing (if any). Built once, on the
+        #: Tk thread, and reused across runs -- see _present_transform_result.
+        self._transform_panel: TransformReviewPanel | None = None
+        self._pending_transform: PendingTransformResult | None = None
         self._tray: TrayIcon | None = None
         self._dashboard: DashboardServer | None = None
         self._window: AppWindow | None = None
@@ -337,23 +477,10 @@ class Engine:
         self._listening = True
         self._listening_lock = threading.Lock()
 
-        self._hotkey = HotkeyListener(
-            key=KNOWN_KEYS[config.hotkey.key],
-            on_press=self._on_press,
-            on_release=self._on_release,
-        )
-        self._command_hotkey: HotkeyListener | None = None
-        #: One OS hook for every tap-shaped shortcut: transform shortcuts,
-        #: dictation's/command's optional alternate chord, and hands-free's
-        #: chord binding all share this table, rebuilt from settings at
-        #: startup and again whenever any of them changes.
-        self._chords = ChordListener()
-        if config.hotkey.command_key is not None:
-            self._command_hotkey = HotkeyListener(
-                key=KNOWN_KEYS[config.hotkey.command_key],
-                on_press=self._on_command_press,
-                on_release=self._on_command_release,
-            )
+        #: Coalesce however many hold-shaped bindings one action has into a
+        #: single start/stop pair -- see sway.hotkey.RefCountedGate.
+        self._dictation_gate = RefCountedGate()
+        self._command_gate = RefCountedGate()
 
         self._preroll_frames = round(config.audio.preroll_ms / 1000.0 * config.audio.sample_rate)
         self._start_frame = 0
@@ -369,26 +496,23 @@ class Engine:
         self._selected_text = ""
 
         # -- hands-free dictation (Phase 6): tap to start, tap again to stop.
-        # See _configure_hands_free for how the binding (a bare held key,
-        # double-tapped or not, vs. a chord) maps onto _hands_free_key_listener
-        # / self._chords.
+        # See _configure_hands_free for how the binding (a bare held key or
+        # combo, double-tapped or not, vs. a chord) maps onto self._bindings.
         self._hands_free_active = False
         self._hands_free_tracker: TapModeTracker | DoubleTapTracker | None = None
-        self._hands_free_key_listener: HotkeyListener | None = None
         self._hands_free_session: ChunkStreamer | None = None
         self._hands_free_start_frame = 0
         self._hands_free_focused_process: str | None = None
         self._hands_free_timer: threading.Thread | None = None
-        self._configure_hands_free()
 
-        # Dictation's and the voice command's optional alternate chord (the
-        # reference's "+" affordance): a chord fires once per tap, so unlike
-        # the primary hold key it starts/stops a session rather than being
-        # held -- driven by the same TapModeTracker hands-free uses, and
-        # protected by the same safety ceiling (_hands_free_max_seconds is
-        # reused here as "how long a *toggle-shaped* session may run before
-        # being force-stopped", not just a hands-free-specific concept) so a
-        # missed second tap can never leave the app looking stuck recording.
+        # Any binding tap-shaped rather than hold-shaped (the reference's "+"
+        # affordance): a tap fires once, so unlike a held key or combo it
+        # starts/stops a session rather than being held -- driven by the same
+        # TapModeTracker hands-free uses, and protected by the same safety
+        # ceiling (_hands_free_max_seconds is reused here as "how long a
+        # *toggle-shaped* session may run before being force-stopped", not
+        # just a hands-free-specific concept) so a missed second tap can
+        # never leave the app looking stuck recording.
         self._dictation_chord_tracker = TapModeTracker(
             max_active_s=float(config.hotkey.hands_free_max_seconds)
         )
@@ -403,6 +527,8 @@ class Engine:
         #: and every release claims it, so a second release with no press
         #: behind it cannot re-dispatch the same audio. See sway.activation.
         self._activations = ActivationLedger()
+
+        self._rebind_all_bindings()
 
     # -- lifecycle -----------------------------------------------------
 
@@ -424,13 +550,7 @@ class Engine:
                 logger.error("personal dictionary disabled: %s", exc)
         if self._config.history.enabled:
             self._start_history()
-        self._hotkey.start()
-        if self._command_hotkey is not None:
-            self._command_hotkey.start()
-        if self._hands_free_key_listener is not None:
-            self._hands_free_key_listener.start()
-        self._bind_transform_shortcuts()
-        self._chords.start()
+        self._bindings.start()
         self._start_activation_timeout_pump()
         if self._config.tray.enabled:
             self._tray = TrayIcon(
@@ -455,11 +575,15 @@ class Engine:
         self._bar.set_listening(self.is_listening)
         self._bar.set_can_paste(False)
         self._refresh_bar_hint()
-        logger.info("Sway ready. Hold %s to dictate.", prettify_hotkey(self._config.hotkey.key))
-        if self._command_hotkey is not None:
+        dictation_label = self._primary_binding_label(self._effective_dictation_bindings())
+        if dictation_label:
+            logger.info("Sway ready. Hold %s to dictate.", dictation_label)
+        else:
+            logger.info("Sway ready, but dictation has no binding -- add one in Settings.")
+        command_label = self._primary_binding_label(self._effective_command_bindings())
+        if command_label:
             logger.info(
-                "Hold %s with text selected to run a voice command.",
-                prettify_hotkey(self._config.hotkey.command_key),
+                "Hold %s with text selected to run a voice command.", command_label
             )
 
     def _start_history(self) -> None:
@@ -621,10 +745,7 @@ class Engine:
         """Idempotent; safe to call even if :meth:`start` only partly succeeded."""
         self._stopping = True
         for label, action in (
-            ("hotkey", self._hotkey.stop),
-            ("command hotkey", self._stop_command_hotkey),
-            ("hands-free key", self._stop_hands_free_listener),
-            ("transform shortcuts", self._chords.stop),
+            ("bindings", self._bindings.stop),
             ("tray", self._stop_tray),
             ("window", self._stop_window),
             ("dashboard", self._stop_dashboard),
@@ -662,14 +783,6 @@ class Engine:
     def _stop_history(self) -> None:
         if self._history is not None:
             self._history.close()
-
-    def _stop_command_hotkey(self) -> None:
-        if self._command_hotkey is not None:
-            self._command_hotkey.stop()
-
-    def _stop_hands_free_listener(self) -> None:
-        if self._hands_free_key_listener is not None:
-            self._hands_free_key_listener.stop()
 
     def _warn_if_another_instance_is_live(self) -> None:
         """Say so, loudly, if a copy of Sway is already running.
@@ -806,16 +919,50 @@ class Engine:
             self._history_window = HistoryWindow(root, self._history)
         self._history_window.show()
 
+    # -- binding gates: collapse N hold-shaped bindings into one start/stop --
+    #
+    # A dictation or command binding is now a *list*, and more than one entry
+    # can be hold-shaped (e.g. both ctrl_r and ctrl+cmd bound to dictation).
+    # These wrappers are what BindingListener actually calls; the real
+    # _on_press/_on_release only run on the first binding to engage / the
+    # last one to disengage, via sway.hotkey.RefCountedGate. See its
+    # docstring for why this matters -- without it, a second binding
+    # engaging mid-recording would restart the capture's bookkeeping and
+    # silently truncate what the user already said.
+
+    def _dictation_binding_engaged(self, pressed_at: float) -> None:
+        if self._dictation_gate.acquire():
+            self._on_press(pressed_at)
+
+    def _dictation_binding_disengaged(self) -> None:
+        if self._dictation_gate.release():
+            self._on_release()
+
+    def _command_binding_engaged(self, pressed_at: float) -> None:
+        if self._command_gate.acquire():
+            self._on_command_press(pressed_at)
+
+    def _command_binding_disengaged(self) -> None:
+        if self._command_gate.release():
+            self._on_command_release()
+
     # -- dictation hotkey callbacks (called from the pynput listener thread) --
 
-    def _on_press(self) -> None:
-        self._press_time = time.monotonic()
+    def _on_press(self, pressed_at: float | None = None) -> None:
+        now = time.monotonic()
+        # The true physical press instant, even when the engage itself was
+        # deferred by sway.hotkey's prefix grace -- so should_process below
+        # measures the real hold duration, not the post-grace remainder.
+        self._press_time = now if pressed_at is None else pressed_at
         # Read by /api/status so onboarding can show the key lighting up as
         # it is physically held. A plain bool assignment, so the listener
         # thread is not slowed by it.
         self._hotkey_down = True
         self._activations.begin(DICTATION)
-        self._start_frame = preroll_start_frame(self._ring.mark(), self._preroll_frames)
+        self._start_frame = preroll_start_frame(
+            frames_before(self._ring.mark(), now - self._press_time, self._config.audio.sample_rate),
+            self._preroll_frames,
+        )
         # Captured at press time, when the target app is unambiguously the one
         # the user is dictating into; PlatformAdapter guarantees this never
         # raises, so no try/except is needed on this hot path.
@@ -901,7 +1048,7 @@ class Engine:
             self._set_ui_state(BarState.IDLE)
             return
 
-        key = prettify_hotkey(self._config.hotkey.key)
+        key = self._primary_binding_label(self._effective_dictation_bindings()) or "your hotkey"
         if repeated:
             text = f"Hold [[{key}]] down, speak, then let go"
         else:
@@ -959,11 +1106,17 @@ class Engine:
 
     # -- command hotkey callbacks (Phase 5; called from the listener thread) --
 
-    def _on_command_press(self) -> None:
-        self._command_press_time = time.monotonic()
+    def _on_command_press(self, pressed_at: float | None = None) -> None:
+        now = time.monotonic()
+        self._command_press_time = now if pressed_at is None else pressed_at
         self._command_key_down = True
         self._activations.begin(COMMAND)
-        self._command_start_frame = preroll_start_frame(self._ring.mark(), self._preroll_frames)
+        self._command_start_frame = preroll_start_frame(
+            frames_before(
+                self._ring.mark(), now - self._command_press_time, self._config.audio.sample_rate
+            ),
+            self._preroll_frames,
+        )
         self._command_focused_process = self._platform.focused_process_name()
         self._set_ui_state(BarState.RECORDING)
         selection_ready = threading.Event()
@@ -1021,42 +1174,67 @@ class Engine:
 
     # -- hands-free dictation (Phase 6): tap to start, tap again to stop --
 
-    def _configure_hands_free(self) -> None:
-        """(Re)build the hands-free binding from the current effective config
-        and settings. Called at construction and again from
-        :meth:`_apply_settings` whenever anything about the binding changes.
+    # -- effective bindings: Settings' override (if any) layered over
+    # config.toml's compiled-in default, per sway.hotkey.effective_bindings --
+
+    def _effective_dictation_bindings(self) -> tuple[str, ...]:
+        hotkey_cfg = self._config.hotkey
+        return effective_bindings(self._settings.get().dictation_bindings, hotkey_cfg.key, hotkey_cfg.key_chord)
+
+    def _effective_command_bindings(self) -> tuple[str, ...]:
+        hotkey_cfg = self._config.hotkey
+        return effective_bindings(
+            self._settings.get().command_bindings, hotkey_cfg.command_key, hotkey_cfg.command_key_chord
+        )
+
+    def _effective_hands_free_bindings(self) -> tuple[str, ...]:
+        hotkey_cfg = self._config.hotkey
+        return effective_bindings(
+            self._settings.get().hands_free_bindings, hotkey_cfg.hands_free_key, hotkey_cfg.hands_free_chord
+        )
+
+    @staticmethod
+    def _primary_binding_label(bindings: tuple[str, ...]) -> str:
+        """The first binding's display label, or ``""`` if there are none.
+
+        Best-effort: a binding that somehow fails to parse (it should
+        always parse -- everything reaching Settings has already been
+        validated once) is skipped rather than raised, since this only ever
+        feeds a log line or a coaching hint.
+        """
+        for text in bindings:
+            try:
+                return parse_binding(text).pretty()
+            except BindingError:
+                continue
+        return ""
+
+    def _configure_hands_free(self) -> tuple[bool, tuple[str, ...]]:
+        """Establish whether hands-free is usable right now, and force-stop
+        an active session if it just stopped being usable.
+
+        Returns ``(usable, bindings)`` for :meth:`_rebind_all_bindings` to
+        wire into the shared listener -- ``bindings`` is empty whenever
+        ``usable`` is ``False``, so a caller never needs to check both.
 
         Never tears down a session silently: if hands-free is being turned
         off while a session is active, that session is force-stopped and
         processed first -- the mic must never be left "hot" behind a
         binding that no longer exists to stop it. If only the *binding*
-        (key/chord/timing) changes while a session is active, the running
-        session is left alone; the new binding takes effect on the next
-        toggle rather than retroactively reinterpreting a session that is
-        already speaking.
+        (which keys/chord, or the double-tap timing) changes while a session
+        is active, the running session is left alone; the new binding takes
+        effect on the next toggle rather than retroactively reinterpreting a
+        session that is already speaking.
         """
         enabled = self._settings.get().hands_free_enabled
-        hotkey_cfg = self._config.hotkey
-        has_binding = hotkey_cfg.hands_free_key is not None or hotkey_cfg.hands_free_chord is not None
-        usable = enabled and has_binding
+        bindings = self._effective_hands_free_bindings()
+        usable = enabled and bool(bindings)
 
         if not usable and self._hands_free_active:
             self._stop_hands_free(timed_out=False)
 
-        if self._hands_free_key_listener is not None:
-            self._hands_free_key_listener.stop()
-            self._hands_free_key_listener = None
-
-        if usable and hotkey_cfg.hands_free_key is not None:
-            self._hands_free_key_listener = HotkeyListener(
-                key=KNOWN_KEYS[hotkey_cfg.hands_free_key],
-                on_press=lambda: None,
-                on_release=self._toggle_hands_free,
-            )
-            if self._listening:
-                self._hands_free_key_listener.start()
-
         if usable:
+            hotkey_cfg = self._config.hotkey
             if hotkey_cfg.hands_free_double_tap:
                 self._hands_free_tracker = DoubleTapTracker(
                     max_active_s=float(hotkey_cfg.hands_free_max_seconds)
@@ -1068,10 +1246,183 @@ class Engine:
         else:
             self._hands_free_tracker = None
 
-    def _toggle_hands_free(self) -> None:
+        return usable, bindings if usable else ()
+
+    def _traced(self, slot_id: str, binding: Binding, fn: Callable[[float], None]) -> Callable[[float], None]:
+        """Wrap ``fn`` (an ``on_engaged``/``on_fire`` callback) to record a
+        fire in ``self._binding_fires`` and log it, without the callback
+        itself needing to know its own slot id.
+
+        Wrapping once here, at registration, covers both a hold-shaped
+        binding's engage and a tap-shaped one's fire -- :meth:`register`
+        below passes the same ``on_engaged`` value into both, exactly as
+        :class:`~sway.hotkey.BindingListener` itself treats them
+        symmetrically (``on_engaged``/``on_fire`` both take the press
+        instant).
+        """
+
+        def wrapped(pressed_at: float) -> None:
+            count, _ = self._binding_fires.get(slot_id, (0, 0.0))
+            self._binding_fires[slot_id] = (count + 1, time.time())
+            logger.info("binding %s (%s) fired", slot_id, binding)
+            fn(pressed_at)
+
+        return wrapped
+
+    def _rebind_all_bindings(self) -> None:
+        """Rebuild the one shared :class:`~sway.hotkey.BindingListener`'s
+        registry: every dictation, command, hands-free, and transform
+        binding at once.
+
+        Called at construction and again from :meth:`_apply_settings`
+        whenever any of them changes. The OS hooks stay up throughout (see
+        :meth:`~sway.hotkey.BindingListener.rebind`), so a binding the user
+        just set works on the very next keystroke rather than needing a
+        restart.
+
+        Never raises. A binding string that will not parse is logged and
+        skipped rather than taken as a reason to leave every other binding
+        unbound -- one bad entry must not disable the rest. Also rebuilds
+        ``self._binding_ledger`` (every configured binding's registration
+        status -- registered, invalid, or duplicate; see
+        :meth:`describe`) and prunes ``self._binding_fires`` of slot ids
+        that no longer exist, so a binding's fire history survives a
+        rebind that did not touch it.
+        """
+        settings = self._settings.get()
+        dictation = self._effective_dictation_bindings()
+        command = self._effective_command_bindings()
+        _hands_free_usable, hands_free = self._configure_hands_free()
+
+        hold_bindings: dict[str, tuple[Binding, Callable[[float], None], Callable[[], None] | None]] = {}
+        tap_bindings: dict[str, tuple[Binding, Callable[[float], None]]] = {}
+        ledger: list[BindingRecord] = []
+
+        def register(
+            group: str,
+            values: Sequence[str],
+            *,
+            label: str,
+            on_engaged: Callable[[float], None],
+            on_disengaged: Callable[[], None] | None,
+        ) -> None:
+            for index, text in enumerate(values):
+                slot_id = f"{group}:{index}"
+                try:
+                    binding = parse_binding(text)
+                except BindingError as exc:
+                    logger.warning(
+                        "%s binding %r is unusable (%s); leaving it unbound", group, text, exc
+                    )
+                    ledger.append(
+                        BindingRecord(
+                            slot_id=slot_id,
+                            owner=group,
+                            label=label,
+                            value=text,
+                            pretty="",
+                            shape="",
+                            status="invalid",
+                            detail=str(exc),
+                        )
+                    )
+                    continue
+                traced = self._traced(slot_id, binding, on_engaged)
+                if binding.shape == "hold":
+                    hold_bindings[slot_id] = (binding, traced, on_disengaged)
+                else:
+                    tap_bindings[slot_id] = (binding, traced)
+                ledger.append(
+                    BindingRecord(
+                        slot_id=slot_id,
+                        owner=group,
+                        label=label,
+                        value=text,
+                        pretty=binding.pretty(),
+                        shape=binding.shape,
+                        status="registered",
+                        detail="",
+                    )
+                )
+
+        register(
+            "dictation",
+            dictation,
+            label="the dictation hotkey",
+            on_engaged=self._dictation_binding_engaged,
+            on_disengaged=self._dictation_binding_disengaged,
+        )
+        register(
+            "command",
+            command,
+            label="the voice-command hotkey",
+            on_engaged=self._command_binding_engaged,
+            on_disengaged=self._command_binding_disengaged,
+        )
+        register(
+            "hands_free",
+            hands_free,
+            label="hands-free dictation",
+            on_engaged=self._toggle_hands_free,
+            on_disengaged=None,
+        )
+
+        try:
+            transforms = settings.transforms
+        except Exception:
+            logger.exception("could not read transforms; leaving shortcuts unbound")
+            transforms = ()
+        for transform in transforms_module.enabled_with_shortcut(transforms):
+            register(
+                f"transform:{transform.id}",
+                transform.shortcuts,
+                label=f'the "{transform.name}" transform',
+                on_engaged=self._transform_handler(transform.id),
+                on_disengaged=None,
+            )
+
+        hold_bindings, hold_dropped = _drop_duplicate_bindings(hold_bindings, kind="binding")
+        tap_bindings, tap_dropped = _drop_duplicate_bindings(tap_bindings, kind="shortcut")
+        dropped = {**hold_dropped, **tap_dropped}
+        ledger = [
+            replace(record, status="duplicate", detail=dropped[record.slot_id])
+            if record.slot_id in dropped
+            else record
+            for record in ledger
+        ]
+
+        self._bindings.rebind(hold_bindings=hold_bindings, tap_bindings=tap_bindings)
+        self._binding_ledger = ledger
+        live_slot_ids = {record.slot_id for record in ledger if record.status == "registered"}
+        self._binding_fires = {
+            slot_id: fired for slot_id, fired in self._binding_fires.items() if slot_id in live_slot_ids
+        }
+
+        total = len(hold_bindings) + len(tap_bindings)
+        for record in ledger:
+            logger.info(
+                "binding %s %r -> %s [%s]%s",
+                record.slot_id,
+                record.value,
+                record.shape or "?",
+                record.status,
+                f" ({record.detail})" if record.detail else "",
+            )
+        if total:
+            logger.info("bound %d binding(s)", total)
+        else:
+            logger.warning("no bindings are registered -- nothing will respond to the keyboard")
+
+    def _toggle_hands_free(self, pressed_at: float = 0.0) -> None:
         """Fires on a hands-free tap -- either the dedicated key listener's
         release, or the shared chord listener's tap. Runs on a listener
         thread; must return immediately.
+
+        ``pressed_at`` (the physical press instant BindingListener now
+        passes every ``on_engaged``) is accepted and unused: hands-free is a
+        toggle timed by its own DoubleTapTracker/TapModeTracker, not by how
+        long a key was held, so there is no ring-buffer back-date to apply
+        here the way dictation's press handler does.
         """
         tracker = self._hands_free_tracker
         if tracker is None:
@@ -1439,7 +1790,7 @@ class Engine:
         self, text: str, run: RunRecorder, activation: Activation | None = None
     ) -> bool:
         """Paste ``text``, or -- when the focused window is confidently
-        elevated (:meth:`~flow.platform.PlatformAdapter.paste_likely_blocked`)
+        elevated (:meth:`~flow.platform.PlatformAdapter.synthetic_input_likely_blocked`)
         and a synthetic paste would silently do nothing -- leave it on the
         clipboard instead so the user can paste it themselves with a real
         keystroke, which UIPI does not block. Returns whether the paste
@@ -1902,6 +2253,8 @@ class Engine:
         source: str = "command",
         expectation: OutputExpectation = SPOKEN_COMMAND_EXPECTATION,
         activation: Activation | None = None,
+        *,
+        transform: Transform | None = None,
     ) -> None:
         metadata: dict[str, Any] = {"source": source}
         if activation is not None:
@@ -1917,6 +2270,7 @@ class Engine:
                     instruction,
                     expectation,
                     activation,
+                    transform=transform,
                 ),
                 label="command",
             )
@@ -1930,14 +2284,50 @@ class Engine:
         instruction: str = "",
         expectation: OutputExpectation = SPOKEN_COMMAND_EXPECTATION,
         activation: Activation | None = None,
+        *,
+        transform: Transform | None = None,
     ) -> None:
+        budget_s = selection_budget_s(self._config.commands.selection_timeout_s)
         with run.stage(Stage.SELECTION):
-            selection_ready.wait(timeout=self._config.commands.selection_timeout_s + 1.0)
+            finished = selection_ready.wait(timeout=budget_s)
             selected_text = self._selected_text
         if not selected_text:
-            run.annotate(skipped="empty_selection")
-            self._set_ui_state(BarState.ERROR, detail="nothing selected")
+            run.annotate(skipped="empty_selection", selection_timed_out=not finished)
+            label = f"transform {transform.name}" if transform is not None else "voice command"
+            # This failure previously wrote to the latency DB and nowhere
+            # else, which is why a broken synthetic Ctrl+C (see
+            # sway.selection's modifier wait) went undiagnosable for as long
+            # as it did. The two causes below are unrelated -- one means the
+            # capture thread never got a chance to finish, the other means
+            # it finished and genuinely found nothing -- so distinguish them
+            # rather than folding both into one line.
+            if not finished:
+                logger.warning(
+                    "%s: the selection read did not finish within %.2fs; treating it as empty",
+                    label,
+                    budget_s,
+                )
+            else:
+                logger.warning(
+                    "%s: no text selection to work on -- the copy shortcut returned "
+                    "nothing (see the copy-attempt log lines above)",
+                    label,
+                )
+            # Say what to do about it, not just what went wrong: "nothing
+            # selected" alone left the user guessing whether the shortcut
+            # had even registered.
+            self._set_ui_state(
+                BarState.ERROR,
+                detail="Select some text first, then press the shortcut",
+                kind="empty_selection",
+            )
             return
+
+        # The selection is in hand and the network call is next -- the slow
+        # part. Retitle so the bar reads as progressing rather than stuck on
+        # whatever it said a second ago.
+        if transform is not None:
+            self._set_ui_state(BarState.THINKING, detail=f"Rewriting — {transform.name}")
 
         # A transform supplies its instruction from storage, so there is
         # nothing to transcribe and this path makes one network call where a
@@ -2009,6 +2399,34 @@ class Engine:
                 run.annotate(command_guardrail_reason=reason)
                 transformed = selected_text
 
+        run.annotate(characters=len(transformed))
+
+        if transform is not None:
+            if transformed == selected_text:
+                # The guardrail rejected the model's output (or it produced
+                # nothing) -- there is no real change to preview, and an
+                # empty "0 Changes" panel would just be confusing. Say so on
+                # the bar instead, the same way a rejected result already
+                # does on the non-preview command path.
+                self._set_ui_state(
+                    BarState.DONE, detail="No usable result", kind="command_guardrail"
+                )
+                return
+            # Preview-first: a shortcut-run transform never pastes on its
+            # own. The result is handed to the review panel, and only
+            # Apply -- a deliberate, separate click -- actually injects it.
+            # See _present_transform_result.
+            self._present_transform_result(
+                transform,
+                original=selected_text,
+                transformed=transformed,
+                instruction=instruction_text,
+                focused_process=focused_process,
+                activation=activation,
+                run=run,
+            )
+            return
+
         with run.stage(Stage.INJECT):
             pasted = self._inject_with_fallback(transformed, run, activation)
         self._set_ui_state(
@@ -2017,7 +2435,6 @@ class Engine:
             kind="" if pasted else "paste_blocked",
         )
 
-        run.annotate(characters=len(transformed))
         self._record_history(
             kind=KIND_COMMAND,
             text=transformed,
@@ -2034,11 +2451,16 @@ class Engine:
             return self._listening
 
     def set_listening(self, listening: bool) -> None:
-        """Arm or disarm the dictation hotkey.
+        """Arm or disarm every binding: dictation, command, hands-free, and
+        every transform shortcut.
 
         Idempotent, and safe to call from the dashboard's HTTP thread:
         pynput's listener is started and stopped from arbitrary threads
-        already (the tray does the same for the overlay).
+        already (the tray does the same for the overlay). One shared
+        listener now backs all of them, so pausing genuinely stops every
+        gesture rather than only the two hold keys -- a transform shortcut
+        firing while the app claims to be paused would be a worse surprise
+        than a shortcut that briefly stops working until Resume.
         """
         with self._listening_lock:
             if listening == self._listening:
@@ -2046,20 +2468,12 @@ class Engine:
             self._listening = listening
         try:
             if listening:
-                self._hotkey.start()
-                if self._command_hotkey is not None:
-                    self._command_hotkey.start()
-                if self._hands_free_key_listener is not None:
-                    self._hands_free_key_listener.start()
+                self._bindings.start()
                 self._bar.set_listening(True)
                 self._set_ui_state(BarState.IDLE)
                 self._refresh_bar_hint()
             else:
-                self._hotkey.stop()
-                if self._command_hotkey is not None:
-                    self._command_hotkey.stop()
-                if self._hands_free_key_listener is not None:
-                    self._hands_free_key_listener.stop()
+                self._bindings.stop()
                 if self._hands_free_active:
                     # The mic must never stay "hot" behind a paused app --
                     # same principle as the dictation/command hold keys,
@@ -2101,6 +2515,21 @@ class Engine:
             "streaming_enabled": str(self._config.streaming.enabled),
             "typing_wpm_baseline": str(self._config.analytics.typing_wpm),
             "data_directory": str(self._config.data_dir),
+            "bindings": [
+                {
+                    "slot_id": record.slot_id,
+                    "owner": record.owner,
+                    "label": record.label,
+                    "value": record.value,
+                    "pretty": record.pretty,
+                    "shape": record.shape,
+                    "status": record.status,
+                    "detail": record.detail,
+                    "fire_count": self._binding_fires.get(record.slot_id, (0, 0.0))[0],
+                    "last_fired_at": self._binding_fires.get(record.slot_id, (0, 0.0))[1] or None,
+                }
+                for record in self._binding_ledger
+            ],
         }
 
     def _start_level_pump(self) -> None:
@@ -2440,9 +2869,9 @@ class Engine:
         try:
             if self._success_count not in self._AMEND_COACH_AT:
                 return
-            if self._command_hotkey is None or self._config.hotkey.command_key is None:
+            key = self._primary_binding_label(self._effective_command_bindings())
+            if not key:
                 return
-            key = prettify_hotkey(self._config.hotkey.command_key)
             self._bar.coach(f"Tip → select any text and hold [[{key}]] to change it")
         except Exception:
             logger.debug("could not show the amend-gesture coach", exc_info=True)
@@ -2465,7 +2894,10 @@ class Engine:
             if self._last_transcript or not self._should_coach():
                 self._bar.set_hint("")
                 return
-            key = prettify_hotkey(self._config.hotkey.key)
+            key = self._primary_binding_label(self._effective_dictation_bindings())
+            if not key:
+                self._bar.set_hint("Add a dictation shortcut in Settings to start")
+                return
             # [[...]] renders as a keycap chip in amber -- the token whose
             # one job is "this is your hotkey" -- rather than as four more
             # words in a sentence the user has to parse.
@@ -2620,8 +3052,8 @@ class Engine:
 
         What can change live and what cannot is stated rather than guessed:
         retention and the overlay's position are read per use, so they take
-        effect immediately; the dictation/command/hands-free bindings rebind
-        in place (see HotkeyListener.rebind / ChordListener.rebind); only the
+        effect immediately; the dictation/command/hands-free/transform
+        bindings all rebind in place (see BindingListener.rebind); only the
         input device is bound into an open PortAudio stream at startup and
         genuinely needs a restart. The UI says which happened instead of
         silently doing nothing.
@@ -2652,24 +3084,6 @@ class Engine:
 
         self._config = new_config
 
-        self._hotkey.rebind(KNOWN_KEYS[new_config.hotkey.key])
-        if new_config.hotkey.command_key is not None:
-            if self._command_hotkey is None:
-                self._command_hotkey = HotkeyListener(
-                    key=KNOWN_KEYS[new_config.hotkey.command_key],
-                    on_press=self._on_command_press,
-                    on_release=self._on_command_release,
-                )
-                if self._listening:
-                    self._command_hotkey.start()
-            else:
-                self._command_hotkey.rebind(KNOWN_KEYS[new_config.hotkey.command_key])
-        elif self._command_hotkey is not None:
-            self._command_hotkey.stop()
-            self._command_hotkey = None
-
-        self._configure_hands_free()
-
         # Rebuilt fresh only when no session is currently in flight through
         # them -- resetting a tracker mid-session would desync it from
         # self._hotkey_down/_command_key_down and the very next tap would be
@@ -2683,11 +3097,11 @@ class Engine:
                 max_active_s=float(new_config.hotkey.hands_free_max_seconds)
             )
 
-        # Transform shortcuts, and every chord-shaped activation binding,
-        # rebind in place rather than needing a restart: the OS hook stays
-        # up and only the dispatch table changes, so a shortcut the user
-        # just bound works on the very next keystroke.
-        self._bind_transform_shortcuts()
+        # Every binding -- dictation, command, hands-free, and every
+        # transform -- rebinds in place rather than needing a restart: the
+        # OS hooks stay up and only the dispatch tables change, so a binding
+        # the user just set works on the very next keystroke.
+        self._rebind_all_bindings()
 
         # Launch-at-login is the one setting that lives outside our own files,
         # so it is pushed to the OS here rather than being read back from it.
@@ -2703,68 +3117,6 @@ class Engine:
         self._refresh_bar_hint()
 
         return {"restart_required": restart_required}
-
-    def _bind_transform_shortcuts(self) -> None:
-        """Rebuild the shared chord table: transform shortcuts, plus every
-        chord-shaped activation binding (dictation's and command's optional
-        alternate chord, and hands-free's chord form).
-
-        Never raises. A shortcut string that will not parse is logged and
-        skipped rather than taken as a reason to start with no shortcuts at
-        all -- one bad binding must not disable the others.
-        """
-        bindings: dict[Chord, Callable[[], None]] = {}
-        try:
-            transforms = self._settings.get().transforms
-        except Exception:
-            logger.exception("could not read transforms; leaving shortcuts unbound")
-            transforms = ()
-
-        for transform in transforms_module.enabled_with_shortcut(transforms):
-            try:
-                chord = parse_chord(transform.shortcut)
-            except ChordError as exc:
-                logger.warning(
-                    "transform %r has an unusable shortcut %r (%s); leaving it unbound",
-                    transform.name,
-                    transform.shortcut,
-                    exc,
-                )
-                continue
-            if chord in bindings:
-                # Two transforms on one chord: first wins, and the UI shows the
-                # conflict. Silently letting the last one win would make the
-                # list disagree with what actually happens.
-                logger.warning("shortcut %s is bound twice; keeping the first", chord)
-                continue
-            bindings[chord] = self._transform_handler(transform.id)
-
-        hotkey_cfg = self._config.hotkey
-        hands_free_usable = self._settings.get().hands_free_enabled
-        for label, shortcut, handler in (
-            ("dictation's alternate", hotkey_cfg.key_chord, self._toggle_dictation_via_chord),
-            ("the voice command's alternate", hotkey_cfg.command_key_chord, self._toggle_command_via_chord),
-            (
-                "hands-free's",
-                hotkey_cfg.hands_free_chord if hands_free_usable else None,
-                self._toggle_hands_free,
-            ),
-        ):
-            if shortcut is None:
-                continue
-            try:
-                chord = parse_chord(shortcut)
-            except ChordError as exc:
-                logger.warning("%s shortcut %r is unusable (%s); leaving it unbound", label, shortcut, exc)
-                continue
-            if chord in bindings:
-                logger.warning("shortcut %s is bound twice; keeping the first", chord)
-                continue
-            bindings[chord] = handler
-
-        self._chords.rebind(bindings)
-        if bindings:
-            logger.info("bound %d shortcut(s)", len(bindings))
 
     def _toggle_dictation_via_chord(self) -> None:
         """Dictation's optional alternate binding: a chord fires once per
@@ -2796,14 +3148,15 @@ class Engine:
         else:
             self._on_command_release()
 
-    def _transform_handler(self, transform_id: str) -> Callable[[], None]:
+    def _transform_handler(self, transform_id: str) -> Callable[[float], None]:
         """A chord handler that runs one transform over the current selection.
 
         Returns immediately: the handler runs on the listener thread, so
         anything slow here would delay every subsequent keystroke.
         """
 
-        def fire() -> None:
+        def fire(pressed_at: float) -> None:
+            del pressed_at  # transforms don't record audio; nothing to back-date
             self._run_transform(transform_id)
 
         return fire
@@ -2818,12 +3171,26 @@ class Engine:
         transcription request.
         """
         transform = transforms_module.by_id(self._settings.get().transforms, transform_id)
-        if transform is None or not transform.enabled:
+        if transform is None:
+            logger.warning("transform %s fired but no longer exists", transform_id)
             return
         if not self._listening:
+            logger.info("transform %s ignored: dictation is paused", transform_id)
             return
 
-        self._set_ui_state(BarState.THINKING, detail=transform.name)
+        # One transform at a time. Belt and braces behind the listener's own
+        # per-press debounce (sway.hotkey._TapSlot.tracker): a second run
+        # starting while one is in flight would reset self._selected_text
+        # out from under the first's still-running capture thread, so the
+        # first would find nothing and report "nothing selected" -- and both
+        # would spend a Groq call to do it.
+        with self._transform_lock:
+            if self._transform_running:
+                logger.info("transform %s ignored: one is already running", transform.name)
+                return
+            self._transform_running = True
+
+        self._set_ui_state(BarState.THINKING, detail=f"Reading selection — {transform.name}")
         selection_ready = threading.Event()
         self._selected_text = ""
         focused = self._platform.focused_process_name()
@@ -2836,7 +3203,7 @@ class Engine:
         ).start()
         threading.Thread(
             name="flow-transform",
-            target=self._process_command,
+            target=self._run_transform_worker,
             args=(
                 self._ring.mark(),
                 focused,
@@ -2852,8 +3219,240 @@ class Engine:
                 # double-fires transforms the selection once.
                 self._activations.once(COMMAND),
             ),
+            kwargs={"transform": transform},
             daemon=True,
         ).start()
+
+    def _run_transform_worker(self, *args: Any, **kwargs: Any) -> None:
+        """:meth:`_process_command` with the in-flight flag released after it.
+
+        A ``finally`` on the worker thread rather than a callback, so the
+        flag is cleared however the run ends -- success, a Groq failure, or
+        an unexpected exception -- and a transform can never be wedged off
+        by one bad run.
+        """
+        try:
+            self._process_command(*args, **kwargs)
+        finally:
+            with self._transform_lock:
+                self._transform_running = False
+
+    # -- the transform review panel: preview first, apply on demand --------
+    #
+    # A shortcut-run transform never pastes on its own (D8's checkbox-era
+    # "opt-in default" became, in the redesign, "preview by default" instead
+    # -- nothing changes on screen until the user explicitly asks it to).
+    # _run_command computes the transformed text and calls
+    # _present_transform_result instead of injecting it; everything below is
+    # what turns that into a panel and wires Apply/Copy/Retry/Undo back to
+    # the actual pipeline.
+
+    def _present_transform_result(
+        self,
+        transform: Transform,
+        *,
+        original: str,
+        transformed: str,
+        instruction: str,
+        focused_process: str | None,
+        activation: Activation | None,
+        run: RunRecorder,
+    ) -> None:
+        self._pending_transform = PendingTransformResult(
+            transform_id=transform.id,
+            transform_name=transform.name,
+            original=original,
+            transformed=transformed,
+            instruction=instruction,
+            focused_process=focused_process,
+            activation=activation,
+        )
+        self._auto_capture_example(transform, original, transformed)
+        parts = word_diff(original, transformed)
+        run.annotate(transform_changes=change_count(parts))
+        self._set_ui_state(BarState.DONE, detail=f"{transform.name} — see changes")
+        self._bar.run_on_ui_thread(lambda root: self._show_transform_panel(root))
+
+    def _auto_capture_example(self, transform: Transform, original: str, transformed: str) -> None:
+        """Store this run as the transform's before/after example, if it
+        does not already have one.
+
+        Best-effort and silent: a custom transform has no example until it
+        has actually been run once, and this is what fills that in without
+        asking the user to write one by hand. Never overwrites an existing
+        example (including one restored by "reset to defaults"), and never
+        touches the shipped defaults' own curated examples.
+        """
+        if transform.example_input or transform.example_output:
+            return
+        if not original.strip() or not transformed.strip():
+            return
+        try:
+            current = self._settings.get().transforms
+            updated = tuple(
+                replace(t, example_input=original, example_output=transformed)
+                if t.id == transform.id and not t.example_input
+                else t
+                for t in current
+            )
+            self._settings.update(transforms=updated)
+        except Exception:
+            logger.debug("could not store an example for %r", transform.name, exc_info=True)
+
+    def _show_transform_panel(self, root: tk.Tk) -> None:
+        """Runs on the Tk thread only, via SwayBar.run_on_ui_thread."""
+        pending = self._pending_transform
+        if pending is None:
+            return
+        if self._transform_panel is None:
+            self._transform_panel = TransformReviewPanel(root)
+        parts = word_diff(pending.original, pending.transformed)
+        n = change_count(parts)
+        title = f"{n} Change" if n == 1 else f"{n} Changes"
+        self._transform_panel.show(
+            title=title,
+            subtitle=pending.transform_name,
+            parts=parts,
+            applied=pending.applied,
+            on_apply=self._transform_apply,
+            on_copy=self._transform_copy,
+            on_retry=self._transform_retry,
+            on_undo=self._transform_undo,
+            on_close=self._transform_panel_closed,
+        )
+
+    def _refresh_transform_panel(self) -> None:
+        pending = self._pending_transform
+        panel = self._transform_panel
+        if pending is None or panel is None or not panel.is_open:
+            return
+        parts = word_diff(pending.original, pending.transformed)
+        n = change_count(parts)
+        panel.update(
+            title=(f"{n} Change" if n == 1 else f"{n} Changes"), parts=parts, applied=pending.applied
+        )
+
+    def _transform_apply(self) -> None:
+        """Paste the transformed text over the selection. The one action in
+        this panel that actually touches the document."""
+        pending = self._pending_transform
+        if pending is None or pending.applied:
+            return
+        with self._tracker.run({"source": "transform_apply"}) as run:
+            pasted = self._inject_with_fallback(pending.transformed, run, pending.activation)
+            if not pasted:
+                self._set_ui_state(
+                    BarState.ERROR, detail="elevated window — copied instead", kind="paste_blocked"
+                )
+                return
+            pending.applied = True
+            self._record_history(
+                kind=KIND_COMMAND,
+                text=pending.transformed,
+                raw_text=pending.original,
+                instruction=pending.instruction,
+                focused_process=pending.focused_process,
+            )
+        self._refresh_transform_panel()
+
+    def _transform_copy(self) -> None:
+        """Clipboard only -- no model call, no injection guard needed."""
+        pending = self._pending_transform
+        if pending is None:
+            return
+        try:
+            self._platform.clipboard_set(pending.transformed)
+        except Exception:
+            logger.debug("could not copy the transform result", exc_info=True)
+
+    def _transform_retry(self) -> None:
+        """Re-run the same transform over the same original text.
+
+        Costs one more model call, same as any other transform run -- the
+        panel stays open and its diff refreshes in place once the new
+        result is ready, rather than closing and reopening.
+        """
+        pending = self._pending_transform
+        if pending is None:
+            return
+        transform = transforms_module.by_id(self._settings.get().transforms, pending.transform_id)
+        if transform is None or not self._listening:
+            return
+        original = pending.original
+        focused_process = pending.focused_process
+
+        def run_retry() -> None:
+            with self._tracker.run({"source": "transform_retry"}) as run:
+                self._run_pipeline(
+                    run,
+                    lambda: self._retry_command(
+                        original, transform, focused_process, run
+                    ),
+                    label="command",
+                )
+
+        threading.Thread(name="flow-transform-retry", target=run_retry, daemon=True).start()
+
+    def _retry_command(
+        self,
+        original: str,
+        transform: Transform,
+        focused_process: str | None,
+        run: RunRecorder,
+    ) -> None:
+        """The retry path: same selection, no fresh capture -- the original
+        is already known, so this skips straight to the model call rather
+        than re-reading the (possibly now-different) live selection."""
+        with run.stage(Stage.COMMAND):
+            self._require_groq()
+            cfg = self._config.commands
+            future = self._network.submit(
+                self._groq.cleanup(
+                    build_command_user_message(transform.instruction, original),
+                    system_prompt=COMMAND_SYSTEM_PROMPT,
+                    model=cfg.model,
+                    temperature=cfg.temperature,
+                    reasoning_effort=self._config.cleanup.reasoning_effort or None,
+                    max_output_tokens=self._config.cleanup.max_output_tokens or None,
+                )
+            )
+            result = future.result(timeout=self._config.groq.timeout_s + 5.0)
+            candidate = normalize_cleanup_output(result.text, original)
+            expectation = expectation_for([transform])
+            reason = unsafe_reason(original, candidate, expectation=expectation)
+            transformed = candidate if candidate and not reason else original
+            if candidate and reason:
+                logger.warning(
+                    "retry output rejected by the %s guardrail; keeping the previous result", reason
+                )
+                run.annotate(command_guardrail_reason=reason)
+                return
+
+        run.annotate(characters=len(transformed))
+        pending = self._pending_transform
+        if pending is None or pending.transform_id != transform.id:
+            return  # the panel was dismissed or moved on while retry was in flight
+        pending.transformed = transformed
+        pending.applied = False
+        self._refresh_transform_panel()
+
+    def _transform_undo(self) -> None:
+        """Put the original text back. Only meaningful after Apply."""
+        pending = self._pending_transform
+        if pending is None or not pending.applied:
+            return
+        with self._tracker.run({"source": "transform_undo"}) as run:
+            pasted = self._inject_with_fallback(pending.original, run, None)
+            if not pasted:
+                self._set_ui_state(
+                    BarState.ERROR, detail="elevated window — copied instead", kind="paste_blocked"
+                )
+                return
+            pending.applied = False
+        self._refresh_transform_panel()
+
+    def _transform_panel_closed(self) -> None:
+        self._pending_transform = None
 
     def _sync_launch_at_login(self, enabled: bool) -> None:
         """Add or remove this build from the per-user Run key."""
@@ -2906,6 +3505,7 @@ class Engine:
                 dictionary_db=self._config.dictionary_db_path,
                 typing_wpm=self._config.analytics.typing_wpm,
                 settings=self._settings,
+                log_file=self._config.log_file_path,
                 control=EngineControl(
                     is_listening=lambda: self.is_listening,
                     set_listening=self.set_listening,

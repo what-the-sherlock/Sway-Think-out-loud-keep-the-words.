@@ -41,15 +41,16 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from sway.hotkey import KNOWN_KEYS, ChordError, parse_chord
+from sway.hotkey import BindingError, parse_binding
 from sway.transforms import (
     DEFAULT_TRANSFORMS,
     MAX_DESCRIPTION_CHARS,
+    MAX_EXAMPLE_CHARS,
     MAX_INSTRUCTION_CHARS,
     MAX_TRANSFORMS,
     Transform,
+    shipped_expectation,
 )
-from sway.transforms import by_id as transforms_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,12 @@ MAX_PHRASE_CHARS = 80
 MAX_NAME_CHARS = 80
 MAX_PAYLOAD_CHARS = 4000
 MAX_APP_RULES = 200
+#: How many alternate bindings one action (dictation, the voice command,
+#: hands-free, or one transform) may hold. A person configuring more than a
+#: handful of ways to fire the same thing has stopped getting value from the
+#: next one; this exists to stop a hand-edited file from being unusable, not
+#: to second-guess reasonable input.
+MAX_BINDINGS_PER_ACTION = 8
 
 
 def _new_id() -> str:
@@ -188,27 +195,29 @@ class Settings:
     lets a developer's ``config.toml`` keep working untouched.
     """
 
-    #: Hotkey override, a pynput key name (e.g. ``ctrl_r``). ``None`` = config's.
-    hotkey: str | None = None
-    #: Optional alternate chord for dictation (tap to start/stop instead of
-    #: holding ``hotkey``). ``None`` = config's (or none, if config has none).
-    hotkey_chord: str | None = None
-    #: Voice-command hotkey override. ``None`` = config's ``command_key``.
-    #: Unlike ``hotkey`` this has no equivalent read/write path before this
-    #: field existed -- the voice-command key was config.toml-only.
-    command_hotkey: str | None = None
-    #: Optional alternate chord for the voice-command hotkey, same shape as
-    #: hotkey_chord.
-    command_hotkey_chord: str | None = None
-    #: Whether hands-free dictation (tap to start, tap to stop, no holding)
-    #: is on. Unlike the other hotkey fields this has no config.toml
+    #: Every binding that starts/stops dictation, as canonical
+    #: :func:`sway.hotkey.parse_binding` strings -- a bare hold key
+    #: (``"ctrl_r"``), a modifier-only combo (``"ctrl+cmd"``), a chord
+    #: (``"ctrl+alt+p"``), or a mouse button (``"mouse:middle"``), in any mix.
+    #: ``None`` means "not customized -- use config.toml's ``key``/``key_chord``
+    #: as the effective list" (see :func:`effective_bindings`); an explicit
+    #: empty tuple means the user removed every binding and dictation has no
+    #: way to fire until they add one back. Same absent-vs-empty contract as
+    #: :attr:`transforms`.
+    dictation_bindings: tuple[str, ...] | None = None
+    #: Every binding that fires a voice command over the current selection.
+    #: Same contract as :attr:`dictation_bindings`, falling back to
+    #: config.toml's ``command_key``/``command_key_chord``.
+    command_bindings: tuple[str, ...] | None = None
+    #: Whether hands-free dictation (tap to start, tap again to stop, no
+    #: holding) is on. Unlike the binding lists this has no config.toml
     #: equivalent to fall back to -- it is a pure UI on/off switch, same
     #: pattern as auto_learn_vocabulary.
     hands_free_enabled: bool = False
-    #: Hands-free binding override. ``None`` = config's ``hands_free_key``.
-    hands_free_key: str | None = None
-    #: Hands-free chord override. ``None`` = config's ``hands_free_chord``.
-    hands_free_chord: str | None = None
+    #: Every binding that toggles hands-free dictation. Same contract as
+    #: :attr:`dictation_bindings`, falling back to config.toml's
+    #: ``hands_free_key``/``hands_free_chord``.
+    hands_free_bindings: tuple[str, ...] | None = None
     #: Whether hands_free_key must be double-tapped rather than tapped once.
     #: ``None`` = config's; unlike hands_free_enabled this *does* have a
     #: config.toml equivalent (HotkeyConfig.hands_free_double_tap), so it
@@ -311,37 +320,61 @@ def _as_optional_str(value: Any, *, name: str, max_chars: int = 200) -> str | No
     return text[:max_chars]
 
 
-def _as_optional_key(value: Any, *, name: str, max_chars: int = 64) -> str | None:
-    """A hold-key name from :data:`sway.hotkey.KNOWN_KEYS`, or ``None``.
+def _as_binding(value: Any, *, name: str, max_chars: int = 64) -> str | None:
+    """A binding string parseable by :func:`sway.hotkey.parse_binding`, or
+    ``None``.
 
-    A value outside that set degrades to ``None`` with a logged warning,
-    exactly like :func:`_as_optional_str` degrades an out-of-range value --
-    this file's own rule is that one bad field is replaced individually
-    rather than bricking the whole settings file.
-    """
-    text = _as_optional_str(value, name=name, max_chars=max_chars)
-    if text is None:
-        return None
-    if text in KNOWN_KEYS:
-        return text
-    logger.warning("settings: %s is not a known key (%r); ignoring", name, text)
-    return None
-
-
-def _as_optional_chord(value: Any, *, name: str, max_chars: int = 64) -> str | None:
-    """A chord string parseable by :func:`sway.hotkey.parse_chord`, or ``None``.
-
-    Stored in its canonical form (see :meth:`sway.hotkey.Chord.__str__`) so
-    two settings saves that mean the same chord always compare equal.
+    Stored in its canonical form (see :meth:`sway.hotkey.Binding.__str__`) so
+    two settings saves that mean the same binding always compare equal.
     """
     text = _as_optional_str(value, name=name, max_chars=max_chars)
     if text is None:
         return None
     try:
-        return str(parse_chord(text))
-    except ChordError as exc:
-        logger.warning("settings: %s is not a usable shortcut (%r): %s; ignoring", name, text, exc)
+        return str(parse_binding(text))
+    except BindingError as exc:
+        logger.warning("settings: %s is not a usable binding (%r): %s; ignoring", name, text, exc)
         return None
+
+
+def _parse_binding_list(raw_list: Any, *, name: str, max_items: int = MAX_BINDINGS_PER_ACTION) -> tuple[str, ...]:
+    """Every usable binding in ``raw_list``, canonicalised and de-duplicated.
+
+    Unusable entries are dropped individually with a warning rather than
+    invalidating the whole list, matching this module's rule throughout.
+    """
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in _as_list(raw_list):
+        canonical = _as_binding(item, name=f"{name}[]")
+        if canonical is None or canonical in seen:
+            continue
+        seen.add(canonical)
+        items.append(canonical)
+        if len(items) >= max_items:
+            break
+    return tuple(items)
+
+
+def _parse_binding_group(
+    raw: dict[str, Any], *, list_key: str, legacy_key: str, legacy_chord_key: str
+) -> tuple[str, ...] | None:
+    """One action's effective binding list from JSON, migrating an older
+    single-key-plus-chord file the first time it is read.
+
+    Absent ``list_key`` means the file predates the binding-list feature
+    (or genuinely has nothing to say here): its two legacy scalars, if any,
+    become the initial list. Both scalars absent -- the ordinary case for a
+    file that never overrode this binding -- stays ``None`` ("use config's
+    default"), not an empty tuple ("the user removed every binding"): an old
+    file's ``hotkey: null`` always meant "config's key", never "no key at
+    all", and this preserves that meaning exactly.
+    """
+    if list_key in raw:
+        return _parse_binding_list(raw.get(list_key), name=list_key)
+    legacy = [raw.get(legacy_key), raw.get(legacy_chord_key)]
+    migrated = _parse_binding_list([v for v in legacy if v is not None], name=list_key)
+    return migrated or None
 
 
 def _parse_trigger(raw: Any, *, seen: set[str]) -> Trigger | None:
@@ -410,6 +443,18 @@ def _parse_transform(raw: Any, *, seen: set[str]) -> Transform | None:
         return None
     seen.add(transform_id)
 
+    # "shortcuts" (a list) is the current shape; a file written before that
+    # existed has a single "shortcut" string instead, migrated in here rather
+    # than at the call site so every other reader of Settings.transforms only
+    # ever sees the current shape.
+    if "shortcuts" in raw:
+        shortcuts = _parse_binding_list(raw.get("shortcuts"), name="transform.shortcuts")
+    else:
+        legacy_shortcut = raw.get("shortcut")
+        shortcuts = _parse_binding_list(
+            [legacy_shortcut] if legacy_shortcut is not None else [], name="transform.shortcuts"
+        )
+
     return Transform(
         id=transform_id,
         name=name,
@@ -420,11 +465,18 @@ def _parse_transform(raw: Any, *, seen: set[str]) -> Transform | None:
         or "",
         phrase=_as_optional_str(raw.get("phrase"), name="transform.phrase", max_chars=MAX_PHRASE_CHARS)
         or "",
-        shortcut=_as_optional_str(raw.get("shortcut"), name="transform.shortcut", max_chars=64)
-        or "",
+        shortcuts=shortcuts,
         icon=_as_optional_str(raw.get("icon"), name="transform.icon", max_chars=8) or "",
-        enabled=_as_bool(raw.get("enabled", False), default=False, name="transform.enabled"),
+        enabled=_as_bool(raw.get("enabled", True), default=True, name="transform.enabled"),
         builtin=_as_bool(raw.get("builtin", False), default=False, name="transform.builtin"),
+        example_input=_as_optional_str(
+            raw.get("example_input"), name="transform.example_input", max_chars=MAX_EXAMPLE_CHARS
+        )
+        or "",
+        example_output=_as_optional_str(
+            raw.get("example_output"), name="transform.example_output", max_chars=MAX_EXAMPLE_CHARS
+        )
+        or "",
         allows_markdown=_expectation_flag(raw, transform_id, "allows_markdown"),
         may_shorten=_expectation_flag(raw, transform_id, "may_shorten"),
         may_lengthen=_expectation_flag(raw, transform_id, "may_lengthen"),
@@ -437,7 +489,7 @@ def _expectation_flag(raw: dict[str, Any], transform_id: str, field: str) -> boo
 
     The plain default is ``False`` -- strict guardrails -- and that is what a
     transform the user wrote gets. A *shipped* id is different: every
-    settings.json written before these fields existed stores the nine built-ins
+    settings.json written before these fields existed stores the built-ins
     without them, and reading those back as ``False`` would quietly restore the
     exact bug the fields were added to fix ("make that bullet points" produces
     bullets, the markdown guardrail rejects them, the user gets plain text).
@@ -450,8 +502,7 @@ def _expectation_flag(raw: dict[str, Any], transform_id: str, field: str) -> boo
     """
     if field in raw:
         return _as_bool(raw.get(field), default=False, name=f"transform.{field}")
-    shipped = transforms_by_id(DEFAULT_TRANSFORMS, transform_id)
-    return bool(getattr(shipped, field)) if shipped is not None else False
+    return shipped_expectation(transform_id, field)
 
 
 def _parse_app_rule(raw: Any, *, seen: set[str]) -> AppRule | None:
@@ -473,13 +524,21 @@ def _parse_app_rule(raw: Any, *, seen: set[str]) -> AppRule | None:
 
 _KNOWN_KEYS = {
     "version",
+    # Current, list-based binding fields.
+    "dictation_bindings",
+    "command_bindings",
+    "hands_free_bindings",
+    # Retired single-key-plus-chord fields. Still recognised (so a file that
+    # predates the binding-list feature is migrated rather than having these
+    # echoed back forever in "unknown") but no longer read into any Settings
+    # field beyond that one-time migration in _parse_binding_group.
     "hotkey",
     "hotkey_chord",
     "command_hotkey",
     "command_hotkey_chord",
-    "hands_free_enabled",
     "hands_free_key",
     "hands_free_chord",
+    "hands_free_enabled",
     "hands_free_double_tap",
     "audio_device",
     "language",
@@ -568,19 +627,26 @@ def parse(raw: Any) -> Settings:
         transforms = tuple(parsed_transforms)
 
     return Settings(
-        hotkey=_as_optional_key(raw.get("hotkey"), name="hotkey"),
-        hotkey_chord=_as_optional_chord(raw.get("hotkey_chord"), name="hotkey_chord"),
-        command_hotkey=_as_optional_key(raw.get("command_hotkey"), name="command_hotkey"),
-        command_hotkey_chord=_as_optional_chord(
-            raw.get("command_hotkey_chord"), name="command_hotkey_chord"
+        dictation_bindings=_parse_binding_group(
+            raw, list_key="dictation_bindings", legacy_key="hotkey", legacy_chord_key="hotkey_chord"
+        ),
+        command_bindings=_parse_binding_group(
+            raw,
+            list_key="command_bindings",
+            legacy_key="command_hotkey",
+            legacy_chord_key="command_hotkey_chord",
         ),
         hands_free_enabled=_as_bool(
             raw.get("hands_free_enabled", DEFAULTS.hands_free_enabled),
             default=DEFAULTS.hands_free_enabled,
             name="hands_free_enabled",
         ),
-        hands_free_key=_as_optional_key(raw.get("hands_free_key"), name="hands_free_key"),
-        hands_free_chord=_as_optional_chord(raw.get("hands_free_chord"), name="hands_free_chord"),
+        hands_free_bindings=_parse_binding_group(
+            raw,
+            list_key="hands_free_bindings",
+            legacy_key="hands_free_key",
+            legacy_chord_key="hands_free_chord",
+        ),
         hands_free_double_tap=_as_optional_bool(
             raw.get("hands_free_double_tap"), name="hands_free_double_tap"
         ),
@@ -630,20 +696,33 @@ def parse(raw: Any) -> Settings:
 
 
 def _as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
+    """A JSON array read from disk is always a ``list``; the same value
+    round-tripped in memory through :func:`to_dict` -- as
+    :meth:`SettingsStore.update` does, to validate a candidate before saving
+    -- comes back as whatever :func:`dataclasses.asdict` preserved a tuple
+    field as, i.e. a ``tuple``. Both must parse the same way, or every
+    tuple-typed field (``Transform.shortcuts`` in particular) silently loses
+    its value on every write, without ever touching disk in between.
+    """
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
 
 
 def to_dict(settings: Settings) -> dict[str, Any]:
-    """The JSON shape written to disk. Unknown keys are merged back in."""
+    """The JSON shape written to disk. Unknown keys are merged back in.
+
+    The retired ``hotkey``/``hotkey_chord``/etc. scalars are never written --
+    only the current ``*_bindings`` lists are. A binding-list field that is
+    still ``None`` (never customized) is omitted entirely rather than written
+    as ``null``, so a version of the app older than this one that reads this
+    file back still finds nothing under either shape and correctly falls back
+    to its own config.toml default, exactly as it would have before this
+    field existed.
+    """
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
-        "hotkey": settings.hotkey,
-        "hotkey_chord": settings.hotkey_chord,
-        "command_hotkey": settings.command_hotkey,
-        "command_hotkey_chord": settings.command_hotkey_chord,
         "hands_free_enabled": settings.hands_free_enabled,
-        "hands_free_key": settings.hands_free_key,
-        "hands_free_chord": settings.hands_free_chord,
         "hands_free_double_tap": settings.hands_free_double_tap,
         "audio_device": settings.audio_device,
         "language": settings.language,
@@ -659,6 +738,13 @@ def to_dict(settings: Settings) -> dict[str, Any]:
         "app_rules": [asdict(r) for r in settings.app_rules],
         "transforms": [asdict(t) for t in settings.transforms],
     }
+    for field_name, value in (
+        ("dictation_bindings", settings.dictation_bindings),
+        ("command_bindings", settings.command_bindings),
+        ("hands_free_bindings", settings.hands_free_bindings),
+    ):
+        if value is not None:
+            payload[field_name] = list(value)
     # Unknown keys never shadow a key this build owns, so a stale field from a
     # newer version cannot resurrect itself over a value the user just set.
     for key, value in settings.unknown.items():
@@ -824,19 +910,16 @@ def apply_to_config(config: Any, settings: Settings) -> Any:
     if settings.audio_device is not None:
         audio = replace(audio, device=settings.audio_device)
 
+    # The dictation/command/hands-free *bindings* are deliberately not
+    # layered onto config.hotkey here: config.hotkey's key/key_chord fields
+    # can only ever express one binding shape (a plain hold key or a plain
+    # chord), while a Settings override is a list that may contain a
+    # modifier-combo hold or a mouse binding neither of those fields can
+    # represent. See sway.hotkey.effective_bindings, which computes each
+    # action's actual binding list straight from Settings and config.hotkey
+    # without forcing it through HotkeyConfig's shape -- that is the one
+    # place the two are combined.
     hotkey = config.hotkey
-    if settings.hotkey is not None:
-        hotkey = replace(hotkey, key=settings.hotkey)
-    if settings.hotkey_chord is not None:
-        hotkey = replace(hotkey, key_chord=settings.hotkey_chord)
-    if settings.command_hotkey is not None:
-        hotkey = replace(hotkey, command_key=settings.command_hotkey)
-    if settings.command_hotkey_chord is not None:
-        hotkey = replace(hotkey, command_key_chord=settings.command_hotkey_chord)
-    if settings.hands_free_key is not None:
-        hotkey = replace(hotkey, hands_free_key=settings.hands_free_key)
-    if settings.hands_free_chord is not None:
-        hotkey = replace(hotkey, hands_free_chord=settings.hands_free_chord)
     if settings.hands_free_double_tap is not None:
         hotkey = replace(hotkey, hands_free_double_tap=settings.hands_free_double_tap)
 
@@ -861,6 +944,7 @@ __all__ = [
     "CLEANUP_STYLES",
     "CONTEXT_MODES",
     "DEFAULTS",
+    "MAX_BINDINGS_PER_ACTION",
     "MAX_PAYLOAD_CHARS",
     "MAX_NAME_CHARS",
     "MAX_PHRASE_CHARS",

@@ -20,13 +20,21 @@ Two rules hold throughout:
 from __future__ import annotations
 
 import logging
+import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from sway import credentials
 from sway.dictionary import SOURCES
-from sway.hotkey import KNOWN_KEYS, ChordError, find_binding_conflicts, parse_chord, prettify_hotkey
+from sway.diff import as_dicts, word_diff
+from sway.hotkey import (
+    BindingError,
+    binding_advisory,
+    effective_bindings,
+    find_binding_list_conflicts,
+    parse_binding,
+)
 from sway.transforms import (
     DEFAULT_IDS,
     DEFAULT_TRANSFORMS,
@@ -39,6 +47,7 @@ from sway.transforms import (
 from sway.settings import (
     CLEANUP_STYLES,
     CONTEXT_MODES,
+    MAX_BINDINGS_PER_ACTION,
     MAX_PAYLOAD_CHARS,
     MAX_NAME_CHARS,
     MAX_PHRASE_CHARS,
@@ -96,35 +105,41 @@ def _optional_str(payload: Mapping[str, Any], key: str, *, max_chars: int = 200)
     return text[:max_chars]
 
 
-def _optional_key(payload: Mapping[str, Any], key: str, *, max_chars: int = 64) -> str | None:
-    """A hold-key name from :data:`sway.hotkey.KNOWN_KEYS`, or ``None``.
-
-    Unlike :func:`_optional_str`, a value that is not a known key is a hard
-    rejection at the door -- a UI save is exactly the place to refuse
-    clearly, unlike a possibly-stale settings.json read at startup.
-    """
-    text = _optional_str(payload, key, max_chars=max_chars)
-    if text is None:
-        return None
-    if text not in KNOWN_KEYS:
-        raise ActionError(f"{prettify_hotkey(text)!r} is not a key Sway can hold -- pick a modifier key")
-    return text
-
-
-def _optional_chord(payload: Mapping[str, Any], key: str, *, max_chars: int = 64) -> str | None:
-    """A chord string parseable by :func:`sway.hotkey.parse_chord`, or ``None``.
-
-    Stored in canonical form, and rejected with ``ChordError``'s own
-    message -- already written for a person, e.g. "a shortcut needs at
-    least one modifier, like Ctrl+Alt+P".
-    """
-    text = _optional_str(payload, key, max_chars=max_chars)
-    if text is None:
-        return None
+def _one_binding(text: str) -> str:
+    """A binding string in canonical form, or a rejection written for a
+    person -- :class:`~sway.hotkey.BindingError`'s own message, e.g. "a
+    shortcut needs at least one modifier, like Ctrl+Alt+P"."""
     try:
-        return str(parse_chord(text))
-    except ChordError as exc:
+        return str(parse_binding(text))
+    except BindingError as exc:
         raise ActionError(str(exc)) from exc
+
+
+def _binding_list(
+    payload: Mapping[str, Any], key: str, *, max_items: int = MAX_BINDINGS_PER_ACTION
+) -> tuple[str, ...]:
+    """Every binding in ``payload[key]``, validated and de-duplicated.
+
+    Absent or not a list is treated as "no bindings" (an empty tuple) rather
+    than an error -- a transform or activation target is allowed to have
+    none, same as it is allowed to have no phrase.
+    """
+    raw = payload.get(key)
+    if not isinstance(raw, list):
+        return ()
+    items: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        canonical = _one_binding(entry)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        items.append(canonical)
+        if len(items) >= max_items:
+            raise ActionError(f"you can have at most {max_items} bindings for one action")
+    return tuple(items)
 
 
 def _require_bool(payload: Mapping[str, Any], key: str) -> bool:
@@ -153,11 +168,10 @@ def _require_int(payload: Mapping[str, Any], key: str, *, low: int, high: int) -
 #: field on :class:`Settings` is not remotely writable until someone adds it
 #: here on purpose.
 _SIMPLE_FIELDS: dict[str, Any] = {
-    # hotkey, hotkey_chord, command_hotkey, command_hotkey_chord,
-    # hands_free_key, and hands_free_chord are set through
-    # save_activation_binding instead of here: those six need pairwise
-    # conflict-checking against each other, which a one-field-at-a-time save
-    # cannot do.
+    # dictation_bindings, command_bindings, and hands_free_bindings are set
+    # through save_activation_binding instead of here: those three need
+    # pairwise conflict-checking against each other, which a
+    # one-field-at-a-time save cannot do.
     "audio_device": lambda p: _optional_str(p, "audio_device"),
     "language": lambda p: _optional_str(p, "language", max_chars=32),
     "launch_at_login": lambda p: _require_bool(p, "launch_at_login"),
@@ -347,21 +361,28 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
     """Create or update one transform.
 
     Like :func:`save_trigger`, an existing id is an edit that keeps its
-    position and anything else is an append.
+    position and anything else is an append. A transform is a full-record
+    save, same as a trigger -- the editor always sends the whole record
+    (autosaved on every field change), so there is no partial-update case to
+    support here.
+
+    A shortcut is only rejected here for being unparsable or an exact
+    duplicate of another transform's (see :func:`transform_view`'s
+    ``conflicts`` for the latter, surfaced rather than blocked, same as a
+    trigger's phrase). It is never rejected merely for sharing a modifier
+    with another binding -- :class:`sway.hotkey.BindingListener` resolves
+    that ambiguity itself at dispatch time (prefix grace), so e.g. a
+    transform on Ctrl+Shift+T works correctly alongside dictation on bare
+    Ctrl with no configuration-time decision needed.
     """
     current = store.get()
     name = _require_str(payload, "name", max_chars=MAX_NAME_CHARS)
     instruction = _require_str(payload, "instruction", max_chars=MAX_INSTRUCTION_CHARS)
 
-    shortcut = _optional_str(payload, "shortcut", max_chars=64) or ""
-    if shortcut:
-        # Validated at the door rather than at bind time, so an unusable
-        # shortcut is refused with a reason the user is looking at instead of
-        # being silently skipped by the engine hours later.
-        try:
-            shortcut = str(parse_chord(shortcut))
-        except ChordError as exc:
-            raise ActionError(str(exc)) from exc
+    # Validated at the door rather than at bind time, so an unusable binding
+    # is refused with a reason the user is looking at instead of being
+    # silently skipped by the engine hours later.
+    shortcuts = _binding_list(payload, "shortcuts")
 
     phrase = _optional_str(payload, "phrase", max_chars=MAX_PHRASE_CHARS) or ""
     transform_id = payload.get("id")
@@ -380,15 +401,14 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
         if phrase and existing.normalised_phrase() == normalise_phrase(phrase):
             raise ActionError(f"the snippet “{existing.phrase}” already uses that phrase")
 
-    enabled = payload.get("enabled", True)
-    if not isinstance(enabled, bool):
-        enabled = True
-
     # What this instruction is allowed to do to the text. Editing a built-in
     # keeps its shipped expectation unless the payload says otherwise, for the
     # same reason the settings parser does (see settings._expectation_flag): a
     # form that round-trips without these keys must not quietly re-arm a
-    # guardrail against the very output the instruction asks for.
+    # guardrail against the very output the instruction asks for. The example
+    # pair works the same way: the editor never sends it back, so an ordinary
+    # save cannot erase a stored example -- only the engine writes one, after
+    # the transform's first real run (see Engine._run_transform).
     prior = next((t for t in current.transforms if t.id == transform_id), None) if transform_id else None
 
     def expectation(field: str) -> bool:
@@ -404,29 +424,30 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
     if transform_id is None and len(current.transforms) >= MAX_TRANSFORMS:
         raise ActionError(f"you can have at most {MAX_TRANSFORMS} transforms")
 
+    def build(existing_id: str, *, builtin: bool) -> Transform:
+        return Transform(
+            id=existing_id,
+            name=name,
+            instruction=instruction,
+            description=_optional_str(payload, "description", max_chars=MAX_DESCRIPTION_CHARS) or "",
+            phrase=phrase,
+            shortcuts=shortcuts,
+            icon=_optional_str(payload, "icon", max_chars=8) or "",
+            builtin=builtin,
+            example_input=prior.example_input if prior is not None else "",
+            example_output=prior.example_output if prior is not None else "",
+            allows_markdown=allows_markdown,
+            may_shorten=may_shorten,
+            may_lengthen=may_lengthen,
+        )
+
     updated: list[Transform] = []
     replaced = False
     for existing in current.transforms:
         if existing.id == transform_id:
-            updated.append(
-                Transform(
-                    id=existing.id,
-                    name=name,
-                    instruction=instruction,
-                    description=_optional_str(payload, "description", max_chars=MAX_DESCRIPTION_CHARS)
-                    or "",
-                    phrase=phrase,
-                    shortcut=shortcut,
-                    icon=_optional_str(payload, "icon", max_chars=8) or "",
-                    enabled=enabled,
-                    # Editing a built-in keeps it a built-in, so "reset to
-                    # defaults" can still put it back.
-                    builtin=existing.builtin,
-                    allows_markdown=allows_markdown,
-                    may_shorten=may_shorten,
-                    may_lengthen=may_lengthen,
-                )
-            )
+            # Editing a built-in keeps it a built-in, so "reset to defaults"
+            # can still put it back.
+            updated.append(build(existing.id, builtin=existing.builtin))
             replaced = True
         else:
             updated.append(existing)
@@ -434,22 +455,7 @@ def save_transform(store: SettingsStore, payload: Mapping[str, Any]) -> Settings
     if not replaced:
         from sway.settings import _new_id
 
-        updated.append(
-            Transform(
-                id=transform_id or _new_id(),
-                name=name,
-                instruction=instruction,
-                description=_optional_str(payload, "description", max_chars=MAX_DESCRIPTION_CHARS)
-                or "",
-                phrase=phrase,
-                shortcut=shortcut,
-                icon=_optional_str(payload, "icon", max_chars=8) or "",
-                enabled=enabled,
-                allows_markdown=allows_markdown,
-                may_shorten=may_shorten,
-                may_lengthen=may_lengthen,
-            )
-        )
+        updated.append(build(transform_id or _new_id(), builtin=False))
 
     try:
         return store.update(transforms=tuple(updated))
@@ -473,7 +479,11 @@ def reset_transforms(store: SettingsStore) -> Settings:
 
     A built-in the user edited goes back to how it shipped; one they created
     is left completely alone. Wiping those too would make this button
-    destructive in a way its name does not suggest.
+    destructive in a way its name does not suggest. "The user's own" is
+    computed fresh against the *current* build's default ids, so a transform
+    that shipped as a built-in in an older version but no longer does (the
+    old Fix grammar/Make casual/Turn into bullet points set) is treated as
+    the user's own from here on rather than silently dropped.
     """
     custom = tuple(t for t in store.get().transforms if t.id not in DEFAULT_IDS)
     try:
@@ -483,7 +493,21 @@ def reset_transforms(store: SettingsStore) -> Settings:
 
 
 def transform_view(settings: Settings) -> list[dict[str, Any]]:
-    """Transforms plus their shortcut conflicts, shaped for the UI."""
+    """Transforms plus their shortcut conflicts, shaped for the UI.
+
+    ``conflicts`` lists only an *exact* duplicate shortcut shared with
+    another transform (:func:`~sway.transforms.find_shortcut_conflicts`) --
+    two transforms cannot both usefully hold the identical gesture, since it
+    would only ever reach whichever one the listener dispatches to first.
+    A shortcut that merely *overlaps* another binding without being
+    identical (e.g. a transform on Ctrl+Shift+T while dictation holds bare
+    Ctrl) is not a conflict at all: :class:`sway.hotkey.BindingListener`
+    already resolves that ambiguity at dispatch time via prefix grace, so
+    both fire correctly and independently. See ``shortcut_advisories`` for
+    the one thing worth telling the user about a shortcut that is not a
+    conflict: Sway's hooks are non-suppressing, so a shortcut using Alt also
+    triggers menu mnemonics in whatever app is focused.
+    """
     conflicts = find_shortcut_conflicts(settings.transforms)
     by_id = {t.id: t for t in settings.transforms}
     return [
@@ -493,11 +517,19 @@ def transform_view(settings: Settings) -> list[dict[str, Any]]:
             "description": t.description,
             "instruction": t.instruction,
             "phrase": t.phrase,
-            "shortcut": t.shortcut,
-            "shortcut_label": parse_chord(t.shortcut).pretty() if t.shortcut else "",
+            "shortcuts": list(t.shortcuts),
+            "shortcut_labels": [parse_binding(s).pretty() for s in t.shortcuts],
+            "shortcut_advisories": [binding_advisory(parse_binding(s)) for s in t.shortcuts],
             "icon": t.icon,
-            "enabled": t.enabled,
             "builtin": t.builtin,
+            "runnable": bool(t.shortcuts) or bool(t.phrase.strip()),
+            "example_input": t.example_input,
+            "example_output": t.example_output,
+            "example_diff": (
+                as_dicts(word_diff(t.example_input, t.example_output))
+                if t.example_input and t.example_output
+                else []
+            ),
             "allows_markdown": t.allows_markdown,
             "may_shorten": t.may_shorten,
             "may_lengthen": t.may_lengthen,
@@ -511,19 +543,23 @@ def transform_view(settings: Settings) -> list[dict[str, Any]]:
 
 # ---------------------------------------------------------------------------
 # Activation bindings: the dictation hotkey, the voice-command hotkey, and
-# hands-free dictation. Each may be bound to a held key (KNOWN_KEYS) and/or
-# an alternate chord (parse_chord). Handled together, rather than through
-# _SIMPLE_FIELDS, because the three must be checked pairwise for a
-# collision before any of them is written -- two hold-shaped listeners on
-# one physical key is genuinely broken (both fire on every press).
+# hands-free dictation. Each holds a *list* of bindings (a hold key, a
+# modifier combo, a chord, or a mouse button, in any mix) rather than a
+# single primary key plus one alternate chord -- see sway.hotkey.Binding.
+# Handled together, rather than through _SIMPLE_FIELDS, because the three
+# must be checked pairwise for a collision before any of them is written --
+# two listeners sharing one physical gesture is genuinely broken (both fire
+# on every press).
 # ---------------------------------------------------------------------------
 
-#: The three configurable activation bindings, and the Settings field pair
-#: (hold-key field, chord field) each one owns.
-ACTIVATION_BINDINGS: dict[str, tuple[str, str]] = {
-    "dictation": ("hotkey", "hotkey_chord"),
-    "command": ("command_hotkey", "command_hotkey_chord"),
-    "hands_free": ("hands_free_key", "hands_free_chord"),
+#: The three configurable activation targets: each one's Settings list field,
+#: and the pair of sway.engine.Engine.describe() keys that hold config.toml's
+#: default hold-key and alternate-chord for it (see
+#: sway.hotkey.effective_bindings).
+ACTIVATION_BINDINGS: dict[str, tuple[str, str, str]] = {
+    "dictation": ("dictation_bindings", "hotkey", "hotkey_chord"),
+    "command": ("command_bindings", "command_hotkey", "command_hotkey_chord"),
+    "hands_free": ("hands_free_bindings", "hands_free_key", "hands_free_chord"),
 }
 
 _ACTIVATION_LABELS = {
@@ -533,44 +569,28 @@ _ACTIVATION_LABELS = {
 }
 
 
-def _effective_hold_bindings(
+def _effective_binding_lists(
     settings: Settings, effective: Mapping[str, Any] | None
-) -> dict[str, str]:
-    """Every hold-key binding actually in force right now, target -> key name.
+) -> dict[str, tuple[str, ...]]:
+    """Every binding actually in force right now, target -> its list.
 
-    A binding not overridden in ``settings`` falls back to ``effective``
-    (the engine's :meth:`~sway.engine.Engine.describe`, which already knows
-    config.toml's defaults) when one is supplied. Without it -- a bare
-    ``store`` with no engine attached, as in a unit test -- only what
-    ``settings`` itself already holds is checked; that is a smaller but
-    still useful check, and the authoritative backstop is
-    ``sway.config._validate`` on the engine's merged config, which always
-    runs before a binding takes live effect regardless of what this
-    function could see.
+    A target not overridden in ``settings`` (``None``) falls back to
+    ``effective`` (the engine's :meth:`~sway.engine.Engine.describe`, which
+    already knows config.toml's defaults) when one is supplied. Without it --
+    a bare ``store`` with no engine attached, as in a unit test -- only
+    config's compiled-in defaults (``HotkeyConfig``'s dataclass defaults, via
+    a plain ``{}``) are missing; that is a smaller but still useful check, and
+    the authoritative backstop is ``sway.config._validate`` on the engine's
+    merged config, which always runs before a binding takes live effect
+    regardless of what this function could see.
     """
     effective = effective or {}
-    resolved: dict[str, str] = {}
-    for target, (key_field, _chord_field) in ACTIVATION_BINDINGS.items():
-        value = getattr(settings, key_field, None)
-        if value is None:
-            value = effective.get(key_field)
-        if value is not None:
-            resolved[target] = value
-    return resolved
-
-
-def _effective_chord_bindings(
-    settings: Settings, effective: Mapping[str, Any] | None
-) -> dict[str, str]:
-    effective = effective or {}
-    resolved: dict[str, str] = {}
-    for target, (_key_field, chord_field) in ACTIVATION_BINDINGS.items():
-        value = getattr(settings, chord_field, None)
-        if value is None:
-            value = effective.get(chord_field)
-        if value is not None:
-            resolved[target] = value
-    return resolved
+    return {
+        target: effective_bindings(
+            getattr(settings, field), effective.get(default_key), effective.get(default_chord_key)
+        )
+        for target, (field, default_key, default_chord_key) in ACTIVATION_BINDINGS.items()
+    }
 
 
 def save_activation_binding(
@@ -579,63 +599,94 @@ def save_activation_binding(
     *,
     effective: Mapping[str, Any] | None = None,
 ) -> Settings:
-    """Set one activation binding's held key and/or alternate chord.
+    """Add, remove, or replace one binding in one activation target's list.
 
-    ``payload``: ``{"target": "dictation"|"command"|"hands_free", "key":
-    ... | None, "chord": ... | None}``. Either or both of ``key``/``chord``
-    may be present; an absent one is left untouched (matching
-    :func:`update_settings`'s partial-save contract), and an explicit
-    ``None`` (or ``""``) clears that half of the binding back to config's
-    default.
+    ``payload``: ``{"target": "dictation"|"command"|"hands_free", "op":
+    "add"|"remove"|"replace", "binding": "ctrl+cmd", "old_binding": ...}``.
+    ``op`` defaults to ``"add"``. ``"replace"`` needs ``old_binding`` (the
+    binding being edited) alongside the new ``binding``; if ``old_binding``
+    is not actually present the new one is simply added, so a stale edit
+    dialog degrades to an add rather than silently doing nothing.
+
+    The very first customization of a target materializes its *whole*
+    effective list (config's defaults included) before applying the one
+    change, so "add a second binding" means exactly that rather than
+    silently discarding the config-default binding the user had not
+    previously had to think about.
     """
     target = payload.get("target")
     if target not in ACTIVATION_BINDINGS:
         raise ActionError(f"unknown activation target: {target!r}")
-    key_field, chord_field = ACTIVATION_BINDINGS[target]
+    field, _default_key, _default_chord_key = ACTIVATION_BINDINGS[target]
 
-    current = store.get()
-    changes: dict[str, Any] = {}
-    if "key" in payload:
-        changes[key_field] = _optional_key(payload, "key")
-    if "chord" in payload:
-        changes[chord_field] = _optional_chord(payload, "chord")
+    lists = _effective_binding_lists(store.get(), effective)
+    working = list(lists[target])
+    op = payload.get("op", "add")
 
-    if not changes:
-        return current
-    candidate = replace(current, **changes)
+    if op == "add":
+        raw = payload.get("binding")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ActionError("which binding?")
+        binding = _one_binding(raw)
+        if binding in working:
+            raise ActionError("that binding is already set for this action")
+        if len(working) >= MAX_BINDINGS_PER_ACTION:
+            raise ActionError(f"you can have at most {MAX_BINDINGS_PER_ACTION} bindings for one action")
+        working.append(binding)
+    elif op == "remove":
+        raw = payload.get("binding")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ActionError("which binding?")
+        binding = _one_binding(raw)
+        if binding not in working:
+            raise ActionError("that binding is not set for this action")
+        working.remove(binding)
+    elif op == "replace":
+        new_raw = payload.get("binding")
+        if not isinstance(new_raw, str) or not new_raw.strip():
+            raise ActionError("which binding?")
+        new_binding = _one_binding(new_raw)
+        old_raw = payload.get("old_binding")
+        old_binding = _one_binding(old_raw) if isinstance(old_raw, str) and old_raw.strip() else None
+        if old_binding is not None and old_binding in working:
+            working = [new_binding if b == old_binding else b for b in working]
+        elif new_binding not in working:
+            working.append(new_binding)
+        # De-duplicate: replacing one binding with a value already present
+        # elsewhere in the list must not leave two copies of it.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for b in working:
+            if b not in seen:
+                seen.add(b)
+                deduped.append(b)
+        working = deduped
+    else:
+        raise ActionError(f"unknown operation: {op!r}")
 
-    hold_bindings = _effective_hold_bindings(candidate, effective)
-    this_key = hold_bindings.get(target)
-    if this_key is not None:
-        for other_target, other_key in hold_bindings.items():
-            if other_target != target and other_key == this_key:
-                raise ActionError(
-                    f"that key is already {_ACTIVATION_LABELS[other_target]} -- pick a different one"
-                )
-
-    chord_bindings = _effective_chord_bindings(candidate, effective)
-    this_chord = chord_bindings.get(target)
-    if this_chord is not None:
-        for other_target, other_chord in chord_bindings.items():
-            if other_target != target and other_chord == this_chord:
-                raise ActionError(
-                    f"that shortcut is already {_ACTIVATION_LABELS[other_target]} -- pick a different one"
-                )
+    candidate_lists = dict(lists)
+    candidate_lists[target] = tuple(working)
+    conflicts = find_binding_list_conflicts(candidate_lists)
+    if conflicts.get(target):
+        other = conflicts[target][0]
+        raise ActionError(
+            f"that binding is already {_ACTIVATION_LABELS[other]} -- pick a different one"
+        )
 
     try:
-        return store.update(**changes)
+        return store.update(**{field: tuple(working)})
     except SettingsWriteError as exc:
         raise ActionError(str(exc)) from exc
 
 
 def reset_activation_binding(store: SettingsStore, payload: Mapping[str, Any]) -> Settings:
-    """Clear one binding's override(s) back to config's default."""
+    """Clear one target's override back to config's default list."""
     target = payload.get("target")
     if target not in ACTIVATION_BINDINGS:
         raise ActionError(f"unknown activation target: {target!r}")
-    key_field, chord_field = ACTIVATION_BINDINGS[target]
+    field, _default_key, _default_chord_key = ACTIVATION_BINDINGS[target]
     try:
-        return store.update(**{key_field: None, chord_field: None})
+        return store.update(**{field: None})
     except SettingsWriteError as exc:
         raise ActionError(str(exc)) from exc
 
@@ -643,28 +694,25 @@ def reset_activation_binding(store: SettingsStore, payload: Mapping[str, Any]) -
 def activation_view(
     settings: Settings, effective: Mapping[str, Any] | None = None
 ) -> dict[str, dict[str, Any]]:
-    """Every activation binding's current effective state, shaped for the UI."""
+    """Every activation target's current effective bindings, shaped for the UI."""
     effective = effective or {}
-    hold_bindings = _effective_hold_bindings(settings, effective)
-    chord_bindings = _effective_chord_bindings(settings, effective)
-    hold_conflicts = find_binding_conflicts(hold_bindings)
-    chord_conflicts = find_binding_conflicts(chord_bindings)
+    lists = _effective_binding_lists(settings, effective)
+    conflicts = find_binding_list_conflicts(lists)
 
     view: dict[str, dict[str, Any]] = {}
-    for target, (key_field, chord_field) in ACTIVATION_BINDINGS.items():
-        key = hold_bindings.get(target)
-        chord = chord_bindings.get(target)
-        conflicts = [
-            _ACTIVATION_LABELS[other]
-            for other in (*hold_conflicts.get(target, []), *chord_conflicts.get(target, []))
-        ]
+    for target, (field, _default_key, _default_chord_key) in ACTIVATION_BINDINGS.items():
         view[target] = {
-            "key": key,
-            "key_label": prettify_hotkey(key) if key else "",
-            "chord": chord,
-            "chord_label": parse_chord(chord).pretty() if chord else "",
-            "is_default": getattr(settings, key_field) is None and getattr(settings, chord_field) is None,
-            "conflicts": conflicts,
+            "bindings": [
+                {
+                    "value": b,
+                    "label": parse_binding(b).pretty(),
+                    "shape": parse_binding(b).shape,
+                    "advisory": binding_advisory(parse_binding(b)),
+                }
+                for b in lists[target]
+            ],
+            "is_default": getattr(settings, field) is None,
+            "conflicts": [_ACTIVATION_LABELS[other] for other in conflicts.get(target, [])],
         }
     view["hands_free"]["enabled"] = settings.hands_free_enabled
     view["hands_free"]["double_tap"] = bool(
@@ -832,6 +880,77 @@ def dictionary_payload(store: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+#: Matches a header line written by sway.logging_setup's file formatter:
+#: "%(asctime)s %(process)d %(levelname)-7s %(name)s [%(threadName)s]: %(message)s".
+#: A line that does not match (a traceback frame, a multi-line message) is
+#: folded into the entry currently being built rather than dropped, so an
+#: exception logged with an error is not truncated to its first line.
+_LOG_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) "
+    r"\d+ (?P<level>[A-Z]+)\s+(?P<logger>\S+) \[[^\]]*\]: (?P<message>.*)$"
+)
+_DIAGNOSTIC_LEVELS = frozenset({"WARNING", "ERROR", "CRITICAL"})
+#: A runaway traceback should not blow up the response the dashboard renders.
+_MAX_DIAGNOSTIC_MESSAGE_CHARS = 4000
+
+
+def recent_diagnostics(log_file: Path | None, *, limit: int = 50) -> dict[str, Any]:
+    """The most recent warnings and errors from Sway's own log file.
+
+    This exists because a packaged build has no console to watch
+    (sway.logging_setup skips the console handler when ``sys.stderr`` is
+    ``None``, which is how a windowed PyInstaller build runs) -- sway.log is
+    then the *only* place a failure is ever recorded, and a user should not
+    have to go find and open a text file to see it. Reads the file fresh on
+    every call rather than tailing it, so this reflects whatever the running
+    process (or a previous one, sharing the same file) actually wrote.
+
+    Returns entries newest-first, each trimmed to
+    :data:`_MAX_DIAGNOSTIC_MESSAGE_CHARS` so one enormous traceback cannot
+    balloon the response.
+    """
+    if log_file is None or not log_file.exists():
+        return {"available": False, "path": str(log_file) if log_file else "", "entries": []}
+
+    try:
+        text = log_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"available": False, "path": str(log_file), "entries": [], "error": str(exc)}
+
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in text.splitlines():
+        match = _LOG_LINE_RE.match(line)
+        if match is not None:
+            current = None
+            if match.group("level") in _DIAGNOSTIC_LEVELS:
+                current = {
+                    "timestamp": match.group("ts"),
+                    "level": match.group("level"),
+                    "logger": match.group("logger"),
+                    "message": match.group("message"),
+                }
+                entries.append(current)
+        elif current is not None:
+            current["message"] += "\n" + line
+
+    recent = entries[-limit:]
+    recent.reverse()
+    for entry in recent:
+        if len(entry["message"]) > _MAX_DIAGNOSTIC_MESSAGE_CHARS:
+            entry["message"] = entry["message"][:_MAX_DIAGNOSTIC_MESSAGE_CHARS] + "\n… (truncated)"
+    return {
+        "available": True,
+        "path": str(log_file),
+        "entries": recent,
+        "total_matched": len(entries),
+    }
+
+
+# ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
 
@@ -939,6 +1058,7 @@ __all__ = [
     "history_delete",
     "history_delete_all",
     "key_status",
+    "recent_diagnostics",
     "save_app_rule",
     "save_transform",
     "delete_transform",

@@ -160,6 +160,29 @@ function caps(spec, cls = 'hot') {
   return `<span class="cap-row">${parts.map((p) => `<span class="cap ${cls}">${esc(prettyKey(p))}</span>`).join('')}</span>`;
 }
 
+/**
+ * Key caps from a binding's already-formatted label (e.g. "Ctrl + Alt + P",
+ * "Middle Click") -- what every activation and transform binding reaches
+ * the dashboard as now (see sway.hotkey.Binding.pretty). Splits on " + "
+ * rather than caps()'s "+", since the server has already done the parsing
+ * and naming (mouse buttons, modifier combos, sided key names) that caps()
+ * cannot.
+ */
+function capsFromLabel(label, cls = 'hot') {
+  const parts = String(label || '').split(' + ').map((p) => p.trim()).filter(Boolean);
+  if (!parts.length) return '';
+  return `<span class="cap-row">${parts.map((p) => `<span class="cap ${cls}">${esc(p)}</span>`).join('')}</span>`;
+}
+
+/** The first (primary) effective dictation binding, or null if none is set
+ * yet -- {value, label, shape}. Used wherever the UI needs to say "your
+ * hotkey" outside the Shortcuts settings page itself (Home, onboarding). */
+function primaryBinding(target) {
+  const a = state.settings && state.settings.activation && state.settings.activation[target];
+  const bindings = a && a.bindings;
+  return bindings && bindings.length ? bindings[0] : null;
+}
+
 /** pynput names are not user-facing text. */
 function prettyKey(name) {
   const map = {
@@ -187,6 +210,7 @@ const state = {
   settings: null,
   dictionary: null,
   devices: null,
+  diagnostics: null,
   query: '',
   range: '30d',
   insightsTab: 'usage',
@@ -218,10 +242,11 @@ function toast(message, undo) {
   }
 }
 
-function openModal({ title, body, actions }) {
+function openModal({ title, body, actions, wide = false }) {
   el('modal-title').textContent = title;
   el('modal-body').innerHTML = body;
   el('modal-foot').innerHTML = actions;
+  document.querySelector('.modal').classList.toggle('wide', wide);
   el('modal-scrim').classList.add('open');
   const focusTarget = el('modal-body').querySelector('input, textarea, select, button');
   if (focusTarget) focusTarget.focus();
@@ -246,11 +271,12 @@ views.home = {
   },
   render() {
     const d = state.home;
-    const hotkey = (state.settings && state.settings.engine && state.settings.engine.hotkey) || '';
+    const binding = primaryBinding('dictation');
+    const bindingCaps = binding ? capsFromLabel(binding.label) : '';
 
     const greeting = `
       <div class="page-title" style="gap:10px;flex-wrap:wrap">
-        <span>Get back into the flow with</span> ${caps(hotkey) || '<span class="muted">your hotkey</span>'}
+        <span>Get back into the flow with</span> ${bindingCaps || '<span class="muted">your hotkey</span>'}
       </div>`;
 
     const rail = card(`
@@ -264,7 +290,7 @@ views.home = {
 
     const recent = d.recent.length
       ? `<div class="rows">${d.recent.map(historyRow).join('')}</div>`
-      : `<div class="empty">Hold ${caps(hotkey) || 'your hotkey'} and say something. It will appear here.</div>`;
+      : `<div class="empty">Hold ${bindingCaps || 'your hotkey'} and say something. It will appear here.</div>`;
 
     return `
       ${greeting}
@@ -612,11 +638,17 @@ function snippetRows(triggers) {
    shortcut runs one model call over a selection, a phrase folds its
    instruction into the cleanup call that was happening anyway.            */
 
+// Mirrors sway.transforms.MAX_INSTRUCTION_CHARS. A textarea maxlength
+// silently truncates a pasted value that exceeds it -- no error, no
+// warning -- so this has to actually match the server's ceiling, not just
+// be "generously large": a mismatch here is exactly the bug that silently
+// clipped a user's own long, deliberate prompt.
+const TRANSFORM_INSTRUCTION_MAX_CHARS = 8000;
+
 views.transforms = {
   async load() { state.settings = await api('/api/settings'); },
   render() {
     const all = (state.settings && state.settings.transforms) || [];
-    const active = all.filter((t) => t.enabled).length;
 
     if (!all.length) {
       return `
@@ -636,89 +668,237 @@ views.transforms = {
       <div style="display:flex;align-items:center;gap:16px">
         <h1 class="page-title">Transforms</h1>
         <div style="flex:1"></div>
-        <button class="btn" data-act="reset-transforms">Reset to defaults</button>
+        <button class="btn" data-act="reset-transforms">${icon('back')} Reset to defaults</button>
         <button class="btn primary" data-act="add-transform">${icon('plus')} New transform</button>
       </div>
       <div class="small muted" style="margin-top:14px">
-        ${active} of ${all.length} turned on. A transform only costs a request when you run it.
+        Transform works anywhere you write. A transform only costs a request when you run it.
       </div>
       <div class="grid cols-3" style="margin-top:24px">
         ${all.map(transformCard).join('')}
+        ${transformCreateTile()}
       </div>`;
   },
 };
 
-function transformCard(t) {
-  const ways = [];
-  if (t.shortcut_label) ways.push(`<span class="cap">${esc(t.shortcut_label)}</span>`);
-  if (t.phrase) ways.push(`<span class="chip"><span class="txt">“${esc(t.phrase)}”</span></span>`);
+function transformCreateTile() {
+  return `<button class="card transform-tile" data-act="add-transform">
+    <span class="transform-tile-plus">${icon('plus')}</span>
+    <div style="font-weight:600">Create your own</div>
+    <div class="small muted">Write your own prompt</div>
+  </button>`;
+}
 
-  return `<div class="card" style="display:flex;flex-direction:column;gap:10px">
-    <div style="display:flex;align-items:flex-start;gap:10px">
-      <div class="grow">
-        <div style="font-weight:600">${esc(t.name)}</div>
-        ${t.description ? `<div class="small muted" style="margin-top:3px">${esc(t.description)}</div>` : ''}
-      </div>
-      ${toggle(t.enabled, `data-act="toggle-transform" data-id="${esc(t.id)}"`)}
+function transformCard(t) {
+  const caps = (t.shortcut_labels || []).map((label) => capsFromLabel(label)).join('');
+  const preview = t.instruction || t.description;
+  return `<div class="card transform-card" data-act="edit-transform" data-id="${esc(t.id)}">
+    <div class="transform-card-caps">
+      ${caps || '<span class="small muted">No shortcut yet</span>'}
     </div>
-    ${ways.length
-      ? `<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">${ways.join('')}</div>`
-      : `<div class="small muted">No shortcut or phrase yet — it cannot be run.</div>`}
+    <div style="font-weight:600;margin-top:12px">${esc(t.name)}</div>
+    <div class="small muted transform-card-preview">${esc(preview)}</div>
+    ${t.phrase ? `<div class="chip" style="margin-top:10px"><span class="txt">“${esc(t.phrase)}”</span></div>` : ''}
+    ${!t.runnable
+      ? `<div class="small muted" style="margin-top:10px">No shortcut or phrase yet — it cannot be run.</div>` : ''}
     ${t.conflicts && t.conflicts.length
-      ? `<div class="small" style="color:var(--red)">Same shortcut as “${esc(t.conflicts[0])}” — only one of them will run.</div>`
+      ? `<div class="small" style="color:var(--red);margin-top:8px">Same shortcut as “${esc(t.conflicts[0])}” — only one of them will run.</div>`
       : ''}
-    <div style="display:flex;gap:6px;margin-top:auto;padding-top:6px">
+    <div class="transform-card-actions">
       ${iconBtn('edit', 'Edit', `data-act="edit-transform" data-id="${esc(t.id)}"`)}
       ${iconBtn('trash', 'Delete', `data-act="delete-transform" data-id="${esc(t.id)}"`)}
     </div>
   </div>`;
 }
 
-function transformDialog(existing) {
-  const t = existing || { id: '', name: '', description: '', instruction: '', phrase: '', shortcut: '', enabled: true,
-    allows_markdown: false, may_shorten: false, may_lengthen: false };
-  openModal({
-    title: existing ? 'Edit transform' : 'New transform',
-    body: `
-      <div>
-        <label class="field-label" for="x-name">Name</label>
-        <input class="input" id="x-name" value="${esc(t.name)}" placeholder="Prompt Engineer" maxlength="80">
+/* ---- The transform editor sheet ------------------------------------------
+
+   A two-pane sheet, not a form-in-a-modal: the left side is what the
+   transform *is* (its name, how you run it, an example), the right side is
+   what it *does* (the prompt, the one thing that actually matters). Autosaved
+   on every field change (debounced 600ms for text, immediate for a shortcut
+   or a checkbox), so there is no separate Save step to forget.                */
+
+let sheetState = null;
+let sheetSaveTimer = null;
+let sheetSavePending = false;
+
+function blankTransform() {
+  return {
+    id: '', name: '', description: '', instruction: '', phrase: '',
+    shortcuts: [], shortcut_labels: [], builtin: false,
+    example_input: '', example_output: '', example_diff: [],
+    allows_markdown: false, may_shorten: false, may_lengthen: false,
+  };
+}
+
+function openTransformSheet(existing) {
+  sheetState = existing ? { ...existing } : blankTransform();
+  renderTransformSheet();
+}
+
+function closeTransformSheet() {
+  clearTimeout(sheetSaveTimer);
+  sheetState = null;
+  closeModal();
+}
+
+function transformExampleHtml(t) {
+  if (t.example_diff && t.example_diff.length) {
+    return t.example_diff.map((part) => {
+      if (part.op === 'delete') return `<s class="diff-del">${esc(part.text)}</s>`;
+      if (part.op === 'insert') return `<mark class="diff-ins">${esc(part.text)}</mark>`;
+      return esc(part.text);
+    }).join('');
+  }
+  if (t.example_input && t.example_output) {
+    return `<s class="diff-del">${esc(t.example_input)}</s> <mark class="diff-ins">${esc(t.example_output)}</mark>`;
+  }
+  return `<span class="muted">No example yet — run it once from its shortcut or phrase, and what it produced will show up here.</span>`;
+}
+
+function renderTransformSheet() {
+  const t = sheetState;
+  const isNew = !t.id;
+  const caps = (t.shortcut_labels || []).map((label, i) => {
+    const advisory = (t.shortcut_advisories || [])[i];
+    return `
+    <span class="cap-row" style="gap:4px">
+      ${capsFromLabel(label)}
+      ${iconBtn('edit', 'Change', `data-act="edit-transform-shortcut" data-index="${i}"`)}
+      ${iconBtn('trash', 'Remove', `data-act="remove-transform-shortcut" data-index="${i}"`)}
+    </span>
+    ${advisory ? `<div class="small muted" style="margin-top:2px">${esc(advisory)}</div>` : ''}`;
+  }).join('');
+
+  el('modal-title').textContent = '';
+  el('modal-body').innerHTML = `
+    <div class="sheet-grid">
+      <div class="sheet-col">
+        <input class="sheet-name-input" id="x-name" value="${esc(t.name)}"
+          placeholder="Name this transform" maxlength="80">
+        <div class="small muted" style="margin-top:2px">
+          ${(t.shortcut_labels || []).length || t.phrase
+            ? `${caps || ''} ${t.phrase ? `<span class="chip" style="margin-left:6px"><span class="txt">“${esc(t.phrase)}”</span></span>` : ''} to use`
+            : 'No shortcut or phrase set yet'}
+        </div>
+        <div style="margin-top:22px">
+          <label class="field-label" for="x-desc">Description <span class="muted">(optional)</span></label>
+          <input class="input" id="x-desc" value="${esc(t.description)}" placeholder="What it is for" maxlength="200">
+        </div>
+        <div style="margin-top:22px">
+          <div class="field-label">Example of transformed text</div>
+          <div class="well transform-example">${transformExampleHtml(t)}</div>
+        </div>
       </div>
-      <div>
-        <label class="field-label" for="x-desc">Description <span class="muted">(optional)</span></label>
-        <input class="input" id="x-desc" value="${esc(t.description)}" placeholder="What it is for" maxlength="200">
+      <div class="sheet-col">
+        <div class="well">
+          <div class="field-label">Shortcuts</div>
+          <div class="small muted" style="margin:-3px 0 10px">Runs it over whatever you have selected.</div>
+          <div class="stack" style="gap:8px">${caps}</div>
+          <button class="btn small ghost" style="margin-top:8px" data-act="add-transform-shortcut">
+            ${icon('plus')} Add a shortcut
+          </button>
+        </div>
+        <div class="well" style="margin-top:16px">
+          <label class="field-label" for="x-phrase">Spoken phrase <span class="muted">(optional)</span></label>
+          <input class="input" id="x-phrase" value="${esc(t.phrase)}" placeholder="make that concise" maxlength="80">
+          <div class="small muted" style="margin-top:6px">Say it at the end of a dictation. Folded into the cleanup request, so it costs no extra call.</div>
+        </div>
+        <div style="margin-top:22px;flex:1;display:flex;flex-direction:column">
+          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px">
+            <label class="field-label" for="x-instruction">Prompt</label>
+            <span style="display:flex;align-items:baseline;gap:10px">
+              <span class="small muted" id="x-charcount">${t.instruction.length} / ${TRANSFORM_INSTRUCTION_MAX_CHARS}</span>
+              <span class="small muted" id="x-autosave">Autosave on</span>
+            </span>
+          </div>
+          <textarea class="input sheet-prompt" id="x-instruction" maxlength="${TRANSFORM_INSTRUCTION_MAX_CHARS}" rows="10"
+            placeholder="Rewrite the text into a highly effective AI prompt while preserving the intent.">${esc(t.instruction)}</textarea>
+          <div class="small muted" style="margin-top:6px">Written to the model as-is. Say what to preserve, not just what to change.</div>
+        </div>
+        <details style="margin-top:18px">
+          <summary class="small" style="cursor:pointer;color:var(--muted)">What it may do to the text</summary>
+          <div class="small muted" style="margin:8px 0">Sway checks the model's answer before pasting it and keeps your own words if it looks wrong. Tick what this prompt is <em>supposed</em> to do, so a correct result is not thrown away.</div>
+          <label class="check-row"><input type="checkbox" id="x-md"${t.allows_markdown ? ' checked' : ''}>
+            <span>Produces a list or headings <span class="muted">— bullets, numbered points</span></span></label>
+          <label class="check-row"><input type="checkbox" id="x-short"${t.may_shorten ? ' checked' : ''}>
+            <span>Makes the text shorter <span class="muted">— summarize, condense</span></span></label>
+          <label class="check-row"><input type="checkbox" id="x-long"${t.may_lengthen ? ' checked' : ''}>
+            <span>Makes the text longer <span class="muted">— adds a greeting, a sign-off</span></span></label>
+        </details>
+        <div id="x-error" class="small" style="color:var(--red);min-height:18px;margin-top:10px"></div>
       </div>
-      <div>
-        <label class="field-label" for="x-instruction">Instruction</label>
-        <textarea class="input" id="x-instruction" maxlength="600" rows="4"
-          placeholder="Rewrite the text into a highly effective AI prompt while preserving the intent.">${esc(t.instruction)}</textarea>
-        <div class="small muted">Written to the model as-is. One clear sentence works better than a paragraph — and say what to preserve, not just what to change.</div>
-      </div>
-      <div>
-        <label class="field-label" for="x-shortcut">Shortcut <span class="muted">(optional)</span></label>
-        <input class="input" id="x-shortcut" value="${esc(t.shortcut)}" placeholder="ctrl+alt+p" maxlength="64">
-        <div class="small muted">Runs it over whatever you have selected. Needs a modifier, e.g. Ctrl+Alt+P.</div>
-      </div>
-      <div>
-        <label class="field-label" for="x-phrase">Spoken phrase <span class="muted">(optional)</span></label>
-        <input class="input" id="x-phrase" value="${esc(t.phrase)}" placeholder="make that concise" maxlength="80">
-        <div class="small muted">Say it at the end of a dictation. Folded into the cleanup request, so it costs no extra call.</div>
-      </div>
-      <div>
-        <label class="field-label">What it may do to the text</label>
-        <div class="small muted" style="margin:-3px 0 8px">Sway checks the model's answer before pasting it and keeps your own words if it looks wrong. Tick what this instruction is <em>supposed</em> to do, so a correct result is not thrown away.</div>
-        <label class="check-row"><input type="checkbox" id="x-md"${t.allows_markdown ? ' checked' : ''}>
-          <span>Produces a list or headings <span class="muted">— bullets, numbered points</span></span></label>
-        <label class="check-row"><input type="checkbox" id="x-short"${t.may_shorten ? ' checked' : ''}>
-          <span>Makes the text shorter <span class="muted">— summarize, condense</span></span></label>
-        <label class="check-row"><input type="checkbox" id="x-long"${t.may_lengthen ? ' checked' : ''}>
-          <span>Makes the text longer <span class="muted">— adds a greeting, a sign-off</span></span></label>
-      </div>
-      <div id="x-error" class="small" style="color:var(--red)"></div>`,
-    actions: `<div class="spacer"></div>
-      <button class="btn" data-act="close-modal">Cancel</button>
-      <button class="btn primary" data-act="save-transform" data-id="${esc(t.id)}">Save</button>`,
-  });
+    </div>`;
+  el('modal-foot').innerHTML = `
+    ${t.builtin ? `<button class="btn" data-act="reset-transforms">Reset to defaults</button>` : '<div class="spacer"></div>'}
+    <div class="spacer"></div>
+    <button class="btn primary" data-act="close-transform-sheet">Done</button>`;
+  document.querySelector('.modal').classList.add('wide');
+  el('modal-scrim').classList.add('open');
+
+  for (const [id, field] of [
+    ['x-name', 'name'], ['x-desc', 'description'], ['x-phrase', 'phrase'],
+    ['x-instruction', 'instruction'],
+  ]) {
+    const node = el(id);
+    if (node) node.oninput = () => {
+      sheetState[field] = node.value;
+      if (id === 'x-instruction' && el('x-charcount')) {
+        el('x-charcount').textContent = `${node.value.length} / ${TRANSFORM_INSTRUCTION_MAX_CHARS}`;
+      }
+      scheduleSheetSave();
+    };
+  }
+  for (const [id, field] of [['x-md', 'allows_markdown'], ['x-short', 'may_shorten'], ['x-long', 'may_lengthen']]) {
+    const node = el(id);
+    if (node) node.onchange = () => { sheetState[field] = node.checked; saveSheetNow(); };
+  }
+  const focusTarget = el('x-name');
+  if (focusTarget && isNew) focusTarget.focus();
+}
+
+function scheduleSheetSave() {
+  el('x-autosave').textContent = 'Saving…';
+  clearTimeout(sheetSaveTimer);
+  sheetSaveTimer = setTimeout(saveSheetNow, 600);
+}
+
+async function saveSheetNow() {
+  if (!sheetState) return;
+  if (sheetSavePending) { clearTimeout(sheetSaveTimer); sheetSaveTimer = setTimeout(saveSheetNow, 300); return; }
+  const t = sheetState;
+  const error = el('x-error');
+  if (!t.name.trim() || !t.instruction.trim()) {
+    if (el('x-autosave')) el('x-autosave').textContent = t.name.trim() ? 'Needs a prompt' : 'Needs a name';
+    return;
+  }
+  sheetSavePending = true;
+  try {
+    const settings = await post('/api/transforms/save', {
+      id: t.id || undefined,
+      name: t.name,
+      description: t.description,
+      instruction: t.instruction,
+      shortcuts: t.shortcuts,
+      phrase: t.phrase,
+      allows_markdown: t.allows_markdown,
+      may_shorten: t.may_shorten,
+      may_lengthen: t.may_lengthen,
+    });
+    state.settings = settings;
+    const saved = (settings.transforms || []).find((x) =>
+      t.id ? x.id === t.id : x.name === t.name && x.instruction === t.instruction);
+    if (saved) { sheetState = { ...saved }; }
+    if (el('x-autosave')) el('x-autosave').textContent = 'Saved';
+    if (error) error.textContent = '';
+    setBadge('transforms-count', countTransformConflicts());
+  } catch (err) {
+    if (error) error.textContent = err.message;
+    if (el('x-autosave')) el('x-autosave').textContent = 'Autosave on';
+  } finally {
+    sheetSavePending = false;
+  }
 }
 
 /* ---- Insights ----------------------------------------------------------- */
@@ -960,6 +1140,9 @@ views.settings = {
     if (state.settingsTab === 'voice' && !state.devices) {
       state.devices = await api('/api/devices');
     }
+    if (state.settingsTab === 'data' && !state.diagnostics) {
+      state.diagnostics = await api('/api/diagnostics');
+    }
   },
   render() {
     // Snippets used to be a tab here. They are a page now: two managers for
@@ -1071,6 +1254,7 @@ function voicePanel() {
     ${activationRow(activation, 'dictation', 'Dictation hotkey', 'Hold it, speak, release.')}
     ${activationRow(activation, 'command', 'Voice command hotkey', 'Hold it over selected text to transform it.')}
     ${handsFreeRow(activation)}
+    ${registeredShortcutsTable(engine)}
     ${settingRow('Language', 'Leave on auto-detect unless Sway keeps guessing wrong.',
       `<select class="input" data-act="set" data-field="language">
         <option value="">Auto-detect</option>
@@ -1101,32 +1285,39 @@ function voicePanel() {
 
 /** One binding chip, wrapped so the live-preview poller (watchActivationPreview)
  * can find it and paint .held while it is physically down right now. */
-const bindingChip = (target, value) =>
-  value ? `<span data-live-binding="${esc(target)}">${caps(value)}</span>` : '';
+function bindingChip(target, b) {
+  return `<span class="stack" style="gap:2px;align-items:flex-end">
+    <span class="cap-row" data-live-binding="${esc(target)}" data-binding-value="${esc(b.value)}" style="gap:4px">
+      ${capsFromLabel(b.label)}
+      ${iconBtn('edit', 'Change', `data-act="edit-binding" data-target="${esc(target)}" data-value="${esc(b.value)}"`)}
+      ${iconBtn('trash', 'Remove', `data-act="remove-binding" data-target="${esc(target)}" data-value="${esc(b.value)}"`)}
+    </span>
+    ${b.advisory ? `<div class="small muted">${esc(b.advisory)}</div>` : ''}
+  </span>`;
+}
 
 /**
- * The Dictation/Voice-command rows: current binding chip(s), an edit
- * pencil, a reset icon once the row is no longer default, and a "+" to add
- * the optional alternate chord (the reference's own affordance) once no
- * chord is set yet.
+ * The Dictation/Voice-command rows: every current binding, each with its own
+ * edit/remove, a reset icon once the row is no longer default, and a "+" to
+ * add another -- any binding can now be a held key, a modifier combo, a
+ * shortcut, or a mouse button, so there is one list rather than a fixed
+ * "primary key, optional alternate chord" pair.
  */
 function activationRow(activation, target, label, hint) {
   const a = activation[target] || {};
-  const chips = [bindingChip(target, a.key), a.chord ? bindingChip(`${target}_chord`, a.chord) : ''].filter(Boolean);
-  const bindingHtml = chips.length
-    ? chips.join(' <span class="small muted">or</span> ')
-    : '<span class="small muted">Not set</span>';
+  const bindings = a.bindings || [];
   const hasConflict = a.conflicts && a.conflicts.length > 0;
   return settingRow(label, hint, `
-    <div class="cap-row${hasConflict ? ' conflict' : ''}" style="flex-wrap:wrap;justify-content:flex-end;gap:8px">
-      ${bindingHtml}
-      <button class="btn small" data-act="edit-binding" data-target="${target}" data-field="key">
-        ${icon('edit')} ${a.key ? 'Change' : 'Set'}
-      </button>
-      ${!a.is_default ? iconBtn('trash', 'Reset to default', `data-act="reset-binding" data-target="${target}"`) : ''}
-      ${a.chord
-        ? iconBtn('trash', 'Remove shortcut', `data-act="clear-binding-chord" data-target="${target}"`)
-        : `<button class="btn small ghost" data-act="edit-binding" data-target="${target}" data-field="chord">+ Shortcut</button>`}
+    <div class="stack" style="gap:8px;align-items:flex-end">
+      <div class="stack" style="gap:6px;align-items:flex-end">
+        ${bindings.length
+          ? bindings.map((b) => bindingChip(target, b)).join('')
+          : '<span class="small muted">Not set</span>'}
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="btn small ghost" data-act="add-binding" data-target="${target}">${icon('plus')} Add</button>
+        ${!a.is_default ? `<button class="btn small ghost" data-act="reset-binding" data-target="${target}">Reset to default</button>` : ''}
+      </div>
     </div>
     ${hasConflict ? `<div class="small" style="color:var(--red)">Same as ${esc(a.conflicts[0])} — only one will fire.</div>` : ''}
   `);
@@ -1135,41 +1326,78 @@ function activationRow(activation, target, label, hint) {
 /**
  * Hands-free dictation: its own mode toggle (off by default -- this is an
  * additional way to dictate, not a replacement for hold-to-talk), the same
- * binding capture as the two hold-based rows, and -- only relevant to a
- * held-key binding, not a chord -- whether it must be double-tapped.
+ * binding list as the two hold-based rows, and -- only meaningful once at
+ * least one binding is a bare held key or combo, not a shortcut -- whether
+ * it must be double-tapped.
  */
 function handsFreeRow(activation) {
   const a = activation.hands_free || {};
-  const chips = [bindingChip('hands_free', a.key), a.chord ? bindingChip('hands_free_chord', a.chord) : ''].filter(Boolean);
-  const bindingHtml = chips.length
-    ? chips.join(' <span class="small muted">or</span> ')
-    : '<span class="small muted">Not set</span>';
+  const bindings = a.bindings || [];
   const hasConflict = a.conflicts && a.conflicts.length > 0;
-  const gesture = a.key
-    ? (a.double_tap ? 'Press this key twice quickly to start, twice again to stop.' : 'Tap this key to start, tap again to stop.')
-    : (a.chord ? 'Press this shortcut to start, again to stop.' : 'Tap once to start recording, tap again to stop — no holding.');
+  const gesture = bindings.length
+    ? (a.double_tap ? 'Double-tap a binding to start, double-tap again to stop.' : 'Tap a binding to start, tap again to stop.')
+    : 'Tap once to start recording, tap again to stop — no holding.';
 
   return `
     ${settingRow('Hands-free dictation', gesture,
       `<span data-live-hands-free></span>${toggle(!!a.enabled, 'data-act="set" data-field="hands_free_enabled"')}`)}
     ${a.enabled ? settingRow('Hands-free binding', '', `
-      <div class="cap-row${hasConflict ? ' conflict' : ''}" style="flex-wrap:wrap;justify-content:flex-end;gap:8px">
-        ${bindingHtml}
-        <button class="btn small" data-act="edit-binding" data-target="hands_free" data-field="key">
-          ${icon('edit')} ${a.key ? 'Change' : 'Set'}
-        </button>
-        ${!a.is_default ? iconBtn('trash', 'Reset to default', 'data-act="reset-binding" data-target="hands_free"') : ''}
-        ${a.chord
-          ? iconBtn('trash', 'Remove shortcut', 'data-act="clear-binding-chord" data-target="hands_free"')
-          : `<button class="btn small ghost" data-act="edit-binding" data-target="hands_free" data-field="chord">+ Shortcut</button>`}
+      <div class="stack" style="gap:8px;align-items:flex-end">
+        <div class="stack" style="gap:6px;align-items:flex-end">
+          ${bindings.length
+            ? bindings.map((b) => bindingChip('hands_free', b)).join('')
+            : '<span class="small muted">Not set</span>'}
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn small ghost" data-act="add-binding" data-target="hands_free">${icon('plus')} Add</button>
+          ${!a.is_default ? `<button class="btn small ghost" data-act="reset-binding" data-target="hands_free">Reset to default</button>` : ''}
+        </div>
       </div>
-      ${a.key ? `<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:10px;justify-content:flex-end">
+      ${bindings.length ? `<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:10px;justify-content:flex-end">
         Double-tap instead of a single tap
         ${toggle(!!a.double_tap, 'data-act="set" data-field="hands_free_double_tap"')}
       </label>` : ''}
       ${hasConflict ? `<div class="small" style="color:var(--red)">Same as ${esc(a.conflicts[0])} — only one will fire.</div>` : ''}
     `) : ''}
   `;
+}
+
+/**
+ * Read-only diagnostic table: every binding Sway is actually tracking right
+ * now -- dictation, the voice command, hands-free, and every transform's
+ * shortcuts, in one place -- with whether it registered cleanly, and
+ * whether it has ever fired. Answers "is this my app, another app, or the
+ * OS?" without needing to open the log file: a shortcut that never shows
+ * "fired" here never reached Sway's own hook at all, so the cause is
+ * upstream of Sway (another app or the OS claimed it first); one that shows
+ * "fired" but visibly did nothing is downstream (selection capture,
+ * injection, or the target app itself).
+ */
+function registeredShortcutsTable(engine) {
+  const bindings = engine.bindings || [];
+  if (!bindings.length) return '';
+
+  const statusNote = (b) => {
+    if (b.status === 'invalid') return `<span class="small" style="color:var(--red)">invalid${b.detail ? ` — ${esc(b.detail)}` : ''}</span>`;
+    if (b.status === 'duplicate') return `<span class="small" style="color:var(--red)">duplicate — “${esc(b.detail)}” claimed it first</span>`;
+    return `<span class="small muted">${b.fire_count ? `fired ${fmt.int(b.fire_count)}× — last ${fmt.clock(b.last_fired_at)}` : 'never fired'}</span>`;
+  };
+
+  return `
+    <div style="margin-top:34px">
+      <span class="meta-label">Registered shortcuts</span>
+      <div class="rows" style="margin-top:8px">
+        ${bindings.map((b) => `
+          <div class="row">
+            <span class="dot ${b.status === 'registered' ? 'ok' : ''}" style="margin-left:6px"></span>
+            <div class="body">
+              <div class="text">${esc(b.pretty || b.value)}</div>
+              <div class="small muted">${esc(b.label)}</div>
+            </div>
+            ${statusNote(b)}
+          </div>`).join('')}
+      </div>
+    </div>`;
 }
 
 // Named states, not a slider: "aggressiveness 0-10" tells a user nothing about
@@ -1237,6 +1465,16 @@ function dataPanel() {
       retention('latency_retention_days', settings.latency_retention_days))}
     ${settingRow('Data folder', engine.data_directory || '', '<button class="btn small" data-act="open-data">Show me</button>')}
     <div style="margin-top:36px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px">
+        <span class="meta-label">Recent warnings &amp; errors</span>
+        <button class="btn small ghost" data-act="refresh-diagnostics">Refresh</button>
+      </div>
+      <div class="small muted" style="margin-top:2px">
+        Read straight from sway.log, so this shows up even when there is no console window to watch.
+      </div>
+      <div style="margin-top:10px">${diagnosticsPanel()}</div>
+    </div>
+    <div style="margin-top:36px">
       <div class="banner" style="align-items:flex-start">
         <div style="flex:1">
           <strong>Delete everything</strong>
@@ -1247,6 +1485,27 @@ function dataPanel() {
         <button class="btn danger small" data-act="delete-all">Delete all</button>
       </div>
     </div>`;
+}
+
+function diagnosticsPanel() {
+  const d = state.diagnostics;
+  if (!d) return '<div class="small muted">Loading…</div>';
+  if (!d.available) {
+    return `<div class="small muted">No log file yet${d.path ? ` (looked in ${esc(d.path)})` : ''}.</div>`;
+  }
+  if (!d.entries.length) {
+    return `<div class="small muted">No warnings or errors recorded — that log file is at ${esc(d.path)}.</div>`;
+  }
+  return `<div class="rows">
+    ${d.entries.map((e) => `
+      <div class="row" style="align-items:flex-start">
+        <span class="dot" style="margin-left:6px;margin-top:7px;background:${e.level === 'WARNING' ? 'var(--amber)' : 'var(--red)'}"></span>
+        <div class="body">
+          <div class="small muted">${esc(e.timestamp)} · ${esc(e.level)} · ${esc(e.logger)}</div>
+          <div class="mono small" style="white-space:pre-wrap;word-break:break-word;margin-top:2px">${esc(e.message)}</div>
+        </div>
+      </div>`).join('')}
+  </div>`;
 }
 
 /* ---- About -------------------------------------------------------------- */
@@ -1577,42 +1836,46 @@ document.addEventListener('click', async (event) => {
       case 'save-key': await saveKey(); break;
       case 'test-key': await testKey(); break;
 
-      case 'add-transform': transformDialog(null); break;
+      case 'add-transform': openTransformSheet(null); break;
       case 'edit-transform': {
         const list = (state.settings && state.settings.transforms) || [];
-        transformDialog(list.find((t) => t.id === target.dataset.id) || null);
+        const existing = list.find((t) => t.id === target.dataset.id);
+        if (existing) openTransformSheet(existing);
         break;
       }
-      case 'save-transform': {
-        const error = el('x-error');
-        try {
-          state.settings = await post('/api/transforms/save', {
-            id: target.dataset.id || undefined,
-            name: el('x-name').value,
-            description: el('x-desc').value,
-            instruction: el('x-instruction').value,
-            shortcut: el('x-shortcut').value,
-            phrase: el('x-phrase').value,
-            enabled: true,
-            allows_markdown: el('x-md').checked,
-            may_shorten: el('x-short').checked,
-            may_lengthen: el('x-long').checked,
-          });
-          closeModal(); await refresh(); toast('Transform saved');
-        } catch (err) { error.textContent = err.message; }
-        break;
-      }
-      case 'toggle-transform': {
-        const list = (state.settings && state.settings.transforms) || [];
-        const t = list.find((x) => x.id === target.dataset.id);
-        if (!t) break;
-        state.settings = await post('/api/transforms/save', { ...t, enabled: !t.enabled });
+      case 'close-transform-sheet':
+        closeTransformSheet();
         await refresh();
+        break;
+      case 'add-transform-shortcut':
+      case 'edit-transform-shortcut': {
+        if (!sheetState) break;
+        const index = target.dataset.index !== undefined ? Number(target.dataset.index) : -1;
+        captureBindingDialog({
+          title: index >= 0 ? 'Press the new key, combination, or mouse button' : 'Press a key, combination, or mouse button',
+          hint: 'Hold modifiers together for a combo (like Ctrl+Win), add a key for a shortcut (like Ctrl+Alt+P), or click a mouse button (middle, back, or forward).',
+          onCaptured: async (spec) => {
+            const shortcuts = [...(sheetState.shortcuts || [])];
+            if (index >= 0) shortcuts[index] = spec; else shortcuts.push(spec);
+            sheetState.shortcuts = shortcuts;
+            await saveSheetNow();
+            renderTransformSheet();
+          },
+        });
+        break;
+      }
+      case 'remove-transform-shortcut': {
+        if (!sheetState) break;
+        const index = Number(target.dataset.index);
+        sheetState.shortcuts = (sheetState.shortcuts || []).filter((_, i) => i !== index);
+        await saveSheetNow();
+        renderTransformSheet();
         break;
       }
       case 'delete-transform': {
         const list = (state.settings && state.settings.transforms) || [];
         const gone = list.find((t) => t.id === target.dataset.id);
+        if (sheetState && gone && sheetState.id === gone.id) closeTransformSheet();
         state.settings = await post('/api/transforms/delete', { id: target.dataset.id });
         await refresh();
         // Deleting is immediate with an undo in the toast, matching how
@@ -1624,6 +1887,7 @@ document.addEventListener('click', async (event) => {
         break;
       }
       case 'reset-transforms':
+        closeTransformSheet();
         state.settings = await post('/api/transforms/reset', {});
         await refresh();
         toast('Built-in transforms restored');
@@ -1766,24 +2030,48 @@ document.addEventListener('click', async (event) => {
 
       case 'pick-device': await saveSetting('audio_device', target.dataset.device || null); break;
       case 'edit-hotkey': hotkeyDialog(); break;
-      case 'edit-binding': {
+      case 'add-binding': {
         const bindingTarget = target.dataset.target;
-        const field = target.dataset.field;
-        if (field === 'chord') {
-          activationBindingDialog({
-            target: bindingTarget, field: 'chord', kind: 'chord',
-            title: 'Press the shortcut you want',
-            hint: 'A combination like Ctrl+Alt+Space — hold the modifier keys, then press the last one.',
-          });
-        } else {
-          activationBindingDialog({
-            target: bindingTarget, field: 'key', kind: 'hold',
-            title: 'Press the key you want to hold',
-            hint: 'Needs a key you never type with — a Ctrl, Shift, Alt, Win, Caps Lock, or F13–F18 key.',
-          });
-        }
+        captureBindingDialog({
+          title: 'Press a key, combination, or mouse button',
+          hint: 'Hold a key on its own, hold modifiers together for a combo (like Ctrl+Win), add a key for a shortcut (like Ctrl+Alt+P), or click a mouse button (middle, back, or forward).',
+          onCaptured: async (spec) => {
+            try {
+              state.settings = await post('/api/shortcuts/save', { target: bindingTarget, op: 'add', binding: spec });
+              toast('Added'); await refresh();
+            } catch (err) { toast(err.message); }
+          },
+        });
         break;
       }
+      case 'edit-binding': {
+        const bindingTarget = target.dataset.target;
+        const oldValue = target.dataset.value;
+        captureBindingDialog({
+          title: 'Press the new key, combination, or mouse button',
+          hint: 'This replaces the binding you clicked edit on.',
+          onCaptured: async (spec) => {
+            try {
+              state.settings = await post('/api/shortcuts/save', {
+                target: bindingTarget, op: 'replace', old_binding: oldValue, binding: spec,
+              });
+              toast('Updated'); await refresh();
+            } catch (err) { toast(err.message); }
+          },
+        });
+        break;
+      }
+      case 'remove-binding':
+        try {
+          state.settings = await post('/api/shortcuts/save', {
+            target: target.dataset.target, op: 'remove', binding: target.dataset.value,
+          });
+          toast('Removed');
+          await refresh();
+        } catch (err) {
+          toast(err.message);
+        }
+        break;
       case 'reset-binding':
         try {
           await post('/api/shortcuts/reset', { target: target.dataset.target });
@@ -1793,16 +2081,11 @@ document.addEventListener('click', async (event) => {
           toast(err.message);
         }
         break;
-      case 'clear-binding-chord':
-        try {
-          await post('/api/shortcuts/save', { target: target.dataset.target, chord: '' });
-          toast('Shortcut removed');
-          await refresh();
-        } catch (err) {
-          toast(err.message);
-        }
-        break;
       case 'open-data': toast('Your data folder is shown in Settings › Data'); break;
+      case 'refresh-diagnostics':
+        state.diagnostics = await api('/api/diagnostics');
+        await refresh();
+        break;
 
       case 'set': {
         // Toggles carry their state in aria-checked; selects in value.
@@ -1986,28 +2269,63 @@ function chordTerminalKeyName(event) {
   return fMatch ? `f${fMatch[1]}` : null;
 }
 
+/** Mouse buttons that may be bound, by MouseEvent.button. Left (0) and
+ * right (2) are deliberately absent -- see sway.hotkey.MOUSE_BUTTONS. */
+const MOUSE_BUTTON_NAMES = { 1: 'middle', 3: 'back', 4: 'forward' };
+const MOUSE_LABELS = { middle: 'Middle Click', back: 'Back Button', forward: 'Forward Button' };
+
+/** A raw binding spec (e.g. "ctrl+cmd", "ctrl_r", "mouse:middle",
+ * "ctrl+alt+p") as key caps, for a capture that has not round-tripped
+ * through the server yet (which is the only place that already knows how
+ * to label a sided hold-key name or a mouse button). */
+function specChips(spec, cls) {
+  const SIDED = ['ctrl_r', 'ctrl_l', 'alt_r', 'alt_l', 'shift_r', 'shift_l', 'cmd', 'caps_lock', 'f13'];
+  const parts = String(spec).split('+');
+  return parts.map((p) => {
+    let label;
+    if (p.startsWith('mouse:')) label = MOUSE_LABELS[p.slice(6)] || p;
+    else if (SIDED.includes(p)) label = prettyKey(p);
+    else label = chordPartLabel(p);
+    return `<span class="cap big ${cls}">${esc(label)}</span>`;
+  }).join('');
+}
+
 /**
- * One capture dialog for every activation binding: a held key (kind:
- * 'hold', dictation/command/hands-free's primary binding) or a modifier
- * chord (kind: 'chord', the optional alternate). Derived from the
- * reference's own hotkey screen (§1 4.png): caps go indigo *while
- * physically held*, and the user is asked to observe that rather than
- * being told the hook registered.
+ * One capture dialog for every binding, activation or transform: a bare
+ * held key, two or more modifiers held together (a combo), a modifier
+ * chord ending in a key, a bare mouse button, or a chord ending in a mouse
+ * button -- see sway.hotkey.Binding. Derived from the reference's own
+ * hotkey screen (§1 4.png): caps go indigo *while physically held* (§5),
+ * and the user is asked to observe that rather than being told the hook
+ * registered.
+ *
+ * Deliberately dumb about what the captured spec *means* -- it just reports
+ * whatever gesture was pressed back to `onCaptured`, which persists it
+ * however its caller needs to (an activation target's list, or a
+ * transform's shortcuts array). The server is the single source of truth
+ * for validating and canonicalising it (sway.hotkey.parse_binding); this
+ * only needs to build something plausible.
  */
-function activationBindingDialog({ target, field, kind, title, hint }) {
-  const isChord = kind === 'chord';
+function captureBindingDialog({ title, hint, onCaptured }) {
   let captured = null;
-  let heldModifiers = new Set();
+  // Generic (unsided) modifiers currently held, for combo/chord detection.
+  const heldGeneric = new Set();
+  // How many relevant physical members (modifiers + a held mouse button)
+  // are down right now -- purely for the held/hot visual, independent of
+  // what has been captured so far.
+  let physicalCount = 0;
+  let locked = false; // a terminal (key or mouse) has fired: the capture is final
 
   openModal({
     title,
     body: `
       <div class="well" style="text-align:center;padding:26px">
-        <div id="ab-caps" style="display:flex;gap:12px;justify-content:center;min-height:76px;align-items:center">
+        <div id="ab-caps" style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center;min-height:76px;align-items:center">
           <span class="cap big capturing"></span>
         </div>
       </div>
-      <div class="small muted">${hint}</div>
+      <div class="small muted">${esc(hint)}</div>
+      <div id="ab-note" class="small muted" style="min-height:18px"></div>
       <div id="ab-error" class="small" style="color:var(--red);min-height:18px"></div>`,
     actions: `<div class="spacer"></div>
       <button class="btn" data-act="close-modal">Cancel</button>
@@ -2015,6 +2333,7 @@ function activationBindingDialog({ target, field, kind, title, hint }) {
   });
 
   const capsBox = document.getElementById('ab-caps');
+  const note = document.getElementById('ab-note');
   const error = document.getElementById('ab-error');
   const save = document.getElementById('ab-save');
 
@@ -2027,102 +2346,133 @@ function activationBindingDialog({ target, field, kind, title, hint }) {
     }
   }, 6000);
 
-  const showChordChips = (parts, cls) => {
-    capsBox.innerHTML = parts.map((p) => `<span class="cap big ${cls}">${esc(chordPartLabel(p))}</span>`).join('');
+  const render = () => {
+    if (!captured) return;
+    capsBox.innerHTML = specChips(captured, physicalCount > 0 ? 'held' : 'hot');
+    // Informational only -- Save stays enabled. Windows' shell specially
+    // intercepts keystrokes while the physical Win key is held (checking
+    // for reserved system shortcuts), which can keep this binding's own
+    // synthetic actions (reading a selection, pasting) from reaching the
+    // app you're using. Not a reason to block the combination, just to be
+    // honest that it is the least dependable modifier to build on.
+    note.textContent = captured.split('+').includes('cmd')
+      ? "Shortcuts using the Win key can be less reliable — Windows sometimes intercepts them before they reach the app you're using."
+      : '';
   };
 
-  const onDown = (event) => {
-    if (isChord) {
-      const mod = CHORD_MODIFIER_CODES[event.code];
-      if (mod) {
-        event.preventDefault();
-        heldModifiers.add(mod);
-        showChordChips(CHORD_MODIFIER_ORDER.filter((m) => heldModifiers.has(m)), 'held');
-        return;
-      }
-      const key = chordTerminalKeyName(event);
-      if (!key) return; // an unrecognised key: not part of a chord, ignore
+  const onKeyDown = (event) => {
+    if (locked) return;
+    const mod = CHORD_MODIFIER_CODES[event.code];
+    if (mod) {
       event.preventDefault();
-      if (heldModifiers.size === 0) {
-        error.textContent = 'A shortcut needs at least one modifier, like Ctrl+Alt+P.';
-        return;
-      }
-      const order = CHORD_MODIFIER_ORDER.filter((m) => heldModifiers.has(m));
-      const chord = [...order, key].join('+');
-      if (RESERVED_CHORDS[chord]) {
-        error.textContent = `${chordLabel(chord)} is ${RESERVED_CHORDS[chord]}.`;
-        return;
-      }
+      const wasHeld = heldGeneric.has(mod);
+      heldGeneric.add(mod);
+      if (!wasHeld) physicalCount += 1;
+      // A single modifier held alone captures as that sided key (matches a
+      // bare hold binding); two or more captures as a modifier-only combo.
+      // Recomputed fresh on every additional press, so the fullest gesture
+      // pressed so far is always what is shown and what would be saved.
+      captured = heldGeneric.size === 1 ? MODIFIER_CODES[event.code] : CHORD_MODIFIER_ORDER.filter((m) => heldGeneric.has(m)).join('+');
       error.textContent = '';
-      captured = chord;
-      showChordChips([...order, key], 'hot');
       save.disabled = false;
-    } else {
-      const name = MODIFIER_CODES[event.code];
-      event.preventDefault();
-      if (!name) {
-        error.textContent = 'That key would be typed into your document. Pick a modifier key.';
-        return;
-      }
-      error.textContent = '';
-      captured = name;
-      // Lilac = "this key is down right now" (§1 4.png).
-      capsBox.innerHTML = `<span class="cap big held">${esc(prettyKey(name))}</span>`;
-      save.disabled = false;
-    }
-  };
-
-  const onUp = (event) => {
-    if (isChord) {
-      const mod = CHORD_MODIFIER_CODES[event.code];
-      if (mod) heldModifiers.delete(mod);
+      render();
       return;
     }
-    if (!captured) return;
-    // Amber at rest = "this is your hotkey" (§5).
-    capsBox.innerHTML = `<span class="cap big hot">${esc(prettyKey(captured))}</span>`;
+    const key = chordTerminalKeyName(event);
+    if (!key) return; // an unrecognised key: not part of a usable binding, ignore
+    event.preventDefault();
+    if (heldGeneric.size === 0) {
+      error.textContent = 'A shortcut needs at least one modifier, like Ctrl+Alt+P — or hold a single key on its own.';
+      return;
+    }
+    const order = CHORD_MODIFIER_ORDER.filter((m) => heldGeneric.has(m));
+    const spec = [...order, key].join('+');
+    if (RESERVED_CHORDS[spec]) {
+      error.textContent = `${chordLabel(spec)} is ${RESERVED_CHORDS[spec]}.`;
+      return;
+    }
+    error.textContent = '';
+    captured = spec;
+    locked = true;
+    physicalCount += 1;
+    save.disabled = false;
+    render();
   };
 
-  document.addEventListener('keydown', onDown, true);
-  document.addEventListener('keyup', onUp, true);
+  const onKeyUp = (event) => {
+    const mod = CHORD_MODIFIER_CODES[event.code];
+    if (!mod) return;
+    if (heldGeneric.delete(mod)) physicalCount = Math.max(0, physicalCount - 1);
+    render();
+  };
+
+  const onMouseDown = (event) => {
+    const name = MOUSE_BUTTON_NAMES[event.button];
+    if (!name || locked) return;
+    event.preventDefault(); // stops the browser's own back/forward/autoscroll behaviour
+    const order = CHORD_MODIFIER_ORDER.filter((m) => heldGeneric.has(m));
+    captured = order.length ? [...order, `mouse:${name}`].join('+') : `mouse:${name}`;
+    locked = true;
+    physicalCount += 1;
+    error.textContent = '';
+    save.disabled = false;
+    render();
+  };
+
+  const onMouseUp = (event) => {
+    const name = MOUSE_BUTTON_NAMES[event.button];
+    if (!name) return;
+    physicalCount = Math.max(0, physicalCount - 1);
+    render();
+  };
+
+  document.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('keyup', onKeyUp, true);
+  document.addEventListener('mousedown', onMouseDown, true);
+  document.addEventListener('mouseup', onMouseUp, true);
 
   const cleanup = () => {
-    document.removeEventListener('keydown', onDown, true);
-    document.removeEventListener('keyup', onUp, true);
+    document.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('keyup', onKeyUp, true);
+    document.removeEventListener('mousedown', onMouseDown, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
     clearTimeout(timeout);
   };
   // Torn down whichever way the dialog closes, so the capture handlers cannot
-  // outlive it and swallow keystrokes on the page behind.
+  // outlive it and swallow keystrokes/clicks on the page behind.
   const scrim = document.getElementById('modal-scrim');
   const observer = new MutationObserver(() => {
     if (!scrim.classList.contains('open')) { cleanup(); observer.disconnect(); }
   });
   observer.observe(scrim, { attributes: true, attributeFilter: ['class'] });
 
-  save.onclick = async () => {
+  save.onclick = () => {
     if (!captured) return;
     cleanup();
     observer.disconnect();
     closeModal();
-    try {
-      await post('/api/shortcuts/save', { target, [field]: captured });
-      toast('Saved');
-      await refresh();
-    } catch (err) {
-      toast(err.message);
-    }
+    onCaptured(captured);
   };
 }
 
 /** Onboarding still only ever rebinds the dictation hold key. */
 function hotkeyDialog() {
-  activationBindingDialog({
-    target: 'dictation',
-    field: 'key',
-    kind: 'hold',
+  const current = primaryBinding('dictation');
+  captureBindingDialog({
     title: 'Press the key you want to hold',
     hint: 'Hold-to-talk needs a key you never type with — a Ctrl, Shift, Alt or Win key. '
       + 'Right-hand keys work best, since your left hand keeps using shortcuts.',
+    onCaptured: async (spec) => {
+      try {
+        state.settings = current
+          ? await post('/api/shortcuts/save', { target: 'dictation', op: 'replace', old_binding: current.value, binding: spec })
+          : await post('/api/shortcuts/save', { target: 'dictation', op: 'add', binding: spec });
+        toast('Saved');
+        await refresh();
+      } catch (err) {
+        toast(err.message);
+      }
+    },
   });
 }
 
@@ -2219,15 +2569,16 @@ async function drawOnboarding() {
   }
 
   if (step === 3) {
-    const engine = (state.settings && state.settings.engine) || {};
+    const binding = primaryBinding('dictation');
+    const value = binding ? binding.value : 'ctrl_r';
     body.innerHTML = onboardScreen({
       title: 'Choose your key',
       sub: 'Hold it while you speak. It should be a key you never type with.',
       card: `
         <div style="font-weight:600;margin-bottom:18px">Does it light up when you hold it?</div>
         <div class="well" style="text-align:center;padding:26px">
-          <div id="ob-caps" style="min-height:76px;display:flex;align-items:center;justify-content:center">
-            <span class="cap big hot">${esc(prettyKey(engine.hotkey || 'ctrl_r'))}</span>
+          <div id="ob-caps" style="min-height:76px;display:flex;gap:8px;align-items:center;justify-content:center">
+            ${specChips(value, 'hot')}
           </div>
         </div>
         <div class="small muted" style="margin-top:14px">
@@ -2237,20 +2588,20 @@ async function drawOnboarding() {
         <div class="spacer"></div>
         <button class="btn primary" data-act="ob-next">It works</button>`,
     });
-    watchHotkeyPreview(engine.hotkey || 'ctrl_r');
+    watchHotkeyPreview(value);
     return;
   }
 
   // Step 4 — the live try-it-now box. The reference frames this inside a fake
   // Slack (§1 5.png); we use a neutral card, because rendering another
   // company's product chrome inside our app would be impersonation.
-  const engine = (state.settings && state.settings.engine) || {};
+  const binding = primaryBinding('dictation');
   body.innerHTML = onboardScreen({
     title: 'Try it right here',
     sub: 'Click the box, then hold your key and say a sentence. This is the real thing — the same pipeline you will use everywhere else.',
     card: `
       <div class="small muted" style="margin-bottom:10px">
-        Hold ${caps(engine.hotkey)} · say something · let go
+        Hold ${binding ? capsFromLabel(binding.label) : 'your key'} · say something · let go
       </div>
       <textarea class="input" id="ob-try" style="min-height:120px;font-size:16px"
         placeholder="Your words will appear here…"></textarea>
@@ -2349,7 +2700,7 @@ function watchLevel() {
   }, 220);
 }
 
-function watchHotkeyPreview(hotkey) {
+function watchHotkeyPreview(bindingValue) {
   stopWatchers();
   levelTimer = setInterval(async () => {
     const target = document.getElementById('ob-caps');
@@ -2357,7 +2708,7 @@ function watchHotkeyPreview(hotkey) {
     try {
       const status = await api('/api/status');
       const held = status.hotkey_down === true;
-      target.innerHTML = `<span class="cap big ${held ? 'held' : 'hot'}">${esc(prettyKey(hotkey))}</span>`;
+      target.innerHTML = specChips(bindingValue, held ? 'held' : 'hot');
     } catch { /* transient */ }
   }, 140);
 }

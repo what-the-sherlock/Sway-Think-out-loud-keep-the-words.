@@ -39,7 +39,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: hand-edited file making the app unusable, not to second-guess real input.
 MAX_TRANSFORMS = 100
 MAX_DESCRIPTION_CHARS = 200
-MAX_INSTRUCTION_CHARS = 600
+#: Raised twice: from the original 600 to 2000 to fit Prompt Engineer's
+#: structured, multi-section instruction, and from 2000 to 8000 when a
+#: user's own hand-written instruction (a detailed, rule-by-rule email
+#: rewriter, ~5000 characters) turned out to legitimately need more room
+#: than that. This path is always a single call over a selection -- there is
+#: no per-utterance cost to a longer instruction the way there would be for
+#: something evaluated on every dictation, and 8000 characters is still a
+#: trivial fraction of any model's context window for a one-shot rewrite.
+MAX_INSTRUCTION_CHARS = 8000
+MAX_EXAMPLE_CHARS = 4000
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,14 +66,26 @@ class Transform:
     #: Optional spoken trigger, matched mid-dictation. Empty means the
     #: transform is shortcut-only.
     phrase: str = ""
-    #: Optional chord, e.g. "ctrl+alt+p". Empty means no shortcut.
-    shortcut: str = ""
+    #: Every keyboard/mouse binding that runs this transform over the current
+    #: selection, as canonical :func:`sway.hotkey.parse_binding` strings.
+    #: Empty means it has no shortcut and can only fire by ``phrase``.
+    shortcuts: tuple[str, ...] = ()
     #: A short label rendered next to the name. Cosmetic.
     icon: str = ""
-    enabled: bool = False
+    #: Kept for schema continuity with settings files written before a
+    #: transform's runnability was determined by whether it has a binding or
+    #: a phrase rather than by a toggle (see :func:`is_runnable`). New and
+    #: migrated transforms are always ``True``; nothing in this build ever
+    #: sets it back to ``False``.
+    enabled: bool = True
     #: True for the transforms Sway ships. A built-in can be edited and
-    #: disabled like any other; the flag only drives "reset to defaults".
+    #: deleted like any other; the flag only drives "reset to defaults".
     builtin: bool = False
+    #: A short "before" sample shown in the editor, illustrating what this
+    #: transform does. Empty for a user-created transform until they try it.
+    example_input: str = ""
+    #: The corresponding "after" sample. Empty unless example_input is too.
+    example_output: str = ""
 
     # -- output expectations -------------------------------------------------
     # What this transform is *allowed* to do to the text, so the cleanup
@@ -78,8 +99,11 @@ class Transform:
     # are checkboxes a user can answer honestly about their own instruction
     # ("does this produce a list?"); a float would be a number nobody can pick
     # correctly. All default False, so a transform that says nothing keeps the
-    # full-strength guardrails, and the entity guard is never relaxed by any of
-    # them -- losing a name or a number is wrong under every instruction.
+    # full-strength guardrails. `may_shorten` is the one flag that also relaxes
+    # the entity guard (see OutputExpectation.protects_entities): a genuine
+    # summary of a long document is expected to drop most of its numbers and
+    # dates, and a transform the user explicitly wrote and ticked "makes the
+    # text shorter" for has already said that is the point.
 
     #: The instruction asks for a list, heading, or other markdown structure.
     allows_markdown: bool = False
@@ -89,82 +113,57 @@ class Transform:
     may_lengthen: bool = False
 
 
-#: Shipped transforms. **All disabled by default**, per D8.5: a transform costs
-#: a model call and free-tier quota, so nothing here starts spending either
-#: until the user turns it on.
+#: Shipped transforms. Unlike the checkbox-era set these ship ready to run --
+#: each has a shortcut, so presence in this list is what makes a transform
+#: available, not a separate on/off switch (see :func:`is_runnable`).
 #:
-#: Each instruction is one line and states the constraint as well as the goal.
-#: "Make it concise" alone invites an 8B-class model to summarize away half the
+#: Each instruction states the constraint as well as the goal. "Make it
+#: concise" alone invites an 8B-class model to summarize away half the
 #: content; "without dropping any fact" is what stops it.
 DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
     Transform(
-        id="polish",
-        name="Polish",
-        description="Tighten the wording without changing the voice.",
+        id="prompt_engineer",
+        name="Prompt Engineer",
+        description="Turns a rough spoken idea into a structured AI prompt.",
         instruction=(
-            "Tidy the phrasing: remove padding and repetition, and smooth awkward "
-            "sentences. Keep the author's voice, register, and every fact; do not "
-            "shorten by removing content."
-        ),
-        phrase="polish that",
-        builtin=True,
-    ),
-    Transform(
-        id="concise",
-        name="Make concise",
-        description="Say the same thing in fewer words.",
-        instruction=(
-            "Say the same thing in noticeably fewer words. Every fact, name, number, "
-            "and request in the original must survive; cut words, not content."
-        ),
-        may_shorten=True,
-        phrase="make that concise",
-        builtin=True,
-    ),
-    Transform(
-        id="grammar",
-        name="Fix grammar",
-        description="Correct mistakes and nothing else.",
-        instruction=(
-            "Correct grammar, spelling, and punctuation only. Do not reword, "
-            "reorder, or restyle anything that was already correct."
-        ),
-        phrase="fix the grammar",
-        builtin=True,
-    ),
-    Transform(
-        id="professional",
-        name="Rewrite professionally",
-        description="For email and anything a client reads.",
-        instruction=(
-            "Rewrite in a professional register: full sentences, no slang, no "
-            "contractions. Keep the meaning and every specific detail exactly."
-        ),
-        phrase="make that professional",
-        builtin=True,
-    ),
-    Transform(
-        id="casual",
-        name="Make casual",
-        description="Loosen it up for chat.",
-        instruction=(
-            "Rewrite in a relaxed, conversational register, as if writing to a "
-            "colleague you know well. Keep the meaning and every specific detail."
-        ),
-        phrase="make that casual",
-        builtin=True,
-    ),
-    Transform(
-        id="bullets",
-        name="Turn into bullet points",
-        description="One point per line.",
-        instruction=(
-            "Rewrite as a bulleted list, one idea per bullet, each starting with "
-            "'- '. Keep every point from the original and add none."
+            "Rewrite the speaker's rough, spoken idea into a well-structured prompt "
+            "for an AI model. Produce, in this exact order, using markdown "
+            "'**heading**' lines: **Title** (one concise line naming the task); "
+            "**Role & stance** (who the model should act as and how it should "
+            "behave); **Task** (exactly what the model must do, one or two "
+            "sentences); **Context** (only the background the model actually needs, "
+            "drawn from what was said); **Inputs available** (what the model has to "
+            "work with, as a short list); **Execution checklist** (2-5 short "
+            "checklist items, each on its own line starting with '- [ ] ', capturing "
+            "the constraints and must-dos implied by the request). Infer reasonable "
+            "specifics from what was said rather than leaving placeholders, but never "
+            "invent a fact, name, or number that was not implied."
         ),
         allows_markdown=True,
-        may_shorten=True,
-        phrase="make that bullet points",
+        may_lengthen=True,
+        phrase="make that a prompt",
+        shortcuts=("ctrl+alt+1",),
+        example_input="design a better UI",
+        example_output=(
+            "**Title**\n"
+            "Design a Better UI\n\n"
+            "**Role & stance**\n"
+            "You are a UI/UX designer and creative problem-solver.\n\n"
+            "**Task**\n"
+            "Create an improved user interface design for the specified application, "
+            "emphasizing usability, aesthetics, and accessibility.\n\n"
+            "**Context**\n"
+            "[Provide a brief description of the current UI, target audience, "
+            "platform, and any specific goals or constraints.]\n\n"
+            "**Inputs available**\n"
+            "- Current UI screenshots or description\n"
+            "- Target audience and platform\n"
+            "- Design goals or constraints\n\n"
+            "**Execution checklist**\n"
+            "- [ ] Improve visual hierarchy and usability\n"
+            "- [ ] Maintain accessibility standards\n"
+            "- [ ] Keep the redesign consistent with the existing brand"
+        ),
         builtin=True,
     ),
     Transform(
@@ -177,6 +176,13 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
         ),
         may_lengthen=True,
         phrase="make that an email",
+        shortcuts=("ctrl+alt+2",),
+        example_input="let the team know the deploy went fine and we're monitoring for the next hour",
+        example_output=(
+            "Hi team,\n\n"
+            "The deploy went fine and we're monitoring it for the next hour.\n\n"
+            "Best,"
+        ),
         builtin=True,
     ),
     Transform(
@@ -189,6 +195,74 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
         ),
         may_shorten=True,
         phrase="summarize that",
+        shortcuts=("ctrl+alt+3",),
+        example_input=(
+            "We discussed the Q3 roadmap for about an hour. Sarah's going to own the "
+            "billing migration, Tom will handle the API versioning work, and we agreed "
+            "to push the mobile redesign to Q4 since design isn't ready yet."
+        ),
+        example_output=(
+            "On the Q3 roadmap, Sarah owns the billing migration, Tom owns API "
+            "versioning, and the mobile redesign is pushed to Q4 pending design."
+        ),
+        builtin=True,
+    ),
+    Transform(
+        id="professional",
+        name="Rewrite professionally",
+        description="For email and anything a client reads.",
+        instruction=(
+            "Rewrite in a professional register: full sentences, no slang, no "
+            "contractions. Keep the meaning and every specific detail exactly."
+        ),
+        phrase="make that professional",
+        shortcuts=("ctrl+alt+4",),
+        example_input="hey so i think the deadline is kind of tight can we maybe push it a few days",
+        example_output=(
+            "I believe the current deadline is tight. Would it be possible to "
+            "extend it by a few days?"
+        ),
+        builtin=True,
+    ),
+    Transform(
+        id="polish",
+        name="Polish",
+        description="Tighten the wording without changing the voice.",
+        instruction=(
+            "Tidy the phrasing: remove padding and repetition, and smooth awkward "
+            "sentences. Keep the author's voice, register, and every fact; do not "
+            "shorten by removing content."
+        ),
+        phrase="polish that",
+        shortcuts=("ctrl+alt+5",),
+        example_input=(
+            "So basically what I'm trying to say is that, um, we should probably go "
+            "ahead and just, you know, finalize the release notes before we ship on "
+            "Friday."
+        ),
+        example_output="We should finalize the release notes before we ship on Friday.",
+        builtin=True,
+    ),
+    Transform(
+        id="concise",
+        name="Make concise",
+        description="Say the same thing in fewer words.",
+        instruction=(
+            "Say the same thing in noticeably fewer words. Every fact, name, number, "
+            "and request in the original must survive; cut words, not content."
+        ),
+        may_shorten=True,
+        phrase="make that concise",
+        shortcuts=("ctrl+alt+6",),
+        example_input=(
+            "I think we need to go back and look at the whole onboarding flow again "
+            "because a lot of new users are dropping off somewhere around step three "
+            "and we're not totally sure why yet."
+        ),
+        example_output=(
+            "We need to revisit the onboarding flow -- many new users drop off around "
+            "step three, and we don't yet know why."
+        ),
         builtin=True,
     ),
     Transform(
@@ -201,11 +275,46 @@ DEFAULT_TRANSFORMS: tuple[Transform, ...] = (
             "Change no facts and drop no content."
         ),
         phrase="make that clearer",
+        shortcuts=("ctrl+alt+7",),
+        example_input=(
+            "So the thing is, when the user does that thing where they click the "
+            "button twice really fast, it kind of breaks because of how we handle it "
+            "on the backend, which we should probably fix."
+        ),
+        example_output=(
+            "Double-clicking the button breaks the flow because of how the backend "
+            "handles the request. We should fix this."
+        ),
         builtin=True,
     ),
 )
 
 DEFAULT_IDS = frozenset(t.id for t in DEFAULT_TRANSFORMS)
+
+#: Expectation flags for transforms that used to ship as defaults but no
+#: longer do (Fix grammar, Make casual, Turn into bullet points -- retired
+#: when the shipped set shrank to the seven above). Migration never deletes
+#: an existing user's copy of one of these; only "reset to defaults" stops
+#: restoring it. :func:`shipped_expectation` is what keeps
+#: settings._expectation_flag correct for such a transform even though it is
+#: no longer in :data:`DEFAULT_TRANSFORMS` -- without this, an old
+#: settings.json's "bullets" entry would silently lose ``allows_markdown``
+#: and reintroduce the exact bug that flag exists to prevent. Add to this
+#: only when retiring a default that had a non-default expectation flag;
+#: never use it to give a *new* transform its flags.
+_RETIRED_DEFAULT_EXPECTATIONS: dict[str, dict[str, bool]] = {
+    "bullets": {"allows_markdown": True, "may_shorten": True},
+}
+
+
+def shipped_expectation(transform_id: str, field: str) -> bool:
+    """The expectation flag a *shipped* transform of this id declares, past
+    or present: the current defaults first, then transforms retired from
+    them. ``False`` for any id that was never shipped."""
+    current = by_id(DEFAULT_TRANSFORMS, transform_id)
+    if current is not None:
+        return bool(getattr(current, field))
+    return bool(_RETIRED_DEFAULT_EXPECTATIONS.get(transform_id, {}).get(field, False))
 
 
 def by_id(transforms: Iterable[Transform], transform_id: str) -> Transform | None:
@@ -215,14 +324,25 @@ def by_id(transforms: Iterable[Transform], transform_id: str) -> Transform | Non
     return None
 
 
+def is_runnable(transform: Transform) -> bool:
+    """Whether this transform can fire at all.
+
+    Presence of a binding or a phrase *is* the on switch now -- there is no
+    separate toggle to check (see :attr:`Transform.enabled`'s docstring). A
+    transform with neither shows in the UI as "no shortcut or phrase yet" and
+    simply never matches or dispatches.
+    """
+    return bool(transform.shortcuts) or bool(transform.phrase.strip())
+
+
 def enabled_with_phrase(transforms: Iterable[Transform]) -> list[Transform]:
-    """Transforms that can fire from speech: enabled, and with a phrase."""
-    return [t for t in transforms if t.enabled and t.phrase.strip()]
+    """Transforms that can fire from speech: runnable, and with a phrase."""
+    return [t for t in transforms if t.phrase.strip()]
 
 
 def enabled_with_shortcut(transforms: Iterable[Transform]) -> list[Transform]:
-    """Transforms that can fire from the keyboard: enabled, and bound."""
-    return [t for t in transforms if t.enabled and t.shortcut.strip()]
+    """Transforms that can fire from the keyboard: runnable, and bound."""
+    return [t for t in transforms if t.shortcuts]
 
 
 #: The trigger type a transform is matched as. Not in
@@ -314,23 +434,23 @@ def build_directive_block(fired: Sequence[Transform]) -> str:
     )
 
 
-def normalise_shortcut(shortcut: str) -> str:
-    """The canonical form a chord is stored and compared in."""
-    return "+".join(part.strip().lower() for part in shortcut.split("+") if part.strip())
-
-
 def find_shortcut_conflicts(transforms: Sequence[Transform]) -> dict[str, list[str]]:
-    """Map transform id -> ids of transforms bound to the same chord.
+    """Map transform id -> ids of other transforms sharing any one binding.
 
     Reported symmetrically, as :func:`sway.triggers.find_conflicts` is, so the
-    UI can flag both rows rather than arbitrarily blaming one.
+    UI can flag both rows rather than arbitrarily blaming one. A transform
+    with several bindings conflicts with another the moment *any one* of them
+    is shared -- the shared binding would only ever reach whichever transform
+    the underlying listener happens to dispatch it to.
     """
     conflicts: dict[str, list[str]] = {}
-    chords = {t.id: normalise_shortcut(t.shortcut) for t in transforms if t.shortcut.strip()}
-    for outer, chord in chords.items():
-        for inner, other in chords.items():
-            if inner != outer and chord == other:
-                conflicts.setdefault(outer, []).append(inner)
+    for outer in transforms:
+        outer_set = set(outer.shortcuts)
+        if not outer_set:
+            continue
+        for inner in transforms:
+            if inner.id != outer.id and outer_set & set(inner.shortcuts):
+                conflicts.setdefault(outer.id, []).append(inner.id)
     return conflicts
 
 
@@ -338,6 +458,7 @@ __all__ = [
     "DEFAULT_IDS",
     "DEFAULT_TRANSFORMS",
     "MAX_DESCRIPTION_CHARS",
+    "MAX_EXAMPLE_CHARS",
     "MAX_INSTRUCTION_CHARS",
     "MATCH_TYPE",
     "MAX_TRANSFORMS",
@@ -349,5 +470,6 @@ __all__ = [
     "enabled_with_shortcut",
     "expectation_for",
     "find_shortcut_conflicts",
-    "normalise_shortcut",
+    "is_runnable",
+    "shipped_expectation",
 ]

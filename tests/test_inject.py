@@ -28,7 +28,7 @@ class FakePlatform:
         self.set_calls: list[str] = []
         self.paste_calls = 0
 
-    def paste_likely_blocked(self) -> bool:
+    def synthetic_input_likely_blocked(self) -> bool:
         return self._paste_blocked
 
     def user_data_dir(self, app_name: str):

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 
 from sway.errors import SwayError, PasteBlockedError
 from sway.platform import PlatformAdapter
@@ -21,11 +23,23 @@ DEFAULT_RESTORE_DELAY_MS = 150
 
 
 class TextInjector:
-    def __init__(self, platform: PlatformAdapter, *, restore_delay_ms: int = DEFAULT_RESTORE_DELAY_MS) -> None:
+    def __init__(
+        self,
+        platform: PlatformAdapter,
+        *,
+        restore_delay_ms: int = DEFAULT_RESTORE_DELAY_MS,
+        suspend_input: Callable[[], AbstractContextManager[None]] = nullcontext,
+    ) -> None:
         if restore_delay_ms < 0:
             raise ValueError("restore_delay_ms must be >= 0")
         self._platform = platform
         self._delay_s = restore_delay_ms / 1000.0
+        #: Wraps the synthetic Ctrl+V below so Sway's own global binding
+        #: listener (see sway.hotkey.BindingListener.suspended) doesn't
+        #: mistake it for a real keystroke. Defaults to a no-op so this
+        #: module stays decoupled from hotkey.py -- it only knows about
+        #: PlatformAdapter, same as before.
+        self._suspend_input = suspend_input
 
     def inject(self, text: str) -> None:
         """Paste ``text`` at the cursor. Schedules the clipboard restore and returns.
@@ -33,13 +47,13 @@ class TextInjector:
         Raises :class:`~flow.errors.PasteBlockedError` -- without touching
         the clipboard at all -- when the platform is confident the paste
         would silently do nothing (see
-        :meth:`~flow.platform.PlatformAdapter.paste_likely_blocked`), so
-        callers can fall back to something the user can act on instead of
+        :meth:`~flow.platform.PlatformAdapter.synthetic_input_likely_blocked`),
+        so callers can fall back to something the user can act on instead of
         clobbering their clipboard for nothing.
         """
         if not text:
             return
-        if self._platform.paste_likely_blocked():
+        if self._platform.synthetic_input_likely_blocked():
             raise PasteBlockedError(
                 "the focused window appears to run at a higher privilege level; "
                 "a synthetic paste would silently be dropped"
@@ -51,7 +65,8 @@ class TextInjector:
             previous = None
 
         self._platform.clipboard_set(text)
-        self._platform.send_paste()
+        with self._suspend_input():
+            self._platform.send_paste()
 
         # A background timer, not time.sleep: this method must not block the
         # caller (the dictation worker thread) for the restore delay.

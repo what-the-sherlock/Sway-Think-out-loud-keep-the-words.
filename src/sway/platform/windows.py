@@ -34,6 +34,21 @@ _TOKEN_ELEVATION = 20  # TOKEN_INFORMATION_CLASS.TokenElevation
 #: onto, so honouring it means the overlay agrees with every web surface on
 #: the same machine.
 _SPI_GETCLIENTAREAANIMATION = 0x1042
+#: Virtual-key codes for the sided modifier keys, keyed by the same names
+#: BindingListener uses (see sway.hotkey.KNOWN_KEYS) -- used only by
+#: modifier_keys_down() to resync the hook's idea of what is held against
+#: the OS's. "cmd" has no left/right split in this app's binding vocabulary,
+#: so both Win keys are probed together under that one name.
+_MODIFIER_VK_CODES: dict[str, int] = {
+    "ctrl_l": 0xA2,  # VK_LCONTROL
+    "ctrl_r": 0xA3,  # VK_RCONTROL
+    "alt_l": 0xA4,  # VK_LMENU
+    "alt_r": 0xA5,  # VK_RMENU
+    "shift_l": 0xA0,  # VK_LSHIFT
+    "shift_r": 0xA1,  # VK_RSHIFT
+}
+_VK_LWIN = 0x5B
+_VK_RWIN = 0x5C
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -57,6 +72,8 @@ _user32.GetForegroundWindow.argtypes = []
 _user32.GetForegroundWindow.restype = wintypes.HWND
 _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_user32.GetAsyncKeyState.restype = wintypes.SHORT
 _kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
 _kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
 _kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
@@ -118,6 +135,17 @@ _instance_mutex: int | None = None
 #: Shared synthetic-input controller. pynput's Controller is cheap to reuse
 #: and reusing it avoids re-touching the input subsystem on every paste.
 _kb_controller = Controller()
+
+#: Between the events of the synthetic copy chord only (not send_paste).
+#: Zero-delay synthetic chords are dropped by targets that route input
+#: asynchronously across processes (Chromium/Electron, some Java toolkits):
+#: "c" can land in the same tick as Ctrl and be dispatched before the
+#: modifier state has been updated. Free in practice -- SelectionReader
+#: polls the clipboard for up to 300ms afterwards, which absorbs it
+#: entirely. Deliberately not applied to send_paste: that path is proven
+#: across the whole production dictation flow, and its failure mode (a
+#: paste silently not landing) is far more disruptive than this one's.
+_COPY_EVENT_DELAY_S = 0.015
 
 
 def _enable_dpi_awareness() -> None:
@@ -266,7 +294,9 @@ class WindowsPlatform:
     def send_copy(self) -> None:
         _kb_controller.press(Key.ctrl)
         try:
+            time.sleep(_COPY_EVENT_DELAY_S)
             _kb_controller.press("c")
+            time.sleep(_COPY_EVENT_DELAY_S)
             _kb_controller.release("c")
         finally:
             _kb_controller.release(Key.ctrl)
@@ -321,13 +351,14 @@ class WindowsPlatform:
             logger.debug("could not read the animation preference", exc_info=True)
             return True
 
-    def paste_likely_blocked(self) -> bool:
+    def synthetic_input_likely_blocked(self) -> bool:
         """True only when the foreground window's process is confidently
         elevated and this process is confidently not -- the one combination
-        where Windows' UIPI is guaranteed to drop the synthetic Ctrl+V
-        :meth:`send_paste` sends, with no error raised anywhere. Every
-        other outcome (same elevation, or either side undeterminable) fails
-        open, per the PlatformAdapter contract.
+        where Windows' UIPI is guaranteed to drop synthetic input Sway
+        sends it (:meth:`send_paste`'s Ctrl+V, :meth:`send_copy`'s Ctrl+C),
+        with no error raised anywhere. Every other outcome (same elevation,
+        or either side undeterminable) fails open, per the PlatformAdapter
+        contract.
         """
         try:
             hwnd = _user32.GetForegroundWindow()
@@ -351,6 +382,25 @@ class WindowsPlatform:
         except OSError:
             logger.debug("could not determine foreground window elevation", exc_info=True)
             return False
+
+    def modifier_keys_down(self) -> frozenset[str] | None:
+        """GetAsyncKeyState against the high bit only -- "is it down right
+        now", never the low "was pressed since the last call" bit, since
+        this can be polled repeatedly by a caller that never consumes it.
+
+        Read-only and best-effort: any failure returns ``None`` rather than
+        raising, per the PlatformAdapter contract.
+        """
+        try:
+            down = {
+                name for name, vk in _MODIFIER_VK_CODES.items() if _user32.GetAsyncKeyState(vk) & 0x8000
+            }
+            if _user32.GetAsyncKeyState(_VK_LWIN) & 0x8000 or _user32.GetAsyncKeyState(_VK_RWIN) & 0x8000:
+                down.add("cmd")
+            return frozenset(down)
+        except OSError:
+            logger.debug("could not read modifier key state", exc_info=True)
+            return None
 
     # -- windowed-build support (see flow.gui) -----------------------------
 

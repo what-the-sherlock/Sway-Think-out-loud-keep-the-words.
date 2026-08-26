@@ -32,8 +32,11 @@ dependencies = [
     "soundfile>=0.12",
     # pynput: global hotkey listener and synthetic Ctrl+V. CLAUDE.md
     # explicitly forbids the `keyboard` package (needs admin on Windows);
-    # pynput does not.
-    "pynput>=1.7",
+    # pynput does not. >=1.8 for the `injected` flag on press/release/click
+    # callbacks (backed by the OS's own LLKHF_INJECTED bit on Windows) --
+    # BindingListener.suspended() uses it to tell its own synthetic
+    # Ctrl+C/Ctrl+V apart from a real keystroke without a blind window.
+    "pynput>=1.8",
     # httpx: the persistent HTTP/2 client CLAUDE.md specifies by name. The
     # [http2] extra pulls in h2, required for http2=True.
     "httpx[http2]>=0.27",

@@ -105,7 +105,7 @@ class PosixPlatform:
         del name
         return True
 
-    def paste_likely_blocked(self) -> bool:
+    def synthetic_input_likely_blocked(self) -> bool:
         """Not implemented: no privilege-elevation check exists for this
         platform yet. Always fails open, same as :meth:`focused_process_name`.
         """
@@ -176,6 +176,12 @@ class PosixPlatform:
         everywhere else until a real per-desktop reader exists here.
         """
         return True
+
+    def modifier_keys_down(self) -> frozenset[str] | None:
+        """Not implemented: no OS-level key-state query exists for this
+        platform yet. ``None``, meaning "no healing available" -- Windows is
+        the target OS (see CLAUDE.md); see PlatformAdapter's contract."""
+        return None
 
     def _run(self, argv: list[str], *, input_text: str | None = None) -> str:
         exe = argv[0]

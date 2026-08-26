@@ -165,6 +165,7 @@ class DashboardServer:
         port: int = 0,
         dictionary_db: Path | None = None,
         settings: SettingsStore | None = None,
+        log_file: Path | None = None,
     ) -> None:
         self._history_db = history_db
         self._latency_db = latency_db
@@ -173,6 +174,10 @@ class DashboardServer:
         self._host = host
         self._port = port
         self._dictionary_db = dictionary_db
+        #: Read fresh on every /api/diagnostics request (see
+        #: actions.recent_diagnostics) rather than cached, so this is never
+        #: the thing that's stale when the user is looking at it.
+        self._log_file = log_file
         #: Optional so ``flow dashboard`` standalone still reports history
         #: without being able to change anything. Every write route checks
         #: for it and returns a clear "not available" rather than crashing.
@@ -295,6 +300,8 @@ class DashboardServer:
                 return self._dictionary()
             if path == "/api/devices":
                 return {"devices": _input_devices()}
+            if path == "/api/diagnostics":
+                return actions.recent_diagnostics(self._log_file, limit=min(_int(params, "limit", 50), 200))
             if path == "/api/dictionary/export":
                 # A GET, because it produces a file and changes nothing. The
                 # UI turns it into a download client-side; the server never

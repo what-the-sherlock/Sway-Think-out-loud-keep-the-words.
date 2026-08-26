@@ -96,14 +96,15 @@ class PlatformAdapter(Protocol):
         """Whether a login-time launch is currently registered. ``False`` when
         unsupported or unreadable."""
 
-    def paste_likely_blocked(self) -> bool:
-        """True only when the caller can be confident a synthetic paste
-        (:meth:`send_paste`) would silently do nothing -- e.g. the foreground
-        window belongs to a process running at a higher privilege level than
-        this one, which Windows' UIPI blocks synthetic input into. Fails
-        open (``False``) whenever that can't be determined: a false positive
-        here means dictation silently stops working, which is worse than an
-        occasional paste that fails anyway."""
+    def synthetic_input_likely_blocked(self) -> bool:
+        """True only when the caller can be confident a synthetic keystroke
+        (:meth:`send_paste` or :meth:`send_copy`) would silently do nothing
+        -- e.g. the foreground window belongs to a process running at a
+        higher privilege level than this one, which Windows' UIPI blocks
+        *any* synthetic input into, not just paste. Fails open (``False``)
+        whenever that can't be determined: a false positive here means
+        dictation or a transform silently stops working, which is worse
+        than an occasional paste or selection-read that fails anyway."""
 
     def animations_enabled(self) -> bool:
         """Whether the OS wants interface animation at all.
@@ -113,6 +114,20 @@ class PlatformAdapter(Protocol):
         Fails *open* (``True``) whenever the setting cannot be read -- an
         unreadable preference must not silently freeze the one part of the
         bar that tells the user it is still working."""
+
+    def modifier_keys_down(self) -> frozenset[str] | None:
+        """The sided modifier key names (``"ctrl_l"``, ``"ctrl_r"``,
+        ``"alt_l"``, ``"alt_r"``, ``"shift_l"``, ``"shift_r"``, ``"cmd"``)
+        the OS currently reports as physically held, queried independently
+        of :class:`sway.hotkey.BindingListener`'s own hook state.
+
+        Best-effort and read-only: ``None`` means "cannot be determined on
+        this platform", never an error. Used only to heal
+        :class:`~sway.hotkey.BindingListener`'s hook state after it drifts
+        from reality (a swallowed release, a missed event) -- see
+        ``BindingListener._maybe_resync_locked``. Not a substitute for the
+        hook itself: polling this on every keystroke would be wasteful, so
+        callers rate-limit it."""
 
 
 @lru_cache(maxsize=1)

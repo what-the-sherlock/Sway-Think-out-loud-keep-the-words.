@@ -24,11 +24,11 @@ def store(tmp_path):
 
 
 def test_update_applies_only_the_keys_present(store):
-    store.update(hotkey="ctrl_l", launch_at_login=True)
+    store.update(dictation_bindings=("ctrl_l",), launch_at_login=True)
     actions.update_settings(store, {"launch_at_login": False})
     # An absent key means "leave it alone", so two controls saved
     # concurrently cannot clobber each other.
-    assert store.get().hotkey == "ctrl_l"
+    assert store.get().dictation_bindings == ("ctrl_l",)
     assert store.get().launch_at_login is False
 
 
@@ -68,37 +68,100 @@ def test_only_allowlisted_fields_are_writable(store):
 # -- activation bindings -----------------------------------------------------
 
 
-def test_save_activation_binding_sets_a_hold_key(store):
-    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_l"})
-    assert store.get().hotkey == "ctrl_l"
+def test_save_activation_binding_adds_a_hold_key(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    assert store.get().dictation_bindings == ("ctrl_l",)
 
 
-def test_save_activation_binding_sets_a_chord(store):
-    actions.save_activation_binding(store, {"target": "hands_free", "chord": "Alt+Ctrl+Space"})
-    assert store.get().hands_free_chord == "ctrl+alt+space"
+def test_save_activation_binding_op_defaults_to_add(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    assert store.get().dictation_bindings == ("ctrl_l",)
+
+
+def test_save_activation_binding_adds_a_chord(store):
+    actions.save_activation_binding(
+        store, {"target": "hands_free", "op": "add", "binding": "Alt+Ctrl+Space"}
+    )
+    assert store.get().hands_free_bindings == ("ctrl+alt+space",)
+
+
+def test_save_activation_binding_adds_a_second_binding_alongside_the_first(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl+alt+space"})
+    assert store.get().dictation_bindings == ("ctrl_l", "ctrl+alt+space")
+
+
+def test_save_activation_binding_add_materializes_config_defaults_first(store):
+    """Adding a second binding to a never-customized target must not silently
+    discard config's default -- it should end up alongside it."""
+    settings = actions.save_activation_binding(
+        store,
+        {"target": "dictation", "binding": "ctrl+alt+space"},
+        effective={"hotkey": "ctrl_r"},
+    )
+    assert settings.dictation_bindings == ("ctrl_r", "ctrl+alt+space")
+
+
+def test_save_activation_binding_remove(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl+alt+space"})
+    actions.save_activation_binding(
+        store, {"target": "dictation", "op": "remove", "binding": "ctrl_l"}
+    )
+    assert store.get().dictation_bindings == ("ctrl+alt+space",)
+
+
+def test_save_activation_binding_remove_rejects_a_binding_not_present(store):
+    with pytest.raises(ActionError, match="not set"):
+        actions.save_activation_binding(
+            store, {"target": "dictation", "op": "remove", "binding": "ctrl_l"}
+        )
+
+
+def test_save_activation_binding_replace(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    actions.save_activation_binding(
+        store,
+        {"target": "dictation", "op": "replace", "old_binding": "ctrl_l", "binding": "ctrl_r"},
+    )
+    assert store.get().dictation_bindings == ("ctrl_r",)
+
+
+def test_save_activation_binding_replace_of_a_missing_old_binding_just_adds(store):
+    actions.save_activation_binding(
+        store,
+        {"target": "dictation", "op": "replace", "old_binding": "ctrl_l", "binding": "ctrl_r"},
+    )
+    assert store.get().dictation_bindings == ("ctrl_r",)
+
+
+def test_save_activation_binding_rejects_a_duplicate_add(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    with pytest.raises(ActionError, match="already set"):
+        actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
 
 
 def test_save_activation_binding_rejects_an_unknown_target(store):
     with pytest.raises(ActionError, match="unknown activation target"):
-        actions.save_activation_binding(store, {"target": "nope", "key": "ctrl_l"})
+        actions.save_activation_binding(store, {"target": "nope", "binding": "ctrl_l"})
 
 
-def test_save_activation_binding_rejects_an_unknown_key(store):
+def test_save_activation_binding_rejects_an_unusable_binding(store):
     with pytest.raises(ActionError):
-        actions.save_activation_binding(store, {"target": "dictation", "key": "not_a_real_key"})
+        actions.save_activation_binding(store, {"target": "command", "binding": "just-a-letter"})
 
 
-def test_save_activation_binding_rejects_an_unusable_chord(store):
-    with pytest.raises(ActionError):
-        actions.save_activation_binding(store, {"target": "command", "chord": "just-a-letter"})
+def test_save_activation_binding_rejects_an_unknown_op(store):
+    with pytest.raises(ActionError, match="unknown operation"):
+        actions.save_activation_binding(store, {"target": "dictation", "op": "nope", "binding": "ctrl_l"})
 
 
 def test_save_activation_binding_hard_rejects_a_hold_key_collision(store):
-    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_r"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_r"})
     with pytest.raises(ActionError, match="already"):
-        actions.save_activation_binding(store, {"target": "hands_free", "key": "ctrl_r"})
+        actions.save_activation_binding(store, {"target": "hands_free", "binding": "ctrl_r"})
     # The rejected save must not have partially applied.
-    assert store.get().hands_free_key is None
+    assert store.get().hands_free_bindings is None
 
 
 def test_save_activation_binding_hard_rejects_a_hold_key_collision_against_config_default(store):
@@ -108,39 +171,43 @@ def test_save_activation_binding_hard_rejects_a_hold_key_collision_against_confi
     with pytest.raises(ActionError, match="already"):
         actions.save_activation_binding(
             store,
-            {"target": "hands_free", "key": "shift_r"},
+            {"target": "hands_free", "binding": "shift_r"},
             effective={"command_hotkey": "shift_r"},
         )
 
 
 def test_save_activation_binding_hard_rejects_a_chord_collision(store):
-    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl+alt+p"})
     with pytest.raises(ActionError, match="already"):
-        actions.save_activation_binding(store, {"target": "command", "chord": "ctrl+alt+p"})
+        actions.save_activation_binding(store, {"target": "command", "binding": "ctrl+alt+p"})
+
+
+def test_save_activation_binding_does_not_reject_a_merely_overlapping_binding(store):
+    """A binding sharing a modifier with another target's -- without being
+    identical -- is not a conflict at all: sway.hotkey.BindingListener
+    resolves that ambiguity itself at dispatch time (prefix grace extended
+    to bare holds), so e.g. dictation on bare ctrl_r and command on
+    ctrl+cmd coexist correctly. An earlier version of this hard-rejected
+    such saves outright, which made half of Ctrl-space unusable for
+    anything but dictation -- see sway.hotkey.needs_prefix_grace."""
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_r"})
+    actions.save_activation_binding(store, {"target": "command", "binding": "ctrl+cmd"})
+    assert store.get().command_bindings == ("ctrl+cmd",)
 
 
 def test_save_activation_binding_does_not_reject_a_transform_collision(store):
-    """A hold/chord binding colliding with a *transform* shortcut is a soft
-    warning shown elsewhere (activation_view's conflicts), not a hard
-    reject here -- mirroring how the transforms UI already treats a
-    transform/transform collision as non-blocking."""
-    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+    """A binding colliding with a *transform* shortcut is a soft warning
+    shown elsewhere (activation_view's conflicts), not a hard reject here --
+    mirroring how the transforms UI already treats a transform/transform
+    collision as non-blocking."""
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl+alt+p"})
 
 
-def test_save_activation_binding_a_field_left_absent_is_untouched(store):
-    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_l"})
-    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
-    assert store.get().hotkey == "ctrl_l"
-    assert store.get().hotkey_chord == "ctrl+alt+p"
-
-
-def test_reset_activation_binding_clears_both_fields(store):
-    actions.save_activation_binding(
-        store, {"target": "dictation", "key": "ctrl_l", "chord": "ctrl+alt+p"}
-    )
+def test_reset_activation_binding_clears_the_whole_list(store):
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl+alt+p"})
     actions.reset_activation_binding(store, {"target": "dictation"})
-    assert store.get().hotkey is None
-    assert store.get().hotkey_chord is None
+    assert store.get().dictation_bindings is None
 
 
 def test_reset_activation_binding_rejects_an_unknown_target(store):
@@ -151,18 +218,25 @@ def test_reset_activation_binding_rejects_an_unknown_target(store):
 def test_activation_view_reports_the_default_flag(store):
     view = actions.activation_view(store.get())
     assert view["dictation"]["is_default"] is True
-    actions.save_activation_binding(store, {"target": "dictation", "key": "ctrl_l"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl_l"})
     view = actions.activation_view(store.get())
     assert view["dictation"]["is_default"] is False
 
 
+def test_activation_view_lists_effective_bindings_with_labels_and_shape(store):
+    view = actions.activation_view(store.get(), effective={"hotkey": "ctrl_r"})
+    assert view["dictation"]["bindings"] == [
+        {"value": "ctrl_r", "label": "Right Ctrl", "shape": "hold", "advisory": ""}
+    ]
+
+
 def test_activation_view_reports_conflicts_symmetrically(store):
-    actions.save_activation_binding(store, {"target": "dictation", "chord": "ctrl+alt+p"})
+    actions.save_activation_binding(store, {"target": "dictation", "binding": "ctrl+alt+p"})
     # Bypass save_activation_binding's hard reject to inspect how the view
     # reports an existing conflict (e.g. one created by two independent
     # settings writes, which the view -- not the save path -- is what
     # surfaces to the user).
-    store.update(command_hotkey_chord="ctrl+alt+p")
+    store.update(command_bindings=("ctrl+alt+p",))
     view = actions.activation_view(store.get())
     assert "the voice-command hotkey" in view["dictation"]["conflicts"]
     assert "the dictation hotkey" in view["command"]["conflicts"]
@@ -345,6 +419,64 @@ def test_delete_all_requires_explicit_confirmation(tmp_path):
         assert store.count() == 0
 
 
+# -- Diagnostics -------------------------------------------------------------
+
+
+def test_recent_diagnostics_missing_file_reports_unavailable(tmp_path):
+    result = actions.recent_diagnostics(tmp_path / "does-not-exist.log")
+    assert result["available"] is False
+    assert result["entries"] == []
+
+
+def test_recent_diagnostics_none_path_reports_unavailable():
+    result = actions.recent_diagnostics(None)
+    assert result["available"] is False
+    assert result["path"] == ""
+
+
+def test_recent_diagnostics_filters_to_warnings_and_errors(tmp_path):
+    log = tmp_path / "sway.log"
+    log.write_text(
+        "2026-08-25 22:42:01,278 24972 INFO    sway.engine [MainThread]: Sway ready.\n"
+        "2026-08-25 23:07:19,282 37664 WARNING sway.engine [flow-transform]: "
+        "transform output rejected by the markdown guardrail; leaving the selection alone\n"
+        "2026-08-25 23:08:00,000 37664 ERROR   sway.groq [flow-net]: request failed\n",
+        encoding="utf-8",
+    )
+    result = actions.recent_diagnostics(log)
+    assert result["available"] is True
+    levels = [e["level"] for e in result["entries"]]
+    assert levels == ["ERROR", "WARNING"]  # newest first
+    assert "markdown guardrail" in result["entries"][1]["message"]
+
+
+def test_recent_diagnostics_folds_traceback_lines_into_their_entry(tmp_path):
+    log = tmp_path / "sway.log"
+    log.write_text(
+        "2026-08-25 23:08:00,000 37664 ERROR   sway.groq [flow-net]: request failed\n"
+        "Traceback (most recent call last):\n"
+        '  File "engine.py", line 1, in <module>\n'
+        "ValueError: boom\n",
+        encoding="utf-8",
+    )
+    entries = actions.recent_diagnostics(log)["entries"]
+    assert len(entries) == 1
+    assert "Traceback" in entries[0]["message"]
+    assert "ValueError: boom" in entries[0]["message"]
+
+
+def test_recent_diagnostics_respects_limit(tmp_path):
+    log = tmp_path / "sway.log"
+    lines = [
+        f"2026-08-25 23:00:{i:02d},000 1 WARNING sway.engine [T]: warning {i}\n"
+        for i in range(10)
+    ]
+    log.write_text("".join(lines), encoding="utf-8")
+    entries = actions.recent_diagnostics(log, limit=3)["entries"]
+    assert len(entries) == 3
+    assert entries[0]["message"] == "warning 9"  # newest first
+
+
 # -- API key ---------------------------------------------------------------
 
 
@@ -373,35 +505,124 @@ def test_saving_a_transform_records_its_expectations(store):
     assert saved.may_lengthen is False
 
 
-def test_toggling_a_builtin_does_not_drop_its_expectations(store):
-    """The toggle posts the whole record back. If a round trip through the UI
-    lost these, enabling "Turn into bullet points" from the switch would
-    re-arm the markdown guardrail against it -- the original bug, restored by
-    the act of turning the feature on."""
-    bullets = next(t for t in store.get().transforms if t.id == "bullets")
-    assert bullets.allows_markdown is True
+def test_resaving_a_builtin_does_not_drop_its_expectations(store):
+    """An ordinary autosave posts the whole record back without the
+    expectation keys. If that round trip lost them, re-saving Prompt
+    Engineer's name would re-arm the markdown guardrail against its own
+    structured output -- the original bug, restored by an unrelated edit."""
+    prompt_engineer = next(t for t in store.get().transforms if t.id == "prompt_engineer")
+    assert prompt_engineer.allows_markdown is True
     settings = actions.save_transform(
         store,
-        {"id": "bullets", "name": bullets.name, "instruction": bullets.instruction, "enabled": True},
+        {
+            "id": "prompt_engineer",
+            "name": prompt_engineer.name,
+            "instruction": prompt_engineer.instruction,
+        },
     )
-    assert next(t for t in settings.transforms if t.id == "bullets").allows_markdown is True
+    assert next(t for t in settings.transforms if t.id == "prompt_engineer").allows_markdown is True
 
 
 def test_unticking_a_box_is_honoured(store):
     settings = actions.save_transform(
         store,
         {
-            "id": "bullets",
-            "name": "Turn into bullet points",
-            "instruction": "Rewrite as a list",
+            "id": "prompt_engineer",
+            "name": "Prompt Engineer",
+            "instruction": "Rewrite as a prompt",
             "allows_markdown": False,
         },
     )
-    assert next(t for t in settings.transforms if t.id == "bullets").allows_markdown is False
+    assert next(t for t in settings.transforms if t.id == "prompt_engineer").allows_markdown is False
+
+
+def test_saving_a_transform_preserves_its_stored_example(store):
+    """The editor never sends example_input/example_output back -- an
+    ordinary save must not erase an example the engine recorded earlier."""
+    prompt_engineer = next(t for t in store.get().transforms if t.id == "prompt_engineer")
+    assert prompt_engineer.example_input
+    settings = actions.save_transform(
+        store,
+        {
+            "id": "prompt_engineer",
+            "name": prompt_engineer.name,
+            "instruction": "a changed instruction",
+        },
+    )
+    saved = next(t for t in settings.transforms if t.id == "prompt_engineer")
+    assert saved.example_input == prompt_engineer.example_input
+    assert saved.example_output == prompt_engineer.example_output
+
+
+def test_saving_a_transform_with_shortcuts(store):
+    settings = actions.save_transform(
+        store,
+        {
+            "name": "Bulletise",
+            "instruction": "Rewrite as a list",
+            "shortcuts": ["ctrl+alt+9", "mouse:middle"],
+        },
+    )
+    saved = settings.transforms[-1]
+    assert saved.shortcuts == ("ctrl+alt+9", "mouse:middle")
+
+
+def test_saving_a_transform_rejects_an_unusable_shortcut(store):
+    with pytest.raises(ActionError):
+        actions.save_transform(
+            store, {"name": "X", "instruction": "i", "shortcuts": ["just-a-letter"]}
+        )
+
+
+def test_saving_a_transform_does_not_reject_a_binding_that_merely_overlaps_dictation(store):
+    """A transform shortcut sharing a modifier with dictation's bare Ctrl_r
+    (Ctrl+Win, the user-reported bug) is not a conflict at all --
+    sway.hotkey.BindingListener now resolves the ambiguity itself at
+    dispatch time (prefix grace extended to bare holds), so both work
+    correctly and independently. No `effective` plumbing is needed here any
+    more since there is nothing left to check a candidate shortcut against."""
+    settings = actions.save_transform(
+        store, {"name": "Email", "instruction": "i", "shortcuts": ["ctrl+cmd"]}
+    )
+    assert settings.transforms[-1].shortcuts == ("ctrl+cmd",)
+
+
+def test_transform_view_reports_no_conflict_for_a_binding_that_merely_overlaps_dictation(store):
+    settings = actions.save_transform(
+        store, {"name": "Email", "instruction": "i", "shortcuts": ["ctrl+cmd"]}
+    )
+    view = {row["id"]: row for row in actions.transform_view(settings)}
+    saved = next(row for row in view.values() if row["name"] == "Email")
+    assert saved["conflicts"] == []
+
+
+def test_activation_view_reports_no_conflict_for_a_binding_that_merely_overlaps_a_transform(store):
+    settings = actions.save_transform(
+        store, {"name": "Email", "instruction": "i", "shortcuts": ["ctrl+cmd"]}
+    )
+    view = actions.activation_view(settings, effective={"hotkey": "ctrl_r"})
+    assert view["dictation"]["conflicts"] == []
 
 
 def test_the_transform_view_exposes_the_expectations(store):
     view = {row["id"]: row for row in actions.transform_view(store.get())}
-    assert view["bullets"]["allows_markdown"] is True
+    assert view["prompt_engineer"]["allows_markdown"] is True
     assert view["email"]["may_lengthen"] is True
     assert view["polish"]["allows_markdown"] is False
+
+
+def test_the_transform_view_includes_a_precomputed_example_diff(store):
+    view = {row["id"]: row for row in actions.transform_view(store.get())}
+    polish = view["polish"]
+    assert polish["example_diff"]
+    assert any(part["op"] == "delete" for part in polish["example_diff"])
+    custom = actions.save_transform(store, {"name": "X", "instruction": "i"})
+    view = {row["id"]: row for row in actions.transform_view(custom)}
+    assert view[custom.transforms[-1].id]["example_diff"] == []
+
+
+def test_the_transform_view_reports_shortcuts_and_runnability(store):
+    view = {row["id"]: row for row in actions.transform_view(store.get())}
+    assert view["polish"]["shortcuts"] == ["ctrl+alt+5"]
+    assert view["polish"]["shortcut_labels"] == ["Ctrl + Alt + 5"]
+    assert view["polish"]["runnable"] is True

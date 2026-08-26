@@ -1,4 +1,4 @@
-"""Tests for :mod:`sway.transforms` and the chord layer in :mod:`sway.hotkey`.
+"""Tests for :mod:`sway.transforms`.
 
 Two things carry real risk here and are tested accordingly.
 
@@ -13,11 +13,9 @@ transform, latency and the free-tier quota would both multiply.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
-from sway.hotkey import Chord, ChordError, format_chord, parse_chord
+from sway.hotkey import parse_binding
 from sway.transforms import (
     DEFAULT_TRANSFORMS,
     Transform,
@@ -27,25 +25,34 @@ from sway.transforms import (
     enabled_with_phrase,
     enabled_with_shortcut,
     find_shortcut_conflicts,
+    is_runnable,
+    shipped_expectation,
 )
 from sway.triggers import apply_triggers
 
 
-def _on(*ids: str) -> tuple[Transform, ...]:
-    """The shipped transforms, with the named ones enabled."""
-    return tuple(replace(t, enabled=t.id in ids) for t in DEFAULT_TRANSFORMS)
+def _only(*ids: str) -> tuple[Transform, ...]:
+    """The named shipped transforms, and no others."""
+    return tuple(t for t in DEFAULT_TRANSFORMS if t.id in ids)
 
 
 class TestDefaults:
-    def test_every_shipped_transform_starts_disabled(self) -> None:
-        """D8.5. A transform costs a request and free-tier quota, so nothing
-        ships already spending them."""
-        assert not any(t.enabled for t in DEFAULT_TRANSFORMS)
+    def test_every_shipped_transform_is_runnable_out_of_the_box(self) -> None:
+        """Unlike the checkbox era, presence in the shipped set *is* the on
+        switch: every default ships with a shortcut (and a phrase), so
+        nothing needs a separate toggle before it can be used."""
+        assert all(is_runnable(t) for t in DEFAULT_TRANSFORMS)
+        assert all(t.shortcuts for t in DEFAULT_TRANSFORMS)
 
     def test_every_shipped_transform_has_an_instruction_and_a_phrase(self) -> None:
         for transform in DEFAULT_TRANSFORMS:
             assert transform.instruction.strip(), transform.id
             assert transform.phrase.strip(), transform.id
+
+    def test_every_shipped_transform_has_a_stored_example(self) -> None:
+        for transform in DEFAULT_TRANSFORMS:
+            assert transform.example_input.strip(), transform.id
+            assert transform.example_output.strip(), transform.id
 
     def test_ids_are_unique(self) -> None:
         ids = [t.id for t in DEFAULT_TRANSFORMS]
@@ -56,19 +63,44 @@ class TestDefaults:
         phrases = [t.phrase.lower() for t in DEFAULT_TRANSFORMS]
         assert len(phrases) == len(set(phrases))
 
+    def test_shortcuts_are_unique(self) -> None:
+        assert find_shortcut_conflicts(DEFAULT_TRANSFORMS) == {}
+
+    def test_every_shortcut_parses(self) -> None:
+        for transform in DEFAULT_TRANSFORMS:
+            for shortcut in transform.shortcuts:
+                parse_binding(shortcut)  # raises on failure
+
+
+class TestRunnability:
+    def test_a_transform_with_neither_a_phrase_nor_a_shortcut_is_not_runnable(self) -> None:
+        assert is_runnable(Transform(id="x", name="X", instruction="do it")) is False
+
+    def test_a_phrase_alone_is_runnable(self) -> None:
+        assert is_runnable(Transform(id="x", name="X", instruction="do it", phrase="do it")) is True
+
+    def test_a_shortcut_alone_is_runnable(self) -> None:
+        t = Transform(id="x", name="X", instruction="do it", shortcuts=("ctrl+alt+p",))
+        assert is_runnable(t) is True
+
 
 class TestSelection:
-    def test_only_enabled_transforms_with_a_phrase_can_be_spoken(self) -> None:
-        transforms = _on("polish") + (
-            Transform(id="x", name="X", instruction="do it", enabled=True),
+    def test_only_phrase_carrying_transforms_can_be_spoken(self) -> None:
+        transforms = _only("polish") + (
+            Transform(id="x", name="X", instruction="do it"),  # no phrase
         )
         assert [t.id for t in enabled_with_phrase(transforms)] == ["polish"]
 
-    def test_only_enabled_transforms_with_a_shortcut_can_be_pressed(self) -> None:
+    def test_only_shortcut_bound_transforms_can_be_pressed(self) -> None:
         transforms = (
-            Transform(id="a", name="A", instruction="i", shortcut="ctrl+alt+a", enabled=True),
-            Transform(id="b", name="B", instruction="i", shortcut="ctrl+alt+b", enabled=False),
-            Transform(id="c", name="C", instruction="i", enabled=True),
+            Transform(id="a", name="A", instruction="i", shortcuts=("ctrl+alt+a",)),
+            Transform(id="b", name="B", instruction="i"),  # no shortcut
+        )
+        assert [t.id for t in enabled_with_shortcut(transforms)] == ["a"]
+
+    def test_a_transform_with_several_shortcuts_still_counts_once(self) -> None:
+        transforms = (
+            Transform(id="a", name="A", instruction="i", shortcuts=("ctrl+alt+a", "mouse:middle")),
         )
         assert [t.id for t in enabled_with_shortcut(transforms)] == ["a"]
 
@@ -78,7 +110,7 @@ class TestSpokenMatching:
     longest-first, non-overlapping rules -- plus one of their own."""
 
     def test_a_trailing_phrase_fires_and_is_excised(self) -> None:
-        result = apply_triggers("Draft the update and make that concise.", as_matchable(_on("concise")))
+        result = apply_triggers("Draft the update and make that concise.", as_matchable(_only("concise")))
         assert result.fired
         assert "concise" not in result.text
         assert "Draft the update" in result.text
@@ -88,50 +120,53 @@ class TestSpokenMatching:
         run Polish. Without this the transform would delete "polish that" from
         the middle of an ordinary sentence."""
         text = "We should polish that stone before shipping."
-        result = apply_triggers(text, as_matchable(_on("polish")))
+        result = apply_triggers(text, as_matchable(_only("polish")))
         assert not result.fired
         assert result.text == text
 
     def test_a_phrase_at_the_end_of_a_later_sentence_still_fires(self) -> None:
-        result = apply_triggers("Rewrite the changelog. Fix the grammar.", as_matchable(_on("grammar")))
+        result = apply_triggers(
+            "Rewrite the changelog. Make that concise.", as_matchable(_only("concise"))
+        )
         assert result.fired
 
-    def test_a_disabled_transform_never_fires(self) -> None:
+    def test_a_transform_absent_from_the_candidate_list_never_fires(self) -> None:
         text = "Draft the update and make that concise."
-        assert not apply_triggers(text, as_matchable(DEFAULT_TRANSFORMS)).fired
+        assert not apply_triggers(text, as_matchable(_only("polish"))).fired
+
+    def test_a_phraseless_transform_never_matches(self) -> None:
+        text = "make that concise"
+        transforms = (Transform(id="x", name="X", instruction="i", phrase=""),)
+        assert not apply_triggers(text, as_matchable(transforms)).fired
 
     def test_the_raw_transcript_is_preserved(self) -> None:
         """A false positive deletes words, so the pre-excision text has to
         survive into history for the user to recover."""
         text = "Draft the update and make that concise."
-        result = apply_triggers(text, as_matchable(_on("concise")))
+        result = apply_triggers(text, as_matchable(_only("concise")))
         assert result.raw_text == text
 
     def test_the_fired_id_comes_back_on_the_hit(self) -> None:
-        result = apply_triggers("Tidy this up, polish that", as_matchable(_on("polish")))
+        result = apply_triggers("Tidy this up, polish that", as_matchable(_only("polish")))
         assert [h.trigger_id for h in result.hits] == ["polish"]
 
     # -- the reported case ---------------------------------------------
     # "I want to order groceries like Kurkure, namkeen, potatoes, sugar, make
-    # that bullet points." The transform was enabled, the user got no bullets,
-    # and the phrase was reported as not being detected at all. It *was*
-    # detected -- these pin that down so a future change to _may_fire_here
-    # cannot quietly move the goalposts under the same sentence.
+    # that a prompt." Pinned so a future change to _may_fire_here cannot
+    # quietly move the goalposts under a natural, trailing-phrase sentence.
 
     @pytest.mark.parametrize(
         "transform_id, text",
         [
             (
-                "bullets",
+                "prompt_engineer",
                 "I want to order groceries like Kurkure, namkeen, potatoes, "
-                "sugar, make that bullet points.",
+                "sugar, make that a prompt.",
             ),
             ("concise", "Let the team know the release slipped, make that concise."),
-            ("grammar", "we was going to ship it on friday, fix the grammar"),
             ("summarize", "Here is everything that happened on the deploy. Summarize that."),
             ("email", "tell Ali the deck is ready, make that an email"),
             ("professional", "tell them it is not happening, make that professional"),
-            ("casual", "The engagement is hereby concluded. Make that casual."),
             ("clarity", "the thing with the thing did not work, make that clearer"),
             ("polish", "we shipped it and it went fine, polish that"),
         ],
@@ -141,17 +176,17 @@ class TestSpokenMatching:
     ) -> None:
         """Every shipped transform, invoked the way it is actually spoken: at
         the end of a real sentence rather than on its own."""
-        result = apply_triggers(text, as_matchable(_on(transform_id)))
+        result = apply_triggers(text, as_matchable(_only(transform_id)))
         assert result.fired, transform_id
         assert [h.trigger_id for h in result.hits] == [transform_id]
 
     def test_the_phrase_is_excised_from_a_natural_request(self) -> None:
         result = apply_triggers(
             "I want to order groceries like Kurkure, namkeen, potatoes, sugar, "
-            "make that bullet points.",
-            as_matchable(_on("bullets")),
+            "make that a prompt.",
+            as_matchable(_only("prompt_engineer")),
         )
-        assert "bullet points" not in result.text
+        assert "make that a prompt" not in result.text
         assert "Kurkure" in result.text and "sugar" in result.text
 
     def test_two_phrases_in_one_utterance_both_fire(self) -> None:
@@ -159,14 +194,14 @@ class TestSpokenMatching:
         this pins that the *last* phrase wins rather than neither."""
         result = apply_triggers(
             "Write up the outage, summarize that",
-            as_matchable(_on("summarize", "bullets")),
+            as_matchable(_only("summarize", "polish")),
         )
         assert [h.trigger_id for h in result.hits] == ["summarize"]
 
     def test_excision_does_not_strand_a_comma_against_a_full_stop(self) -> None:
         result = apply_triggers(
             "Tell them the release slipped, make that professional.",
-            as_matchable(_on("professional")),
+            as_matchable(_only("professional")),
         )
         assert result.text == "Tell them the release slipped."
 
@@ -208,17 +243,21 @@ class TestDirectiveBlock:
 
 class TestShortcutConflicts:
     def test_two_transforms_on_one_chord_are_reported_both_ways(self) -> None:
+        # Shortcuts are always stored in canonical form by the time they
+        # reach a Transform (both the settings parser and the dashboard
+        # actions layer canonicalise via parse_binding before saving), so
+        # conflict detection compares canonical strings directly.
         transforms = (
-            Transform(id="a", name="A", instruction="i", shortcut="ctrl+alt+p"),
-            Transform(id="b", name="B", instruction="i", shortcut="Ctrl+Alt+P"),
+            Transform(id="a", name="A", instruction="i", shortcuts=("ctrl+alt+p",)),
+            Transform(id="b", name="B", instruction="i", shortcuts=("ctrl+alt+p",)),
         )
         conflicts = find_shortcut_conflicts(transforms)
         assert conflicts == {"a": ["b"], "b": ["a"]}
 
     def test_different_chords_do_not_conflict(self) -> None:
         transforms = (
-            Transform(id="a", name="A", instruction="i", shortcut="ctrl+alt+p"),
-            Transform(id="b", name="B", instruction="i", shortcut="ctrl+alt+q"),
+            Transform(id="a", name="A", instruction="i", shortcuts=("ctrl+alt+p",)),
+            Transform(id="b", name="B", instruction="i", shortcuts=("ctrl+alt+q",)),
         )
         assert find_shortcut_conflicts(transforms) == {}
 
@@ -229,59 +268,27 @@ class TestShortcutConflicts:
         )
         assert find_shortcut_conflicts(transforms) == {}
 
+    def test_a_shared_binding_among_several_conflicts_even_if_the_rest_differ(self) -> None:
+        transforms = (
+            Transform(id="a", name="A", instruction="i", shortcuts=("ctrl+alt+p", "mouse:middle")),
+            Transform(id="b", name="B", instruction="i", shortcuts=("ctrl+alt+q", "mouse:middle")),
+        )
+        conflicts = find_shortcut_conflicts(transforms)
+        assert conflicts == {"a": ["b"], "b": ["a"]}
 
-class TestChords:
-    @pytest.mark.parametrize(
-        ("written", "canonical"),
-        [
-            ("ctrl+alt+p", "ctrl+alt+p"),
-            ("Ctrl+Alt+P", "ctrl+alt+p"),
-            ("alt+ctrl+p", "ctrl+alt+p"),
-            ("  ctrl + alt + p  ", "ctrl+alt+p"),
-            ("ctrl+shift+f5", "ctrl+shift+f5"),
-        ],
-    )
-    def test_parsing_is_order_and_case_insensitive(self, written: str, canonical: str) -> None:
-        assert str(parse_chord(written)) == canonical
 
-    def test_equal_chords_hash_together(self) -> None:
-        """Dispatch is a dict lookup keyed on Chord, so equality without a
-        matching hash would silently never fire."""
-        assert len({parse_chord("Ctrl+Alt+P"), parse_chord("alt+ctrl+p")}) == 1
+class TestShippedExpectation:
+    def test_a_current_default_returns_its_own_flags(self) -> None:
+        assert shipped_expectation("prompt_engineer", "allows_markdown") is True
+        assert shipped_expectation("prompt_engineer", "may_lengthen") is True
+        assert shipped_expectation("polish", "allows_markdown") is False
 
-    @pytest.mark.parametrize(
-        ("bad", "because"),
-        [
-            ("p", "no modifier"),
-            ("", "empty"),
-            ("ctrl", "modifier only"),
-            ("ctrl+alt", "still modifier only"),
-            ("meta+p", "unknown modifier"),
-        ],
-    )
-    def test_unusable_shortcuts_are_refused(self, bad: str, because: str) -> None:
-        with pytest.raises(ChordError):
-            parse_chord(bad)
+    def test_a_retired_default_still_returns_its_historical_flags(self) -> None:
+        """"Turn into bullet points" no longer ships, but an existing user's
+        copy of it must keep working exactly as it did before it was retired
+        -- see _RETIRED_DEFAULT_EXPECTATIONS."""
+        assert shipped_expectation("bullets", "allows_markdown") is True
+        assert shipped_expectation("bullets", "may_shorten") is True
 
-    def test_a_bare_letter_is_refused_rather_than_bound(self) -> None:
-        """It would fire inside anything the user typed. That is not a
-        shortcut, it is a broken keyboard."""
-        with pytest.raises(ChordError):
-            parse_chord("p")
-
-    def test_pretty_form_is_for_reading(self) -> None:
-        assert parse_chord("ctrl+alt+p").pretty() == "Ctrl + Alt + P"
-        assert parse_chord("cmd+k").pretty() == "Win + K"
-
-    def test_format_chord_passes_through_what_it_cannot_parse(self) -> None:
-        """Display paths must not raise on a hand-edited settings file."""
-        assert format_chord("nonsense!") == "nonsense!"
-        assert format_chord("Ctrl+Alt+P") == "ctrl+alt+p"
-
-    def test_a_chord_is_not_equal_to_a_random_object(self) -> None:
-        assert parse_chord("ctrl+alt+p") != "ctrl+alt+p"
-
-    def test_left_and_right_modifiers_are_the_same_modifier(self) -> None:
-        """Nobody means "the right Ctrl specifically" when they write
-        ctrl+alt+p."""
-        assert Chord(frozenset({"ctrl"}), "p") == parse_chord("ctrl+p")
+    def test_an_id_that_was_never_shipped_returns_false(self) -> None:
+        assert shipped_expectation("something-a-user-made-up", "allows_markdown") is False

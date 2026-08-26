@@ -24,7 +24,13 @@ from sway.cleanup import (
     unsafe_reason,
 )
 from sway.profiles import CleanupStyle
-from sway.transforms import DEFAULT_TRANSFORMS, Transform, by_id, expectation_for
+from sway.transforms import (
+    DEFAULT_TRANSFORMS,
+    Transform,
+    by_id,
+    expectation_for,
+    shipped_expectation,
+)
 
 # Hindi fixtures, spelled out so the file stays readable in any editor.
 HI_TOMORROW_TEN = "कल सुबह दस बजे ठीक रहेगा"
@@ -382,10 +388,18 @@ def test_the_correction_directive_teaches_the_negative_cases():
 
 
 def _expect(transform_id: str) -> OutputExpectation:
-    """The shipped expectation for one built-in, by id."""
-    transform = by_id(DEFAULT_TRANSFORMS, transform_id)
-    assert transform is not None, transform_id
-    return expectation_for([transform])
+    """The shipped expectation for one built-in, current or retired.
+
+    Goes through shipped_expectation (not a direct DEFAULT_TRANSFORMS
+    lookup) specifically so "bullets" -- retired from the shipped set, but
+    still a live case for any existing user's settings.json -- keeps
+    exercising exactly the same guardrail scenario it always has.
+    """
+    return OutputExpectation(
+        allows_markdown=shipped_expectation(transform_id, "allows_markdown"),
+        may_shorten=shipped_expectation(transform_id, "may_shorten"),
+        may_lengthen=shipped_expectation(transform_id, "may_lengthen"),
+    )
 
 
 # Representative model output for each transform, written the way the shipped
@@ -448,13 +462,28 @@ def test_the_same_output_is_still_rejected_with_no_transform(
     assert not is_cleanup_output_safe(original, cleaned)
 
 
-def test_an_expectation_never_relaxes_the_entity_guard():
-    """Losing a number is wrong under every instruction. This is the guard that
-    stops a transform being a licence to drop what the speaker actually said."""
+def test_a_markdown_only_expectation_does_not_relax_the_entity_guard():
+    """Being allowed to restructure into a list is not a licence to drop what
+    was actually said -- only an instruction that says it *shortens* the text
+    is trusted with that (see test_may_shorten_relaxes_the_entity_guard)."""
     original = "order 6 packets of namkeen and 2 kilos of sugar"
     dropped = "- Namkeen\n- Sugar"
-    reason = unsafe_reason(original, dropped, expectation=_expect("bullets"))
+    markdown_only = OutputExpectation(allows_markdown=True)
+    reason = unsafe_reason(original, dropped, expectation=markdown_only)
     assert reason.startswith("lost_entity:")
+
+
+def test_may_shorten_relaxes_the_entity_guard():
+    """A transform the user explicitly ticked "makes the text shorter" for is
+    trusted to drop numbers and dates the way a real summary would -- see
+    OutputExpectation.protects_entities. Reported end to end: a user's own
+    Summarize rewrite of a long document was rejected outright because it did
+    not repeat every figure in the source, which defeats the point of asking
+    for a summary at all."""
+    original = "order 6 packets of namkeen and 2 kilos of sugar"
+    summarized = "Namkeen and sugar were ordered."
+    shortening = OutputExpectation(may_shorten=True)
+    assert unsafe_reason(original, summarized, expectation=shortening) == ""
 
 
 def test_an_expectation_never_relaxes_the_assistant_voice_guard():
@@ -508,14 +537,100 @@ def test_polish_does_not_quietly_gain_permission_to_restructure():
 
 def test_a_spoken_command_may_restructure_a_selection():
     """The speaker stated an instruction over text they selected, so the
-    shape-based checks are relaxed -- but not the entity guard."""
+    shape-based checks are relaxed, including the entity guard: SPOKEN_COMMAND_
+    EXPECTATION carries may_shorten=True, and a spoken "summarize that" is
+    entitled to drop numbers exactly as a saved Summarize transform is."""
     assert unsafe_reason(GROCERIES, GROCERIES_BULLETED, expectation=SPOKEN_COMMAND_EXPECTATION) == ""
     assert (
         unsafe_reason(
             "order 6 packets", "- packets", expectation=SPOKEN_COMMAND_EXPECTATION
         )
-        == "lost_entity:6"
+        == ""
     )
+
+
+# -- the "grew" ceiling for a lengthening transform --------------------------
+# Reported end to end: a real sentence run through the shipped "Turn into an
+# email" transform was rejected as "grew" even though turning a sentence
+# into a complete email is the entire point of the transform. The 60-word
+# absolute allowance was sized for a one-line note's greeting-and-sign-off
+# and never re-sized as longer may_lengthen transforms shipped -- see
+# sway.cleanup._LENGTHENING_ABSOLUTE_WORD_GROWTH.
+
+COMPLAINT = (
+    "I want to complain to the government about the road issues. They are "
+    "of very bad quality and we need good roads."
+)
+COMPLAINT_AS_EMAIL = (
+    "Subject: Request for Urgent Repair of Deteriorating Road Conditions\n\n"
+    "Dear Sir or Madam,\n\n"
+    "I am writing to raise a concern about the condition of the roads in "
+    "our area, which has deteriorated noticeably over recent months. The "
+    "surfaces are in poor repair, with potholes and uneven sections that "
+    "make daily travel difficult and, in places, unsafe for both drivers "
+    "and pedestrians.\n\n"
+    "I would be grateful if you could advise what steps are being taken "
+    "to address this, and whether a timeline for repair work has been "
+    "established. Improving these roads would make a meaningful "
+    "difference to everyone who relies on them.\n\n"
+    "Thank you for your time and attention to this matter.\n\n"
+    "Yours faithfully"
+)
+
+
+def test_the_reported_sentence_becomes_a_real_email():
+    assert unsafe_reason(COMPLAINT, COMPLAINT_AS_EMAIL, expectation=_expect("email")) == ""
+    assert unsafe_reason(COMPLAINT, COMPLAINT_AS_EMAIL) == "grew"
+
+
+def test_a_short_idea_becomes_a_full_prompt_scaffold():
+    """prompt_engineer's own shipped example: a few words in, a full
+    Title/Role/Task/Context/Inputs scaffold out. Rejected before the fix."""
+    prompt_engineer = by_id(DEFAULT_TRANSFORMS, "prompt_engineer")
+    assert prompt_engineer is not None
+    assert prompt_engineer.example_input and prompt_engineer.example_output
+    reason = unsafe_reason(
+        prompt_engineer.example_input,
+        prompt_engineer.example_output,
+        expectation=_expect("prompt_engineer"),
+    )
+    assert reason == ""
+
+
+def test_a_runaway_rewrite_is_still_rejected_under_may_lengthen():
+    """The absolute allowance rescuing short input must not become a licence
+    for the model to answer/expound at any length. A 100-word selection
+    becoming a 1200-word essay trips the ratio ceiling regardless."""
+    original = " ".join(f"word{i}" for i in range(100))
+    runaway = " ".join(f"filler{i}" for i in range(1200))
+    assert unsafe_reason(original, runaway, expectation=_expect("email")) == "grew"
+
+
+@pytest.mark.parametrize("transform", [t for t in DEFAULT_TRANSFORMS if t.example_output])
+def test_every_shipped_transform_example_passes_its_own_expectation(transform: Transform):
+    """The test that would have caught this class of bug directly: every
+    transform's own shipped, UI-visible example must survive the guardrail
+    under that transform's own expectation."""
+    reason = unsafe_reason(
+        transform.example_input, transform.example_output, expectation=_expect(transform.id)
+    )
+    assert reason == "", f"{transform.id}: {reason}"
+
+
+def test_a_plain_subject_line_is_not_markdown():
+    """email declares allows_markdown=False deliberately -- an ordinary
+    "Subject: ..." line and paragraph breaks must not trip it, since a real
+    email always has both."""
+    assert unsafe_reason(COMPLAINT, COMPLAINT_AS_EMAIL, expectation=_expect("email")) == ""
+
+
+def test_a_bold_subject_line_trips_the_markdown_guard():
+    """The genuine exposure of allows_markdown=False on email: the model
+    reaching for **bold** or a bulleted body is still caught, which is the
+    guard doing its job -- an email transform is not licence to invent
+    structure the user did not ask for."""
+    bolded = COMPLAINT_AS_EMAIL.replace("Subject:", "**Subject:**")
+    assert unsafe_reason(COMPLAINT, bolded, expectation=_expect("email")) == "markdown"
 
 
 def test_is_safe_and_unsafe_reason_cannot_disagree():

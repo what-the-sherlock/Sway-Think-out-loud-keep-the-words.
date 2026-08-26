@@ -360,7 +360,16 @@ _LENGTHENING_MAX_LENGTH_RATIO = 4.0
 #: "tell Ali the deck is ready" legitimately becomes a 34-word email, a ratio of
 #: 5.7 that no sane proportional ceiling would admit -- so under this
 #: expectation a rewrite passes if it is within *either* bound.
-_LENGTHENING_ABSOLUTE_WORD_GROWTH = 60
+#:
+#: 60 was sized for a short one-liner's greeting-and-sign-off and never
+#: re-sized as more may_lengthen transforms shipped: it rejected the shipped
+#: "Turn into an email" transform's own real output on an ordinary
+#: complaint-length sentence, and rejected "Prompt Engineer"'s own shipped
+#: example. Raised to a still-bounded 400 rather than loosening the ratio --
+#: the ratio is what stops a genuine runaway (a 100-word selection becoming a
+#: 1200-word essay would slip through at a looser ratio; it still trips this
+#: absolute bound, and the ratio still trips a shorter runaway on its own).
+_LENGTHENING_ABSOLUTE_WORD_GROWTH = 400
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,11 +382,22 @@ class OutputExpectation:
     transform supplies its own (see :func:`sway.transforms.expectation_for`),
     relaxing only the specific check its instruction is bound to trip.
 
-    What is deliberately *not* here: any relaxation of the entity guard, the
-    assistant-voice check, the language check, or the answered-a-question
-    check. Those catch the model doing something no instruction asked for, so
-    no instruction may switch them off. Dropping a number is wrong even when
-    the user asked for bullet points.
+    What is deliberately *not* here: any relaxation of the assistant-voice
+    check, the language check, or the answered-a-question check. Those catch
+    the model doing something no instruction asked for -- going off-script --
+    so no instruction may switch them off.
+
+    The entity guard is different: it is tied to :attr:`may_shorten`
+    (see :meth:`protects_entities`) rather than being unconditional, because
+    a transform is a rewrite instruction the user wrote and saved themselves,
+    not a guess about what unstated dictation cleanup should do. A user who
+    ticks "makes the text shorter" has already said condensing is the point;
+    a real summary of a long document necessarily drops most of its numbers
+    and dates, and rejecting every such result back to strict word-for-word
+    survival makes the "adapt to what the transform is supposed to do" design
+    (see the checkboxes in the transform editor) a lie for exactly the
+    transforms that need it most. Plain dictation cleanup is unaffected --
+    :data:`NO_EXPECTATION` always has ``may_shorten=False``.
     """
 
     #: The instruction asks for a list, heading, or other markdown structure.
@@ -386,6 +406,16 @@ class OutputExpectation:
     may_shorten: bool = False
     #: The instruction is expected to add scaffolding.
     may_lengthen: bool = False
+
+    def protects_entities(self) -> bool:
+        """Whether every number, date, email, URL, path, and handle in the
+        original must survive into the rewrite untouched.
+
+        ``True`` for everything except a transform explicitly marked
+        :attr:`may_shorten` -- see the class docstring for why summarization
+        is the one case this guard steps aside for.
+        """
+        return not self.may_shorten
 
     def min_ratio(self, *, correction_detected: bool) -> float:
         if self.may_shorten:
@@ -428,10 +458,13 @@ NO_EXPECTATION = OutputExpectation()
 #: What a *spoken* voice command is checked against. The speaker stated an
 #: arbitrary instruction over text they had selected, which is the clearest
 #: "I asked for this" the app ever gets, and the instruction is unknowable in
-#: advance -- so every shape-based check is relaxed. The guards that catch the
-#: model doing what nobody asked for (lost entities, assistant voice, a
-#: question answered rather than rewritten) stay fully armed, and those are the
-#: ones that protect the selection from being overwritten with rubbish.
+#: advance -- so every shape-based check is relaxed, and ``may_shorten=True``
+#: also lifts the entity guard (see OutputExpectation.protects_entities): a
+#: spoken "summarize that" is entitled to drop numbers exactly as a saved
+#: Summarize transform is. The guards that catch the model doing something no
+#: instruction asked for at all -- assistant voice, a question answered
+#: rather than rewritten, a language switched -- stay fully armed, and those
+#: are what protect the selection from being overwritten with rubbish.
 SPOKEN_COMMAND_EXPECTATION = OutputExpectation(
     allows_markdown=True, may_shorten=True, may_lengthen=True
 )
@@ -591,7 +624,9 @@ def is_cleanup_output_safe(
       translation, the failure mode that would silently destroy a Hindi or
       Russian dictation); or
     * lost a number, email address, URL, file path, or handle the speaker
-      actually said.
+      actually said -- unless ``expectation`` is a transform explicitly
+      marked as shortening the text (see :meth:`OutputExpectation.protects_entities`),
+      in which case dropping most of them is what a correct summary does.
 
     Callers fall back to ``original`` whenever this returns ``False``.
 
@@ -675,7 +710,11 @@ def unsafe_reason(
     if _scripts(original) - _scripts(text):
         return "language_changed"
 
-    missing = _protected_entities(original) - _protected_entities(text) - _protected_entities(retracted)
+    missing = (
+        _protected_entities(original) - _protected_entities(text) - _protected_entities(retracted)
+        if expectation.protects_entities()
+        else set()
+    )
     if missing:
         return f"lost_entity:{sorted(missing)[0][:32]}"
     return ""

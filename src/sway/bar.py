@@ -51,6 +51,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -71,6 +72,7 @@ from sway.branding import (
     SURFACE_RAISED,
     app_badge_image,
 )
+from sway.diff import DiffPart
 from sway.motion import (
     BUTTON_FILL_S,
     COLLAPSE_S,
@@ -215,6 +217,12 @@ _FONT_SIZE = 13
 _LEVEL_W = 18
 _BUTTON_D = 28
 _BUTTON_GAP = 6
+#: How long a state change's accent takes to cross-fade to the new colour,
+#: rather than cutting instantly. Short enough to still read as a change
+#: (not a slow mood-lighting fade), long enough to be visibly a blend rather
+#: than a snap -- the gap between "Listening" (amber) and "Transcribing"
+#: (indigo) is otherwise the single most jarring instant in the whole bar.
+_ACCENT_CROSSFADE_S = 0.15
 
 #: The inline recovery pill on an error or a paused capsule.
 _PILL_H = 24
@@ -873,6 +881,7 @@ def render_bar(
     opacity: float = 1.0,
     hollow: bool = False,
     reduced_motion: bool = False,
+    accent_override: tuple[int, int, int] | None = None,
 ) -> tuple[Image.Image, tuple[HitRegion, ...]]:
     """One full bar frame, plus where it can be clicked.
 
@@ -886,8 +895,17 @@ def render_bar(
     keycap. ``hover`` and ``press`` are the actions under the pointer and
     under a held mouse button; the ``*_t`` values are the sampled animation
     positions for them, defaulted so a static render still looks correct.
+
+    ``accent_override`` replaces the state's own accent everywhere it would
+    be used (level meter, orb tint, resting dot, recovery pill) -- the hook
+    :meth:`SwayBar._update_phase`'s accent cross-fade uses so a state change
+    (say, RECORDING's amber to THINKING's indigo) blends over a couple of
+    frames instead of cutting instantly, without this function needing to
+    know anything about tweening.
     """
     style = _STYLES[state]
+    if accent_override is not None:
+        style = replace(style, accent=accent_override)
     expand = _clamp01(expand)
     opacity = _clamp01(opacity)
     text = _bar_text(state, detail, hint=hint, elapsed_s=elapsed_s)
@@ -1851,6 +1869,12 @@ class SwayBar:
         self._image_item: int | None = None
 
         self._state = BarState.IDLE
+        #: The outgoing state's accent at the moment of the last state
+        #: change -- what "accent_t" (see _update_phase) blends away from.
+        #: Starts equal to IDLE's own accent, so the very first real
+        #: transition has a true starting colour rather than blending from
+        #: black.
+        self._prev_accent: tuple[int, int, int] = _STYLES[BarState.IDLE].accent
         self._detail = ""
         self._kind = ""
         self._hint = ""
@@ -2437,6 +2461,8 @@ class SwayBar:
                 state, detail, kind = self._queue.get_nowait()
                 if state != self._state:
                     self._state_entered_at = time.monotonic()
+                    self._prev_accent = _STYLES[self._state].accent
+                    self._motion.set("accent_t", 0.0)
                     if state is BarState.RECORDING:
                         # A dictation starting closes anything the user left
                         # open: the words are about to go somewhere, and a
@@ -2602,6 +2628,10 @@ class SwayBar:
             self._motion.to(
                 f"level{index}", 1.0 if level > index else 0.0, duration_s=LEVEL_S
             )
+        # Reset to 0 by the state-change handler above; always ticks toward
+        # 1 here, so it is a no-op once settled and self-corrects if a
+        # frame was ever dropped mid-blend.
+        self._motion.to("accent_t", 1.0, duration_s=_ACCENT_CROSSFADE_S, ease=ease_out_cubic)
 
     def _apply_frame(self, *, force: bool = False) -> None:
         canvas = self._canvas
@@ -2642,6 +2672,12 @@ class SwayBar:
         hover_t = self._motion.value("hover", 0.0)
         press_t = self._motion.value("press", 0.0)
         level_t = tuple(self._motion.value(f"level{i}", 0.0) for i in range(3))
+        accent_t = self._motion.value("accent_t", 1.0)
+        accent = (
+            _STYLES[self._state].accent
+            if accent_t >= 1.0
+            else lerp_rgb(self._prev_accent, _STYLES[self._state].accent, accent_t)
+        )
         # The orb's clock restarts with the state, so each variant begins at
         # its own beginning rather than being joined mid-gesture.
         orb_phase_s = now - self._state_entered_at
@@ -2675,7 +2711,7 @@ class SwayBar:
             round(expand, 3), round(dot_t, 2), round(hover_t, 2),
             round(press_t, 2), orb_t,
             tuple(round(value, 2) for value in level_t),
-            round(opacity, 2), round(shake, 1),
+            round(opacity, 2), round(shake, 1), accent,
         )
         if not force and key == self._render_key:
             return
@@ -2703,6 +2739,7 @@ class SwayBar:
             opacity=opacity,
             hollow=self._state is BarState.PAUSED,
             reduced_motion=self._reduced_motion,
+            accent_override=accent,
         )
         self._regions = regions
 
@@ -3112,6 +3149,546 @@ class _Tooltip:
         self._photo = None
 
 
+def _rgb_hex(rgb: tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % rgb
+
+
+def _mix(base: tuple[int, int, int], toward: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
+    """Blend two RGB triples. For hover tints, where a second hand-picked
+    hex would just be the same colour written twice."""
+    t = _clamp01(amount)
+    return tuple(round(lerp(base[i], toward[i], t)) for i in range(3))  # type: ignore[return-value]
+
+
+def _round_window_corners(window: tk.Misc, radius: int) -> bool:
+    """Clip a Tk window to a rounded rectangle via ``SetWindowRgn``.
+
+    An ``overrideredirect`` Toplevel is a hard rectangle -- Tk offers no
+    shaping, and the bar's own colour-key trick is unavailable here (this
+    window holds a real ``tk.Text``, which must stay opaque and hit-testable).
+    A window region is the one mechanism that rounds an arbitrary HWND on
+    Windows. Best-effort: returns False anywhere it is unavailable, leaving
+    a square-cornered panel rather than no panel.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        window.update_idletasks()
+        hwnd = int(window.winfo_id())
+        width = max(1, window.winfo_width())
+        height = max(1, window.winfo_height())
+        gdi = ctypes.windll.gdi32
+        # +1: CreateRoundRectRgn's right/bottom edges are exclusive.
+        region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+        if not region:
+            return False
+        # Ownership of the region passes to the window on success; on
+        # failure it is ours to delete or it leaks a GDI object.
+        if not ctypes.windll.user32.SetWindowRgn(hwnd, region, True):
+            gdi.DeleteObject(region)
+            return False
+        return True
+    except Exception:
+        logger.debug("could not round the panel's corners", exc_info=True)
+        return False
+
+
+#: Glyphs from Segoe Fluent Icons (ships on Windows 10 1809+ as Segoe MDL2
+#: Assets; both names resolve to the same font family here) -- the OS's own
+#: icon language, so Copy/Retry/Undo read as native chrome rather than as
+#: three more custom-drawn widgets. Verified to render (non-empty glyph
+#: bounding box) against C:\Windows\Fonts\SegoeIcons.ttf.
+_ICON_FONT = "Segoe Fluent Icons"
+_ICON_COPY = ""
+_ICON_REFRESH = ""
+_ICON_UNDO = ""
+
+
+class TransformReviewPanel:
+    """The "N Changes" preview after a shortcut-run transform: a word diff,
+    and Apply / Copy / Retry / Undo.
+
+    Built with plain ``tk``/``ttk`` widgets rather than the PIL-rendered
+    pipeline the rest of the bar uses -- its content is a scrollable text
+    diff, which is what ``tk.Text`` exists for, not a handful of icons.
+
+    Uses the exact same non-activating-window recipe as :class:`_Panel`
+    (``overrideredirect`` + ``-topmost`` + ``WS_EX_NOACTIVATE``), for the
+    same reason: this panel opens *after* a transform already ran, with
+    Apply queued up to paste into whatever application the user was in --
+    if showing this panel stole focus, Apply's paste would land in the
+    panel's own window instead.
+
+    Owned by :class:`~sway.engine.Engine`, not by :class:`SwayBar`, exactly
+    like :class:`~sway.history_window.HistoryWindow` -- constructed on the
+    Tk thread via :meth:`SwayBar.run_on_ui_thread` and kept for the
+    process's lifetime, reused across runs rather than rebuilt each time.
+    """
+
+    _WIDTH = 520
+    #: 460 was cutting it fine -- a 30-change diff's natural height (464px)
+    #: already exceeded it, and only the footer's pack order (side="bottom",
+    #: reserved first -- see _build) keeps a shortfall like that from
+    #: hiding the buttons entirely rather than just shrinking the visible
+    #: diff area a little.
+    _MAX_HEIGHT = 560
+    _RADIUS = 14
+
+    #: The panel's own palette, deliberately a shade deeper than the shared
+    #: SURFACE so the card reads as floating *above* the desktop rather than
+    #: continuous with the bar. The insert/delete pair carries the whole
+    #: diff: a soft teal wash behind added words (not a hue the rest of the
+    #: app spends, so "this is new text" cannot be confused with a state
+    #: colour) and struck-through grey for removed ones, which is legible
+    #: without colour at all.
+    #:
+    #: _BG_INSET is deliberately *not* used behind the diff text any more --
+    #: a raised "field" box around the whole diff read as a form control
+    #: (the one thing that most said "prototype" rather than "product"),
+    #: whereas the reference this was redesigned against lets the diff float
+    #: directly on the panel's own background. It survives only as the
+    #: ghost-icon buttons' hover tint, which wants to be a shade *lighter*
+    #: than the surface it sits on rather than a container in its own right.
+    _BG = (18, 19, 23)
+    _BG_INSET = (28, 30, 36)
+    _BORDER = (42, 44, 52)
+    #: Close enough to _BG to read as a seam, not a rule -- the reference's
+    #: own divider is nearly invisible, which is part of why the header
+    #: doesn't feel like a boxed toolbar.
+    _DIVIDER = (30, 32, 38)
+    _MUTED = (138, 142, 155)
+    _MUTED_DIM = (90, 93, 103)
+    _INSERT_BG = (26, 61, 56)
+    _INSERT_FG = (167, 243, 224)
+    _DELETE_FG = (110, 114, 126)
+
+    def __init__(self, root: tk.Tk) -> None:
+        self._root = root
+        self._top: tk.Toplevel | None = None
+        self._text: tk.Text | None = None
+        self._title_label: tk.Label | None = None
+        self._subtitle_label: tk.Label | None = None
+        self._apply_btn: tk.Button | None = None
+        self._undo_btn: tk.Button | None = None
+        self._copy_btn: tk.Button | None = None
+        self._retry_btn: tk.Button | None = None
+        self._on_close: Callable[[], None] | None = None
+        self._poll_id: str | None = None
+        self._opened_at = 0.0
+        self._anim_id: str | None = None
+        self._subtitle = ""
+        self._shown = False
+        self._rest_xy: tuple[int, int] | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self._top is not None
+
+    def show(
+        self,
+        *,
+        title: str,
+        parts: list[DiffPart],
+        applied: bool,
+        on_apply: Callable[[], None],
+        on_copy: Callable[[], None],
+        on_retry: Callable[[], None],
+        on_undo: Callable[[], None],
+        on_close: Callable[[], None],
+        subtitle: str = "",
+    ) -> None:
+        """Open the panel, or refresh it in place if already open (Retry)."""
+        self._on_close = on_close
+        self._subtitle = subtitle
+        if self._top is None:
+            self._build(title=title)
+        self._apply_btn.configure(command=lambda: self._safe(on_apply))
+        self._undo_btn.configure(command=lambda: self._safe(on_undo))
+        for widget, handler in (
+            (self._copy_btn, on_copy),
+            (self._retry_btn, on_retry),
+        ):
+            widget.configure(command=lambda h=handler: self._safe(h))
+        self.update(title=title, parts=parts, applied=applied)
+
+    def update(self, *, title: str, parts: list[DiffPart], applied: bool) -> None:
+        """Redraw the diff and button states without reopening the window --
+        used by Retry, which produces a fresh diff for the same panel."""
+        if self._top is None:
+            return
+        self._title_label.configure(text=title)
+        if self._subtitle_label is not None:
+            self._subtitle_label.configure(text=self._subtitle)
+        text = self._text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        for part in parts:
+            tag = {"equal": "equal", "delete": "delete", "insert": "insert"}.get(part.op, "equal")
+            text.insert("end", part.text, (tag,))
+        text.configure(state="disabled")
+        # Applied already: Apply becomes the spent action and Undo the live
+        # one, so the primary emphasis follows whatever is actually useful
+        # next rather than staying on a button that now does nothing.
+        self._apply_btn.configure(state="disabled" if applied else "normal")
+        self._undo_btn.configure(state="normal" if applied else "disabled")
+        self._reposition()
+
+    def close(self) -> None:
+        for attr in ("_poll_id", "_anim_id"):
+            job = getattr(self, attr)
+            if job is not None and self._top is not None:
+                try:
+                    self._top.after_cancel(job)
+                except tk.TclError:
+                    pass
+            setattr(self, attr, None)
+        self._shown = False
+        self._rest_xy = None
+        top, self._top = self._top, None
+        if top is not None:
+            try:
+                top.destroy()
+            except tk.TclError:
+                pass
+        self._text = None
+        self._title_label = None
+        self._subtitle_label = None
+        self._apply_btn = None
+        self._undo_btn = None
+        self._copy_btn = None
+        self._retry_btn = None
+        self._on_close = None
+
+    def _safe(self, handler: Callable[[], None]) -> None:
+        try:
+            handler()
+        except Exception:
+            logger.exception("transform review panel action failed")
+
+    def _request_close(self, *_args: object) -> None:
+        handler, self._on_close = self._on_close, None
+        self.close()
+        if handler is not None:
+            self._safe(handler)
+
+    def _build(self, *, title: str) -> None:
+        top = tk.Toplevel(self._root)
+        top.withdraw()
+        top.title("Sway — Changes")
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+
+        bg = _rgb_hex(self._BG)
+        inset = _rgb_hex(self._BG_INSET)
+        ink = _rgb_hex(INK)
+        muted = _rgb_hex(self._MUTED)
+        brand = _rgb_hex(ACCENT_BRAND)
+        top.configure(bg=bg, highlightthickness=1, highlightbackground=_rgb_hex(self._BORDER))
+
+        # -- header: what happened (left), which transform did it (right) --
+        header = tk.Frame(top, bg=bg)
+        header.pack(fill="x", padx=22, pady=(18, 0))
+        title_label = tk.Label(
+            header, text=title, bg=bg, fg=ink, font=("Segoe UI", 12, "bold"), anchor="w"
+        )
+        title_label.pack(side="left")
+        subtitle_label = tk.Label(
+            header, text=self._subtitle, bg=bg, fg=muted, font=("Segoe UI", 10), anchor="e"
+        )
+        subtitle_label.pack(side="right")
+
+        divider = tk.Frame(top, bg=_rgb_hex(self._DIVIDER), height=1)
+        divider.pack(fill="x", padx=22, pady=(14, 0))
+
+        # -- footer: Apply is the one deliberately-visible act; the rest are
+        # icon-only ghosts that only reveal a fill on hover -- a labelled,
+        # filled button for each action read as a form's toolbar (the thing
+        # most said "prototype"). Copy/Retry/Undo are common enough
+        # pictograms that a label adds noise, not clarity.
+        #
+        # Packed with side="bottom" and *before* body below, even though it
+        # reads later on screen -- pack() allocates space in call order, not
+        # widget-creation order, and this is what guarantees the footer its
+        # full natural height no matter how tall the diff's natural request
+        # is. With every widget packed side="top" (the default), a taller
+        # diff pushed the footer below the window's forced height and it
+        # was silently clipped -- pack does not scroll or warn, it simply
+        # stops drawing whatever does not fit. body's own expand=True below
+        # is what absorbs the size difference now, by scrolling instead.
+        footer = tk.Frame(top, bg=bg)
+        footer.pack(side="bottom", fill="x", padx=22, pady=(14, 16))
+
+        icons = tk.Frame(footer, bg=bg)
+        icons.pack(side="left")
+        copy_btn = self._make_icon_button(icons, _ICON_COPY)
+        copy_btn.pack(side="left")
+        retry_btn = self._make_icon_button(icons, _ICON_REFRESH)
+        retry_btn.pack(side="left")
+        undo_btn = self._make_icon_button(icons, _ICON_UNDO)
+        undo_btn.pack(side="left")
+
+        apply_btn = self._make_button(footer, "Apply", primary=True)
+        apply_btn.pack(side="right")
+        hint = tk.Label(footer, text="Esc to dismiss", bg=bg, fg=_rgb_hex(self._MUTED_DIM), font=("Segoe UI", 9))
+        hint.pack(side="right", padx=(0, 14))
+
+        # -- body: the diff itself, the reason the panel exists ------------
+        body = tk.Frame(top, bg=bg)
+        body.pack(side="top", fill="both", expand=True, padx=22, pady=(16, 0))
+        # A real transform's diff routinely runs well past the 11 lines this
+        # box shows at once (mouse-wheel alone scrolled it, but with nothing
+        # on screen suggesting more was there to find) -- a visible track is
+        # what turns "the diff looks cut off" into "the diff scrolls".
+        scrollbar = tk.Scrollbar(
+            body,
+            orient="vertical",
+            bg=bg,
+            troughcolor=bg,
+            activebackground=_rgb_hex(self._BORDER),
+            highlightthickness=0,
+            bd=0,
+            width=10,
+        )
+        scrollbar.pack(side="right", fill="y")
+        text = tk.Text(
+            body,
+            width=54,
+            height=11,
+            wrap="word",
+            bg=inset,
+            fg=ink,
+            insertbackground=ink,
+            selectbackground=_rgb_hex(self._INSERT_BG),
+            relief="flat",
+            bd=0,
+            padx=16,
+            pady=14,
+            spacing1=3,  # above each line
+            spacing2=3,  # between wrapped lines
+            spacing3=3,  # below each line
+            font=("Segoe UI", 11),
+            cursor="arrow",
+            state="disabled",
+            yscrollcommand=scrollbar.set,
+        )
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=text.yview)
+        text.tag_configure("equal", foreground=ink)
+        text.tag_configure("delete", foreground=_rgb_hex(self._DELETE_FG), overstrike=True)
+        # A wash behind added words rather than coloured text: it survives
+        # being read at a glance, and marks the *run* of new text rather
+        # than asking the eye to diff two similar greens word by word.
+        text.tag_configure(
+            "insert",
+            foreground=_rgb_hex(self._INSERT_FG),
+            background=_rgb_hex(self._INSERT_BG),
+        )
+
+        top.bind("<Escape>", self._request_close)
+        top.protocol("WM_DELETE_WINDOW", self._request_close)
+
+        self._top = top
+        self._text = text
+        self._title_label = title_label
+        self._subtitle_label = subtitle_label
+        self._apply_btn = apply_btn
+        self._undo_btn = undo_btn
+        self._copy_btn = copy_btn
+        self._retry_btn = retry_btn
+        self._opened_at = time.monotonic()
+
+        top.after(60, lambda: self._make_non_activating(top))
+        self._poll_id = top.after(200, self._poll_outside_click)
+
+    def _make_button(self, parent: tk.Widget, label: str, *, primary: bool = True) -> tk.Button:
+        """The one filled, laballed control in the footer -- Apply. Every
+        other action moved to :meth:`_make_icon_button`, deliberately
+        leaving this the single visually "loud" element: the panel should
+        have exactly one thing that looks like the primary act.
+        """
+        rest = _rgb_hex(ACCENT_BRAND)
+        hover = _rgb_hex(_mix(ACCENT_BRAND, (255, 255, 255), 0.14))
+        fg = "#ffffff"
+        button = tk.Button(
+            parent,
+            text=label,
+            bg=rest,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            disabledforeground=_rgb_hex(self._MUTED),
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=7,
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+        )
+
+        def on_enter(_e: object) -> None:
+            if button["state"] != "disabled":
+                button.configure(bg=hover)
+
+        def on_leave(_e: object) -> None:
+            button.configure(bg=rest)
+
+        button.bind("<Enter>", on_enter)
+        button.bind("<Leave>", on_leave)
+        return button
+
+    def _make_icon_button(self, parent: tk.Widget, glyph: str) -> tk.Button:
+        """A ghost icon button: no visible fill or border at rest, a soft
+        tint on hover -- Copy/Retry/Undo, in the reference's own idiom.
+        Labelled, filled buttons for actions this common read as a form's
+        toolbar; a bare, recognisable pictogram reads as part of the
+        surface it sits on until the pointer finds it.
+        """
+        muted = _rgb_hex(self._MUTED)
+        hover_bg = _rgb_hex(self._BG_INSET)
+        button = tk.Button(
+            parent,
+            text=glyph,
+            bg=_rgb_hex(self._BG),
+            fg=muted,
+            activebackground=hover_bg,
+            activeforeground=_rgb_hex(INK),
+            disabledforeground=_rgb_hex(self._MUTED_DIM),
+            relief="flat",
+            bd=0,
+            padx=7,
+            pady=6,
+            font=(_ICON_FONT, 14),
+            cursor="hand2",
+        )
+
+        def on_enter(_e: object) -> None:
+            if button["state"] != "disabled":
+                button.configure(bg=hover_bg, fg=_rgb_hex(INK))
+
+        def on_leave(_e: object) -> None:
+            button.configure(bg=_rgb_hex(self._BG), fg=muted)
+
+        button.bind("<Enter>", on_enter)
+        button.bind("<Leave>", on_leave)
+        return button
+
+    def _reposition(self) -> None:
+        top = self._top
+        if top is None:
+            return
+        top.update_idletasks()
+        area = work_area((top.winfo_screenwidth(), top.winfo_screenheight()))
+        width = self._WIDTH
+        height = min(top.winfo_reqheight(), self._MAX_HEIGHT)
+        cx = (area[0] + area[2]) // 2 - width // 2
+        cy = (area[1] + area[3]) // 2 - height // 2
+        x, y = clamp_to_area(cx, cy, (width, height), area)
+        self._rest_xy = (x, y)
+        first_show = not self._shown
+        if first_show:
+            # Start fully transparent so the very first frame is never a
+            # square, unrounded flash at the wrong opacity.
+            _set_window_alpha(top, 0.0)
+        top.geometry(f"{width}x{height}+{x}+{y}")
+        top.deiconify()
+        # After deiconify: the region needs a realised window of known size,
+        # and a resize (Retry producing a taller diff) invalidates it.
+        _round_window_corners(top, self._RADIUS)
+        if first_show:
+            self._shown = True
+            self._opened_at = time.monotonic()
+            self._animate_in()
+
+    def _animate_in(self) -> None:
+        """Fade up and settle down a few pixels, ~160ms.
+
+        The same gesture :class:`_Panel` uses, for the same reason: a panel
+        that simply exists on the next frame reads as a glitch, while one
+        that arrives reads as a response to what the user just did.
+        """
+        top = self._top
+        if top is None or self._rest_xy is None:
+            return
+        elapsed = time.monotonic() - self._opened_at
+        t = _clamp01(elapsed / PANEL_OPEN_S) if PANEL_OPEN_S > 0 else 1.0
+        eased = ease_out_cubic(t)
+        if not _set_window_alpha(top, eased):
+            return  # no layered-window support: it is simply already visible
+        x, y = self._rest_xy
+        try:
+            top.geometry(f"+{x}+{round(y + lerp(10.0, 0.0, eased))}")
+        except tk.TclError:
+            return
+        if t >= 1.0:
+            self._anim_id = None
+            return
+        try:
+            self._anim_id = top.after(16, self._animate_in)
+        except tk.TclError:
+            self._anim_id = None
+
+    def _make_non_activating(self, top: tk.Toplevel) -> None:
+        """See :meth:`SwayBar._make_non_activating` -- same reasoning, same
+        recipe, applied to this window instead of the bar's own."""
+        try:
+            import ctypes
+
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(top.winfo_id()) or top.winfo_id()
+            current = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, current | WS_EX_NOACTIVATE)
+        except Exception:
+            logger.debug("could not mark the review panel non-activating", exc_info=True)
+
+    def _poll_outside_click(self) -> None:
+        top = self._top
+        if top is None:
+            return
+        self._poll_id = top.after(200, self._poll_outside_click)
+        # Same grace-period reasoning as SwayBar._dismiss_on_outside_click:
+        # the click that opened this panel may still be pending on the first
+        # tick or two.
+        if time.monotonic() - self._opened_at < 0.35:
+            return
+        point = self._mouse_press_point()
+        if point is None:
+            return
+        x, y = point
+        try:
+            left, top_y = top.winfo_rootx(), top.winfo_rooty()
+            right, bottom = left + top.winfo_width(), top_y + top.winfo_height()
+        except tk.TclError:
+            return
+        if left <= x <= right and top_y <= y <= bottom:
+            return
+        self._request_close()
+
+    @staticmethod
+    def _mouse_press_point() -> tuple[int, int] | None:
+        """See :meth:`SwayBar._mouse_press_point` -- identical technique,
+        kept as its own copy so this panel has no dependency on SwayBar's
+        internal poll loop or panel-tracking state."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            pressed = any(user32.GetAsyncKeyState(button) & 0x8001 for button in (0x01, 0x02))
+            if not pressed:
+                return None
+            point = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return None
+            return point.x, point.y
+        except Exception:
+            logger.debug("cannot watch for an outside click", exc_info=True)
+            return None
+
+
 class NullBar:
     """Headless stand-in when the bar is disabled."""
 
@@ -3199,6 +3776,7 @@ __all__ = [
     "MenuItem",
     "NullBar",
     "SwayBar",
+    "TransformReviewPanel",
     "build_menu",
     "clamp_to_area",
     "measure_rich",
