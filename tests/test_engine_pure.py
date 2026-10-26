@@ -17,6 +17,7 @@ from sway.activation import Activation, ActivationLedger
 from sway.bar import RECOVERY, BarState, recovery_for
 from sway.engine import (
     Engine,
+    _Transcript,
     _describe_failure,
     _drop_duplicate_bindings,
     _failure_label,
@@ -162,6 +163,7 @@ EMITTED_KINDS = {
     "audio",
     "auth",
     "clipboard",
+    "command_guardrail",
     "failed",
     "network",
     "no_key",
@@ -180,6 +182,13 @@ NO_RECOVERY = {
     "failed": "cause unknown, so there is nothing specific to offer",
     "unexpected": "same, and the detail is in the log file",
     "settings": "the write already failed; retrying the same write is not help",
+    # A guardrail-blocked transform/command (Engine._run_command) or retry
+    # (Engine._retry_command) means the model returned nothing usable -- the
+    # only honest recovery is trying again, which pressing the shortcut or
+    # holding the command key already does. _transform_retry cannot serve
+    # this either: it acts on self._pending_transform, which is None on this
+    # exact path since nothing was ever presented to a panel.
+    "command_guardrail": "the only recovery is retrying, which the shortcut/key already offers",
 }
 
 
@@ -289,10 +298,39 @@ def test_a_language_row_round_trips_to_a_language():
     chosen = []
     engine._choose_language = chosen.append
     engine._choose_device = lambda value: chosen.append(("device", value))
+    engine._choose_target_language = lambda value: chosen.append(("target", value))
 
     engine._popover_choice_handler("lang:en")()
     engine._popover_choice_handler("lang:")()
     assert chosen == ["en", None]
+
+
+def test_a_target_row_round_trips_to_a_target_language():
+    """The output language rides the same popover, on its own prefix, so the
+    bar still knows nothing about what a language is."""
+    engine = Engine.__new__(Engine)
+    chosen = []
+    engine._choose_language = lambda value: chosen.append(("language", value))
+    engine._choose_device = lambda value: chosen.append(("device", value))
+    engine._choose_target_language = chosen.append
+
+    engine._popover_choice_handler("target:mr")()
+    engine._popover_choice_handler("target:")()
+    assert chosen == ["mr", None]
+
+
+def test_target_rows_are_not_mistaken_for_dictation_language_rows():
+    """Both prefixes end in a colon; a prefix check in the wrong order would
+    silently route every output choice into the input setting."""
+    engine = Engine.__new__(Engine)
+    chosen = []
+    engine._choose_language = lambda value: chosen.append(("language", value))
+    engine._choose_device = lambda value: chosen.append(("device", value))
+    engine._choose_target_language = lambda value: chosen.append(("target", value))
+
+    engine._popover_choice_handler("target:hi")()
+    engine._popover_choice_handler("lang:hi")()
+    assert chosen == [("target", "hi"), ("language", "hi")]
 
 
 def test_a_device_row_round_trips_to_a_device():
@@ -626,3 +664,372 @@ def test_a_dispatched_activation_can_only_paste_once(monkeypatch):
     assert engine._inject_with_fallback("hello", run, activation) is True
     assert engine._inject_with_fallback("hello", run, activation) is False
     assert pasted == ["hello"]
+
+
+# -- language resolution ----------------------------------------------------
+#
+# The decisions that pick the STT model, the prompt, and whether to translate
+# at all. Pure enough to build an Engine shell for: none of them touch audio,
+# the network, or the bar.
+
+
+def _language_engine(*, language=None, target=None, history=(), streaming=True):
+    """An Engine shell wired with just the state the language logic reads."""
+    import threading
+    from collections import deque
+
+    from sway.groq_client import WHISPER_ACCURATE_MODEL, WHISPER_MODEL
+
+    engine = Engine.__new__(Engine)
+    engine._config = SimpleNamespace(
+        groq=SimpleNamespace(
+            language=language,
+            stt_model=WHISPER_MODEL,
+            stt_accurate_model=WHISPER_ACCURATE_MODEL,
+            timeout_s=15.0,
+        ),
+        cleanup=SimpleNamespace(
+            enabled=True,
+            model="openai/gpt-oss-20b",
+            skip_min_words=8,
+            skip_when_unconfident=True,
+        ),
+        streaming=SimpleNamespace(enabled=streaming),
+    )
+    engine._settings = SimpleNamespace(get=lambda: SimpleNamespace(target_language=target))
+    engine._language_history = deque(history, maxlen=3)
+    engine._language_lock = threading.Lock()
+    return engine
+
+
+def _transcript(text="text", language=None, *, confident=True, speech_ms=5000.0):
+    return _Transcript(
+        text=text, language=language, confident=confident, speech_ms=speech_ms
+    )
+
+
+def test_an_explicit_language_beats_whispers_guess():
+    """Whisper labels Marathi as Hindi. Someone who has said "I speak
+    Marathi" must not be overruled by that."""
+    engine = _language_engine(language="mr")
+    assert engine._language_for_transcript(_transcript(language="hindi")) == "mr"
+
+
+def test_a_short_clip_ignores_whispers_language_label():
+    """Measured misdetections cluster under ~2s: "Hello" came back as Hindi,
+    a surname as Korean. A one-word utterance must not repick the language."""
+    engine = _language_engine(history=("en", "en"))
+    short = _transcript(language="hindi", speech_ms=900.0)
+    assert engine._language_for_transcript(short) == "en"
+
+
+def test_a_long_clip_trusts_whispers_language_label():
+    engine = _language_engine(history=("en",))
+    assert engine._language_for_transcript(_transcript(language="hindi")) == "hi"
+
+
+def test_a_short_clip_with_no_history_falls_back_to_the_label():
+    """Better than nothing, and still the old behaviour on a fresh session."""
+    engine = _language_engine()
+    assert engine._language_for_transcript(_transcript(language="hindi", speech_ms=500.0)) == "hi"
+
+
+def test_the_session_language_is_the_recent_majority():
+    engine = _language_engine(history=("hi", "en", "hi"))
+    assert engine._session_language() == "hi"
+
+
+def test_a_genuine_switch_wins_a_tie():
+    """Two each: the newer one should take effect now, not in three more
+    dictations."""
+    engine = _language_engine(history=("en", "mr"))
+    assert engine._session_language() == "mr"
+
+
+def test_remembering_normalises_and_ignores_junk():
+    engine = _language_engine()
+    engine._remember_language("Hindi")
+    engine._remember_language("klingon")
+    engine._remember_language(None)
+    assert list(engine._language_history) == ["hi"]
+
+
+def test_indic_languages_get_the_accurate_stt_model():
+    engine = _language_engine(language="mr")
+    assert engine._stt_model_for("mr").endswith("large-v3")
+    assert not engine._stt_model_for("mr").endswith("turbo")
+
+
+def test_english_keeps_the_fast_stt_model():
+    engine = _language_engine()
+    assert engine._stt_model_for("en").endswith("turbo")
+    assert engine._stt_model_for(None).endswith("turbo")
+
+
+def test_streaming_is_skipped_for_languages_turbo_decodes_badly():
+    """Chunking a language the decoder already bends toward another one
+    compounds the error across fragments that cannot be told apart."""
+    assert not _language_engine(language="mr")._streaming_wanted()
+    assert not _language_engine(history=("hi", "hi"))._streaming_wanted()
+    assert _language_engine(language="en")._streaming_wanted()
+    assert not _language_engine(language="en", streaming=False)._streaming_wanted()
+
+
+# -- the cleanup skip decision ----------------------------------------------
+
+
+def _skip(engine, transcript, *, style=None, language=None, target=None, transforms=()):
+    from sway.corrections import CorrectionScan
+    from sway.profiles import CleanupStyle
+
+    return engine._cleanup_skip_reason(
+        transcript,
+        style or CleanupStyle.CASUAL,
+        CorrectionScan(text=transcript.text),
+        transforms,
+        language=language,
+        target_language=target,
+    )
+
+
+def test_a_target_language_forces_a_short_utterance_through_cleanup():
+    """Otherwise "short_and_clean" pastes it in the language it was spoken
+    in, silently ignoring the setting."""
+    engine = _language_engine(target="mr")
+    assert _skip(engine, _transcript("Meet me at noon"), language="en", target="mr") == ""
+
+
+def test_a_short_utterance_still_skips_when_nothing_is_being_translated():
+    engine = _language_engine()
+    assert _skip(engine, _transcript("Meet me at noon"), language="en") == "short_and_clean"
+
+
+def test_an_unconfident_transcript_is_never_translated():
+    """Rewriting shaky words in the same language is recoverable; rendering
+    them into a language the user cannot read back is not."""
+    engine = _language_engine(target="hi")
+    shaky = _transcript("mumble", confident=False)
+    assert _skip(engine, shaky, language="en", target="hi") == "language_uncertain"
+
+
+def test_the_uncertainty_check_outranks_the_correction_override():
+    """A self-correction normally forces cleanup through even when Whisper is
+    unsure. That override must not also authorise a translation."""
+    from sway.corrections import scan as scan_corrections
+    from sway.profiles import CleanupStyle
+
+    engine = _language_engine(target="hi")
+    correction = scan_corrections("the meeting is at 7, no, at 8")
+    assert correction.detected, "fixture must actually contain a correction"
+    reason = engine._cleanup_skip_reason(
+        _transcript(correction.text, confident=False),
+        CleanupStyle.CASUAL,
+        correction,
+        (),
+        language="en",
+        target_language="hi",
+    )
+    assert reason == "language_uncertain"
+
+
+def test_a_verbatim_profile_is_never_translated():
+    """A terminal or code editor gets the words as transcribed, whatever the
+    output language says. Silently translating a shell command is the worst
+    outcome in the matrix."""
+    from sway.profiles import CleanupStyle
+
+    engine = _language_engine(target="mr")
+    reason = _skip(
+        engine,
+        _transcript("git commit --amend"),
+        style=CleanupStyle.VERBATIM,
+        language="en",
+        target="mr",
+    )
+    assert reason == "verbatim_profile"
+
+
+def test_a_same_script_session_prior_beats_whispers_label():
+    """Whisper reports every Marathi utterance as Hindi -- it cannot tell the
+    two apart at all. Once the session knows the difference, that knowledge
+    has to survive contact with the next transcription, or the model's own
+    verdict is recorded and then ignored forever."""
+    engine = _language_engine(history=("mr", "mr"))
+    assert engine._language_for_transcript(_transcript(language="hindi")) == "mr"
+
+
+def test_a_cross_script_label_still_beats_the_session():
+    """Whisper is reliable across scripts, so a genuine switch must take
+    effect immediately rather than being held back by history."""
+    engine = _language_engine(history=("mr", "mr"))
+    assert engine._language_for_transcript(_transcript(language="english")) == "en"
+
+
+def test_the_session_prior_does_not_invent_a_language():
+    engine = _language_engine()
+    assert engine._language_for_transcript(_transcript(language=None)) is None
+
+
+# -- the language popover ---------------------------------------------------
+
+
+def _popover(language=None, target=None, opener="_open_language_popover"):
+    captured = {}
+    engine = Engine.__new__(Engine)
+    engine._settings = SimpleNamespace(
+        get=lambda: SimpleNamespace(language=language, target_language=target)
+    )
+    engine._bar = SimpleNamespace(
+        open_popover=lambda anchor, items, width=0: captured.update(
+            anchor=anchor, items=items, width=width
+        )
+    )
+    getattr(engine, opener)()
+    return captured
+
+
+def test_the_language_popover_offers_marathi():
+    actions = [item.action for item in _popover()["items"]]
+    assert "lang:mr" in actions
+
+
+def test_the_output_language_is_a_drill_down_not_a_second_list():
+    """Both lists inline came to 27 rows -- taller than the screen the
+    popover has to open on. The row shows the current value so the drill-down
+    still answers the question without being opened."""
+    items = _popover(target="hi")["items"]
+    assert sum(1 for item in items if item.action.startswith("target:")) == 0
+    row = next(item for item in items if item.action == Engine._ACTION_TARGET_MENU)
+    assert row.submenu and row.detail == "हिन्दी"
+
+
+def test_the_drill_down_row_reads_same_as_spoken_by_default():
+    items = _popover()["items"]
+    row = next(item for item in items if item.action == Engine._ACTION_TARGET_MENU)
+    assert row.detail == "Same as spoken"
+
+
+def test_the_target_popover_leads_with_same_as_spoken_and_can_go_back():
+    items = _popover(opener="_open_target_popover")["items"]
+    assert items[0].label == "Back"
+    same_as_spoken = next(item for item in items if item.action == "target:")
+    assert same_as_spoken.checked, "the default must show as the current value"
+
+
+@pytest.mark.parametrize(
+    "opener", ["_open_language_popover", "_open_target_popover"]
+)
+def test_neither_popover_is_taller_than_a_laptop_screen(opener):
+    """A popover taller than the display opens off-screen and cannot be
+    used. 864px is a common laptop height; leave room for the bar itself."""
+    from sway.bar import render_menu
+
+    rendered = render_menu(_popover(language="mr", target="hi", opener=opener)["items"])
+    image = rendered[0] if isinstance(rendered, tuple) else rendered
+    assert image.size[1] < 800
+
+
+# -- the accurate-STT retry -------------------------------------------------
+#
+# The Auto-mode recovery path. Turbo reported one speaker's Marathi as
+# english, then indonesian, then arabic, then urdu -- each one confidently,
+# and each one pasted. These pin when the full model gets a second look.
+
+
+def _retry_engine(*, language=None, history=(), submitted=None):
+    from concurrent.futures import Future
+
+    engine = _language_engine(language=language, history=history)
+
+    def submit(coro):
+        coro.close()  # never actually awaited in these tests
+        future: Future = Future()
+        future.set_result(submitted)
+        return future
+
+    engine._network = SimpleNamespace(submit=submit)
+    engine._groq = SimpleNamespace(transcribe=lambda *a, **k: _Coro())
+    return engine
+
+
+class _Coro:
+    """A stand-in for the coroutine GroqClient.transcribe returns."""
+
+    def close(self):
+        return None
+
+
+def _result(text="x", language=None, *, confident=True):
+    from sway.groq_client import TranscriptionResult
+
+    return TranscriptionResult(
+        text=text,
+        language=language,
+        avg_logprob=0.0 if confident else -2.0,
+    )
+
+
+def _retry(engine, result, speech_ms=2000.0):
+    return engine._retry_on_accurate_stt(
+        result, b"flac", prompt_bias="", used_model="whisper-large-v3-turbo",
+        speech_ms=speech_ms,
+    )
+
+
+def test_an_unsupported_detected_language_triggers_a_retry():
+    """Whisper naming a language Sway has no profile for is evidence the
+    detection is junk, not a fact about the speaker. This is the exact
+    failure that pasted Urdu for a Marathi speaker."""
+    better = _result("मला घरी जायचं आहे", "marathi")
+    engine = _retry_engine(submitted=better)
+    assert _retry(engine, _result("ملاع ادعاء", "urdu")) is better
+
+
+def test_a_known_hard_language_triggers_a_retry():
+    better = _result("मला घरी जायचं आहे", "marathi")
+    engine = _retry_engine(submitted=better)
+    assert _retry(engine, _result("मला घरी", "hindi")) is better
+
+
+def test_a_low_confidence_decode_triggers_a_retry():
+    better = _result("clearer text", "english")
+    engine = _retry_engine(submitted=better)
+    assert _retry(engine, _result("mush", "english", confident=False)) is better
+
+
+def test_a_confident_supported_language_is_left_alone():
+    """The common case must not pay for a second transcription."""
+    engine = _retry_engine(submitted=_result("other", "english"))
+    assert _retry(engine, _result("hello there", "english")) is None
+
+
+def test_an_explicit_language_setting_suppresses_the_retry():
+    """The user already said what they speak; the first call used the right
+    model and hint, so a second one buys nothing."""
+    engine = _retry_engine(language="mr", submitted=_result("other", "marathi"))
+    assert _retry(engine, _result("मला", "hindi")) is None
+
+
+def test_a_long_clip_is_not_retried():
+    """A second full transcription of a long clip costs more than the error
+    it fixes, and doubles the spend against a daily audio quota."""
+    engine = _retry_engine(submitted=_result("other", "marathi"))
+    assert _retry(engine, _result("x", "urdu"), speech_ms=9000.0) is None
+
+
+def test_the_retry_hints_the_session_language_when_detection_is_junk():
+    """Nothing in the response can be trusted, so the best available hint is
+    what the last few dictations actually were."""
+    captured = {}
+    engine = _retry_engine(history=("mr", "mr"), submitted=_result("ok", "marathi"))
+    engine._groq = SimpleNamespace(
+        transcribe=lambda *a, **k: (captured.update(k), _Coro())[1]
+    )
+    _retry(engine, _result("ملاع", "urdu"))
+    assert captured["language"] == "mr"
+    assert captured["model"].endswith("large-v3")
+
+
+def test_an_empty_retry_result_keeps_the_original():
+    engine = _retry_engine(submitted=_result("   ", "marathi"))
+    assert _retry(engine, _result("something", "urdu")) is None

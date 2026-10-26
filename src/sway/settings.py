@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from sway import languages
 from sway.hotkey import BindingError, parse_binding
 from sway.transforms import (
     DEFAULT_TRANSFORMS,
@@ -79,34 +80,14 @@ CLEANUP_STYLES = ("casual", "formal", "verbatim")
 #:
 #: ``None`` -- auto-detect -- leads, because it is both the default and the
 #: right answer for anyone who has not thought about it.
-LANGUAGES: tuple[tuple[str | None, str], ...] = (
-    (None, "Auto-detect"),
-    ("en", "English"),
-    ("hi", "हिन्दी"),
-    ("es", "Español"),
-    ("fr", "Français"),
-    ("de", "Deutsch"),
-    ("pt", "Português"),
-    ("it", "Italiano"),
-    ("nl", "Nederlands"),
-    ("ja", "日本語"),
-    ("zh", "中文"),
-)
+#:
+#: Both of these now derive from :mod:`sway.languages`, the single catalogue.
+#: They stay here as names because the bar and the engine already import them
+#: from this module, and because a language shortlist is a settings concern
+#: even when the data behind it is not.
+LANGUAGES: tuple[tuple[str | None, str], ...] = languages.shortlist()
 
-
-def language_label(code: str | None) -> str:
-    """The display name for a Whisper language code.
-
-    Falls back to the code itself upper-cased, so a language configured
-    outside :data:`LANGUAGES` renders as ``SV`` rather than as blank or as a
-    wrong name.
-    """
-    if not code:
-        return "Auto-detect"
-    for known, label in LANGUAGES:
-        if known == code:
-            return label
-    return code.upper()
+language_label = languages.label
 
 #: How hard the self-correction pass looks. Mirrors
 #: :data:`sway.corrections.MODES` without importing it, for the same reason
@@ -228,6 +209,14 @@ class Settings:
     audio_device: str | None = None
     #: Dictation language hint passed to Whisper. ``None`` = auto-detect.
     language: str | None = None
+    #: The language the pasted text should end up in. ``None`` -- the default
+    #: and the behaviour Sway shipped with -- means "whatever I spoke", which
+    #: is not a translation at all. A code here is an explicit request to
+    #: translate, and is the only thing permitted to relax cleanup's
+    #: never-translate guardrail (see :class:`sway.cleanup.LanguageIntent`).
+    #: Kept separate from :attr:`language`: that one is an *input* hint for
+    #: Whisper and means something entirely different.
+    target_language: str | None = None
     #: Where the pill sits. Must be one of :data:`OVERLAY_POSITIONS`.
     overlay_position: str = "top-center"
     #: Whether the app registers itself in the per-user Run key.
@@ -542,6 +531,7 @@ _KNOWN_KEYS = {
     "hands_free_double_tap",
     "audio_device",
     "language",
+    "target_language",
     "overlay_position",
     "launch_at_login",
     "history_retention_days",
@@ -652,6 +642,14 @@ def parse(raw: Any) -> Settings:
         ),
         audio_device=_as_optional_str(raw.get("audio_device"), name="audio_device"),
         language=_as_optional_str(raw.get("language"), name="language", max_chars=32),
+        # Normalised against the catalogue, unlike `language`. An unknown
+        # input hint is harmless -- Whisper either accepts it or ignores it --
+        # but an unknown *target* has no script to verify the output against,
+        # so it is dropped to None (no translation) rather than silently
+        # disabling the guardrail.
+        target_language=languages.normalize(
+            _as_optional_str(raw.get("target_language"), name="target_language", max_chars=32)
+        ),
         overlay_position=position,
         launch_at_login=_as_bool(
             raw.get("launch_at_login", DEFAULTS.launch_at_login),
@@ -726,6 +724,7 @@ def to_dict(settings: Settings) -> dict[str, Any]:
         "hands_free_double_tap": settings.hands_free_double_tap,
         "audio_device": settings.audio_device,
         "language": settings.language,
+        "target_language": settings.target_language,
         "overlay_position": settings.overlay_position,
         "launch_at_login": settings.launch_at_login,
         "history_retention_days": settings.history_retention_days,

@@ -109,6 +109,19 @@ def test_settings_payload_shape(server):
     assert "settings" in body and "triggers" in body
 
 
+def test_settings_serves_the_language_catalogue(server):
+    """app.js used to hold its own hardcoded language list, which had already
+    drifted from the bar's. Serving it is what stops that recurring."""
+    from sway import languages
+
+    _, body = get(server, "/api/settings")
+    assert [row["code"] for row in body["languages"]] == [
+        lang.code for lang in languages.CATALOGUE if lang.in_shortlist
+    ]
+    assert "mr" in [row["code"] for row in body["languages"]]
+    assert all({"code", "label", "endonym"} == set(row) for row in body["languages"])
+
+
 def test_settings_never_reveals_the_key(server):
     """The masked value is the only form of the key that may cross this line."""
     _, body = get(server, "/api/settings")

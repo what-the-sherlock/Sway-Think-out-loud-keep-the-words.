@@ -505,3 +505,51 @@ def test_an_explicit_false_beats_the_shipped_default(tmp_path):
         encoding="utf-8",
     )
     assert SettingsStore(path).load().transforms[0].allows_markdown is False
+
+
+# -- the output language ----------------------------------------------------
+
+
+def test_target_language_defaults_to_none():
+    """None means "whatever I spoke", which is not a translation and is what
+    every existing user is already on."""
+    assert DEFAULTS.target_language is None
+    assert parse({}).target_language is None
+
+
+def test_target_language_is_normalised_against_the_catalogue():
+    assert parse({"target_language": "Hindi"}).target_language == "hi"
+    assert parse({"target_language": "MR"}).target_language == "mr"
+
+
+def test_an_unresolvable_target_language_is_dropped():
+    """An input hint Whisper does not know is harmless -- it is ignored. An
+    unknown *target* has no script for the guardrail to verify against, so
+    honouring it would disable the check rather than enable a feature."""
+    assert parse({"target_language": "klingon"}).target_language is None
+    assert parse({"target_language": "   "}).target_language is None
+
+
+def test_target_language_round_trips():
+    settings = parse({"language": "en", "target_language": "mr"})
+    restored = parse(to_dict(settings))
+    assert restored.target_language == "mr"
+    assert restored.language == "en"
+    assert restored.unknown == {}
+
+
+def test_target_language_is_separate_from_the_whisper_hint():
+    """They mean opposite things: one is what goes in, one is what comes out.
+    Overloading a single field would send the output language to Whisper."""
+    settings = parse({"language": "en", "target_language": "hi"})
+    assert settings.language == "en"
+    assert settings.target_language == "hi"
+
+
+def test_the_output_language_never_reaches_whispers_input_hint(make_config):
+    """apply_to_config maps settings onto GroqConfig, whose `language` is the
+    language Whisper is told to *expect*. Leaking the target there would ask
+    Whisper to transcribe English audio as Hindi."""
+    config = make_config()
+    result = apply_to_config(config, Settings(target_language="hi"))
+    assert result.groq.language is config.groq.language

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from sway.analytics import DEFAULT_TYPING_WPM, time_saved_seconds
+from sway.cleanup import guardrail_family
 from sway.errors import SwayError
 
 logger = logging.getLogger(__name__)
@@ -547,6 +548,7 @@ class DashboardQueries:
                 "latency": _empty_latency(),
                 "stages": [],
                 "errors": [],
+                "guardrails": [],
             }
         where, params = _time_window("started_at", since, None)
         all_rows = self._select(
@@ -567,6 +569,22 @@ class DashboardQueries:
         for row in rows:
             if not row["ok"] and row["error"]:
                 errors[row["error"]] = errors.get(row["error"], 0) + 1
+
+        # Tallied over all_rows, not rows: a blocked guardrail run is
+        # annotated `skipped` (see Engine._run_command) precisely so it stops
+        # counting as a request above -- counting this over `rows` instead
+        # would silently report zero for exactly the runs this exists to
+        # surface. Bucketed by family (see sway.cleanup.guardrail_family) so
+        # e.g. "lost_entity:200" and "lost_entity:450" collapse into one
+        # "lost_entity" row instead of one row per dropped value.
+        guardrails: dict[str, int] = {}
+        for row in all_rows:
+            meta = _metadata_dict(row["metadata"])
+            for key in ("cleanup_guardrail_reason", "command_guardrail_reason"):
+                token = str(meta.get(key) or "")
+                if token:
+                    family = guardrail_family(token)
+                    guardrails[family] = guardrails.get(family, 0) + 1
 
         return {
             "total": len(rows),
@@ -594,6 +612,11 @@ class DashboardQueries:
             ],
             "errors": sorted(
                 ({"error": name, "count": count} for name, count in errors.items()),
+                key=lambda item: item["count"],
+                reverse=True,
+            ),
+            "guardrails": sorted(
+                ({"reason": name, "count": count} for name, count in guardrails.items()),
                 key=lambda item: item["count"],
                 reverse=True,
             ),

@@ -22,7 +22,9 @@ import re
 import threading
 import unicodedata
 from dataclasses import dataclass
+from enum import StrEnum
 
+from sway import languages
 from sway.profiles import CleanupStyle
 
 logger = logging.getLogger(__name__)
@@ -125,12 +127,108 @@ KEEP_FILLERS_DIRECTIVE = (
 )
 
 
+#: Appended when the user has chosen an explicit output language. Phrased as
+#: an exception, exactly like KEEP_FILLERS_DIRECTIVE, so _SHARED_RULES' "Never
+#: translate" is never edited: the default stays strict for every user who has
+#: not asked for translation, and the cacheable style prefix stays intact.
+TRANSLATE_DIRECTIVE = (
+    " Exception to the \"never translate\" rule above, and only to that rule: "
+    "the user has explicitly asked for the output in {name}. Write the entire "
+    "reply in {name}, in {script}. This is still a rewrite, not a reply: never "
+    "answer the content, never add commentary, and keep the speaker's meaning, "
+    "specifics, and intent exactly."
+)
+
+#: Appended for an Indic language when no translation was asked for. Measured
+#: behaviour without it: romanized Hinglish ("mujhe kal office jaana hai") is
+#: silently converted into Devanagari. That is a rewrite nobody requested --
+#: the speaker chose a script by typing in it, and a dictation tool changing
+#: it is the same class of error as translating.
+PRESERVE_SCRIPT_DIRECTIVE = (
+    " Keep the transcript in the script it is already written in. If it is "
+    "in Latin letters, reply in Latin letters; if it is in the local script, "
+    "reply in the local script. Never transliterate between the two."
+)
+
+#: Appended when the caller wants the model's own read on what language was
+#: spoken. Whisper's audio-side detection cannot tell Hindi from Marathi -- it
+#: labels Marathi as Hindi -- and is close to random under about two seconds
+#: of speech, while the model reading the actual text gets both right. Asking
+#: for it here costs ~12 output tokens on a call already being made, rather
+#: than a second round trip the latency budget cannot afford.
+LANGUAGE_HEADER_DIRECTIVE = (
+    " Before the rewritten text, output exactly one header line of the form "
+    "#lang: <iso639-1> mixed=<iso639-1 or none> conf=<high|low>\n"
+    "naming the language the transcript is actually in, any second language "
+    "mixed into it, and your confidence. Then output the rewritten text on "
+    "the following lines. Output nothing else."
+)
+
+#: A model asked for the header emits it on line one; everything after is the
+#: rewrite. Deliberately strict -- a malformed header is treated as no header
+#: at all and the whole output is kept as body, so a model that ignores the
+#: instruction degrades to exactly the pre-header behaviour.
+_LANGUAGE_HEADER_PATTERN = re.compile(
+    r"^[ \t]*#lang:[ \t]*(?P<lang>[a-zA-Z]{2,3})"
+    r"(?:[ \t]+mixed=(?P<mixed>[a-zA-Z]{2,3}|none))?"
+    r"(?:[ \t]+conf=(?P<conf>high|low))?"
+    r"[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LanguageVerdict:
+    """What the cleanup model reported about the transcript's language.
+
+    ``code`` is ``None`` when no header was emitted or it was malformed,
+    which is the same state as "we never asked" -- callers must treat it as
+    no information rather than as a negative finding.
+    """
+
+    code: str | None = None
+    mixed: str | None = None
+    confident: bool = True
+
+
+NO_LANGUAGE_VERDICT = LanguageVerdict()
+
+
+def parse_language_header(raw: str) -> tuple[LanguageVerdict, str]:
+    """Split a leading ``#lang:`` header off the model's output.
+
+    Returns the verdict and the remaining body. When there is no valid header
+    the verdict is :data:`NO_LANGUAGE_VERDICT` and the body is ``raw``
+    unchanged, so this is safe to call on output from a prompt that never
+    requested a header.
+    """
+    if not raw:
+        return NO_LANGUAGE_VERDICT, raw
+    match = _LANGUAGE_HEADER_PATTERN.match(raw)
+    if match is None:
+        return NO_LANGUAGE_VERDICT, raw
+    mixed_raw = match.group("mixed")
+    verdict = LanguageVerdict(
+        code=languages.normalize(match.group("lang")),
+        mixed=(
+            None
+            if not mixed_raw or mixed_raw.lower() == "none"
+            else languages.normalize(mixed_raw)
+        ),
+        confident=(match.group("conf") or "high").lower() == "high",
+    )
+    return verdict, raw[match.end() :]
+
+
 def system_prompt_for_style(
     style: CleanupStyle,
     *,
     language: str | None = None,
     correction: bool = False,
     remove_fillers: bool = True,
+    register: str = "",
+    target_language: str | None = None,
+    emit_language_header: bool = False,
 ) -> str:
     """The cleanup system prompt for a profile style, optionally pinned to the
     language Whisper detected.
@@ -149,45 +247,62 @@ def system_prompt_for_style(
     detected language) leaves the prompt language-agnostic rather than
     guessing English, so a mixed-language or undetected utterance is not
     pushed toward any one language.
+
+    ``register`` is :attr:`sway.languages.Language.register_hint` -- what
+    makes Hindi and Marathi output read as something a person typed rather
+    than as a textbook translation. ``target_language`` switches the prompt
+    from "keep the speaker's language" to "write in this one"; it is the only
+    thing that may override ``_SHARED_RULES``' never-translate clause, and it
+    comes from a stored user setting, never from the transcript.
+
+    Every new parameter is falsy by default, so a caller that passes none of
+    them gets a byte-identical prompt to the one this function has always
+    returned -- and the cacheable prefix is untouched in every branch.
     """
     prompt = _PROMPT_BY_STYLE.get(style, CLEANUP_SYSTEM_PROMPT)
-    if language:
+    target = languages.get(target_language)
+    if target is not None:
+        prompt += TRANSLATE_DIRECTIVE.format(
+            name=target.english_name,
+            script=_script_phrase(target),
+        )
+    elif language:
         prompt += (
             f" The transcript's primary language is {language}; reply in "
             f"{language}, preserving any other language the speaker used."
         )
+    if register:
+        prompt += " " + register
+        if target is None:
+            # Only when nothing is being translated: an explicit target has
+            # already named the script it wants, and these two would fight.
+            prompt += PRESERVE_SCRIPT_DIRECTIVE
     if not remove_fillers:
         prompt += KEEP_FILLERS_DIRECTIVE
     if correction:
         prompt += CORRECTION_DIRECTIVE
+    if emit_language_header:
+        prompt += LANGUAGE_HEADER_DIRECTIVE
     return prompt
 
 
-#: Per-language disfluency word lists, keyed by the lowercase language name
-#: flow.groq_client.TranscriptionResult.language reports (Whisper's
-#: verbose_json "language" field, e.g. "english", "spanish"). Each list is
-#: the same kind of short, high-precision filler set as the original
-#: English one -- deliberately excludes words frequently used sincerely
-#: (the German "also", used both as a filler and as "so"/"therefore", is a
-#: known imprecise case; the alternative of dropping it loses most of the
-#: signal for that language) so the heuristic doesn't fire on almost every
-#: transcript and defeat the point of skipping the LLM.
-_FILLER_WORDS_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
-    "english": ("um+", "uh+", "erm+", "hmm+", "you know", "i mean", "sort of", "kind of"),
-    "spanish": ("eh+", "este\\.\\.\\.", "o sea", "bueno", "pues", "digamos"),
-    "french": ("euh+", "en fait", "tu vois", "bah", "quoi"),
-    "german": ("äh+", "ähm+", "sozusagen", "halt"),
-    "portuguese": ("é+", "então\\.\\.\\.", "tipo assim", "quer dizer"),
-    "italian": ("ehm+", "cioè", "insomma", "diciamo"),
-    "dutch": ("uh+", "eh+", "zeg maar", "eigenlijk"),
-    "russian": ("ну", "типа", "короче"),
-    "hindi": ("मतलब", "यानी", "वो ना", "क्या कहते हैं"),
-}
+def _script_phrase(language: languages.Language) -> str:
+    """How to name a language's script in a prompt.
 
-_FILLER_PATTERNS_BY_LANGUAGE: dict[str, re.Pattern[str]] = {
-    language: re.compile(r"\b(" + "|".join(words) + r")\b", re.IGNORECASE)
-    for language, words in _FILLER_WORDS_BY_LANGUAGE.items()
-}
+    Spelled out because the measured failure of an unpinned target is the
+    model answering in romanized Latin -- "Kal subah ki meeting" instead of
+    Devanagari -- which reads as broken rather than as translated.
+    """
+    return " and ".join(part.title() for part in sorted(language.scripts)) + " script"
+
+
+#: Per-language disfluency word lists now live in :mod:`sway.languages`
+#: alongside everything else that varies by language. Each list is short and
+#: high-precision -- deliberately excluding words frequently used sincerely
+#: (the German "also", used both as a filler and as "so"/"therefore", is a
+#: known imprecise case; dropping it loses most of the signal for that
+#: language) so the heuristic doesn't fire on almost every transcript and
+#: defeat the point of skipping the LLM.
 
 #: Immediate word repetition ("I I want", "the the store") is a common
 #: self-correction signature that survives into Whisper's output, in any
@@ -219,16 +334,17 @@ def has_filler_markers(text: str, *, language: str | None = None) -> bool:
     """True if the transcript shows disfluency: filler words, an immediate
     word repetition, an explicit self-correction, or a dash-marked false start.
 
-    ``language`` is the lowercase language name Whisper detected (see
-    :class:`~flow.groq_client.TranscriptionResult`). ``None`` (undetected,
-    e.g. an older cached result) is treated as English, the historical
-    default. A *known* language we have no filler word list for skips the
-    word-list check rather than matching English words against it -- that
-    would never fire and would silently understate disfluency in every
-    language we haven't catalogued instead of just the ones we haven't; the
-    structural checks below still apply regardless of language.
+    ``language`` is either the lowercase name Whisper detected (see
+    :class:`~flow.groq_client.TranscriptionResult`) or an ISO-639-1 code --
+    :func:`sway.languages.normalize` accepts both. ``None`` (undetected, e.g.
+    an older cached result) is treated as English, the historical default. A
+    *known* language we have no filler word list for skips the word-list
+    check rather than matching English words against it -- that would never
+    fire and would silently understate disfluency in every language we
+    haven't catalogued instead of just the ones we haven't; the structural
+    checks below still apply regardless of language.
     """
-    pattern = _FILLER_PATTERNS_BY_LANGUAGE.get(language or "english")
+    pattern = languages.filler_pattern(language or "en")
     if pattern is not None and pattern.search(text):
         return True
     if _REPEATED_WORD_PATTERN.search(text):
@@ -244,8 +360,15 @@ def should_skip_cleanup(text: str, *, language: str | None = None, min_words: in
     CLAUDE.md's Phase 2 heuristic -- under ``min_words`` words and no filler
     markers means there is nothing worth spending a cleanup call on. See
     :func:`has_filler_markers` for how ``language`` affects the filler check.
+
+    ``min_words`` is calibrated in English words and scaled per language by
+    :func:`sway.languages.scaled_min_words`. Without that, the threshold
+    skipped cleanup for essentially every Hindi and Marathi dictation: those
+    languages carry the same meaning in roughly two thirds as many
+    whitespace tokens, so a typical utterance sat under the English bar.
     """
-    return word_count(text) < min_words and not has_filler_markers(text, language=language)
+    threshold = languages.scaled_min_words(min_words, language)
+    return word_count(text) < threshold and not has_filler_markers(text, language=language)
 
 
 #: Below this many milliseconds of speech per word, the audio physically
@@ -373,6 +496,66 @@ _LENGTHENING_ABSOLUTE_WORD_GROWTH = 400
 
 
 @dataclass(frozen=True, slots=True)
+class LanguageIntent:
+    """The script change the user explicitly asked for, if any.
+
+    Deliberately *not* a field on :class:`OutputExpectation`. That class is
+    built from a transform's own checkboxes, and the rule that no instruction
+    may switch off the language check (see its docstring) holds literally: a
+    transform cannot construct one of these. Only the dictation path can, and
+    only from a stored user setting -- which is what keeps ADR-008's principle
+    intact. The relaxation derives from persisted user intent, never from
+    anything a model or a prompt can reach.
+
+    The default reproduces the pre-multilingual behaviour exactly, so every
+    existing caller and every existing test is unaffected.
+
+    With a target set, the check does not merely step aside -- it *inverts and
+    tightens*. Instead of "no script may disappear" it becomes "the output
+    must be in the target's script, and every script present must be
+    accounted for", which additionally catches the model drifting into
+    romanized Latin, a failure the original check could not see at all.
+    """
+
+    #: Scripts the transcript was spoken in; they may legitimately survive
+    #: into a translation (a quoted proper noun, a code identifier).
+    source_scripts: frozenset[str] = frozenset()
+    #: Scripts a correct output may be written in.
+    target_scripts: frozenset[str] = frozenset()
+    #: Scripts the target language routinely borrows -- English loanwords in
+    #: Latin for Hindi and Marathi, which are *correct* output, not drift.
+    loanword_scripts: frozenset[str] = frozenset()
+    #: False for ordinary same-language cleanup, which keeps the original rule.
+    translating: bool = False
+
+
+NO_LANGUAGE_INTENT = LanguageIntent()
+
+
+def language_intent_for(
+    *, source: str | None, target: str | None
+) -> LanguageIntent:
+    """Build a :class:`LanguageIntent` from a spoken and a requested language.
+
+    Returns :data:`NO_LANGUAGE_INTENT` when there is no usable target or when
+    the target is the language already being spoken -- in both cases nothing
+    is being translated and the original guardrail is the correct one.
+    """
+    target_language = languages.get(target)
+    if target_language is None:
+        return NO_LANGUAGE_INTENT
+    source_code = languages.normalize(source)
+    if source_code == target_language.code:
+        return NO_LANGUAGE_INTENT
+    return LanguageIntent(
+        source_scripts=languages.scripts_for(source_code),
+        target_scripts=target_language.scripts,
+        loanword_scripts=target_language.loanword_scripts,
+        translating=True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class OutputExpectation:
     """What a rewrite is *allowed* to do, so a guardrail can tell a correct
     result apart from a model going off-script.
@@ -386,6 +569,12 @@ class OutputExpectation:
     check, the language check, or the answered-a-question check. Those catch
     the model doing something no instruction asked for -- going off-script --
     so no instruction may switch them off.
+
+    The language check has exactly one way to be varied, and it is not this
+    class: an explicit user-stored output language, passed separately as a
+    :class:`LanguageIntent`. A transform cannot construct one, so "no
+    instruction may switch it off" remains literally true; and even then the
+    check is replaced by a stricter one rather than dropped.
 
     The entity guard is different: it is tied to :attr:`may_shorten`
     (see :meth:`protects_entities`) rather than being unconditional, because
@@ -609,6 +798,7 @@ def is_cleanup_output_safe(
     retracted: str = "",
     correction_detected: bool = False,
     expectation: OutputExpectation = NO_EXPECTATION,
+    intent: LanguageIntent = NO_LANGUAGE_INTENT,
 ) -> bool:
     """Whether a cleanup rewrite may be pasted, or must be discarded in favor
     of the raw transcript.
@@ -656,6 +846,7 @@ def is_cleanup_output_safe(
         retracted=retracted,
         correction_detected=correction_detected,
         expectation=expectation,
+        intent=intent,
     )
 
 
@@ -666,6 +857,7 @@ def unsafe_reason(
     retracted: str = "",
     correction_detected: bool = False,
     expectation: OutputExpectation = NO_EXPECTATION,
+    intent: LanguageIntent = NO_LANGUAGE_INTENT,
 ) -> str:
     """A short label for *why* a rewrite must be rejected, for the latency
     record and the log line. Returns ``""`` when the rewrite is safe.
@@ -704,10 +896,21 @@ def unsafe_reason(
     if _answered_instead_of_rewriting(original, text):
         return "answered_question"
 
+    if intent.translating:
+        # The user asked for a different language, so "a script disappeared"
+        # is the *point*. Check what was actually asked for instead, which is
+        # a stricter test than the one it replaces: the target script must be
+        # present, and anything else must be explainable.
+        produced = _scripts(text)
+        if intent.target_scripts and not (produced & intent.target_scripts):
+            return "wrong_target_language"
+        stray = produced - intent.target_scripts - intent.source_scripts - intent.loanword_scripts
+        if stray:
+            return "unexpected_script"
     # A script present in the speech but absent from the rewrite means the
     # model translated it away. The reverse (a new script appearing) is left
     # alone: that is usually just a quotation mark or symbol classified oddly.
-    if _scripts(original) - _scripts(text):
+    elif _scripts(original) - _scripts(text):
         return "language_changed"
 
     missing = (
@@ -718,6 +921,144 @@ def unsafe_reason(
     if missing:
         return f"lost_entity:{sorted(missing)[0][:32]}"
     return ""
+
+
+def guardrail_family(reason: str) -> str:
+    """The bucket a reason token belongs to.
+
+    Collapses ``lost_entity:X`` variants -- one per dropped entity -- into a
+    single ``"lost_entity"`` family, so a tally of guardrail trips (see the
+    dashboard's Performance view) never grows a row per number the model
+    happened to drop; every other token is already its own family.
+    """
+    return reason.split(":", 1)[0]
+
+
+#: Plain-English renderings of each :func:`unsafe_reason` token, for a human
+#: deciding whether to Apply a reviewed rewrite. Two rules shape every entry:
+#: never blame the transform's own settings (a user cannot predict that an
+#: indented "- " line counts as markdown -- that is exactly the failure this
+#: module exists to stop being silent about), and never claim the result is
+#: *wrong* -- only that it is worth a look before Apply. Keyed by family
+#: (see :func:`guardrail_family`), so ``"lost_entity"`` covers every dropped
+#: entity via the ``{value}`` placeholder filled in by :func:`advisory_note`.
+_ADVISORY_NOTES: dict[str, str] = {
+    "empty": "The model returned nothing.",
+    "shrank": "This is much shorter than the text you selected — check nothing was dropped.",
+    "grew": "This is much longer than the text you selected — check nothing was invented.",
+    "assistant_voice": "This starts as a reply to you rather than as a rewrite of your text.",
+    "markdown": "This added list or heading formatting that wasn't in your text.",
+    "answered_question": "This reads as an answer to your text rather than a rewrite of it.",
+    "language_changed": (
+        "This dropped a script your text was written in — it may have been translated."
+    ),
+    "wrong_target_language": (
+        "This isn't in the language you asked for — the model may have ignored the request."
+    ),
+    "unexpected_script": (
+        "This contains a writing system neither your text nor your chosen language uses."
+    ),
+    "lost_entity": 'This dropped "{value}" from your text.',
+}
+
+#: A future guardrail token must never render a blank note -- see
+#: :func:`advisory_note`.
+_ADVISORY_FALLBACK = "Something about this result looked unusual — read it before applying."
+
+
+def advisory_note(reason: str) -> str:
+    """A plain-English rendering of ``reason`` (an :func:`unsafe_reason`
+    token) for a review panel. ``""`` exactly when ``reason`` is.
+
+    Falls back to :data:`_ADVISORY_FALLBACK` for any token not in
+    :data:`_ADVISORY_NOTES`, so a guardrail added later can never surface a
+    blank note -- see ``test_every_reason_token_has_an_advisory_note``.
+    """
+    if not reason:
+        return ""
+    family = guardrail_family(reason)
+    if family == "lost_entity":
+        return _ADVISORY_NOTES["lost_entity"].format(value=reason.partition(":")[2])
+    return _ADVISORY_NOTES.get(family, _ADVISORY_FALLBACK)
+
+
+class GuardrailMode(StrEnum):
+    """How a guardrail trip is handled, chosen by whether a human reviews
+    the rewrite before it reaches the document -- never by what the fired
+    instruction claims to do. See :func:`apply_guardrail`.
+    """
+
+    #: Nothing stands between this text and the document: dictation cleanup
+    #: and a mid-dictation phrase transform both paste on their own. A
+    #: tripped guardrail here discards the rewrite and falls back to the
+    #: original -- the behaviour :func:`unsafe_reason` has always driven.
+    GATE = "gate"
+    #: A human sees the rewrite in the review panel and clicks Apply
+    #: themselves -- every path through the transform/command pipeline. A
+    #: tripped guardrail here is a note for that human, not a veto: only a
+    #: genuinely empty response leaves nothing to show them.
+    ADVISORY = "advisory"
+
+
+@dataclass(frozen=True, slots=True)
+class GuardrailOutcome:
+    """What :func:`apply_guardrail` decided, and why."""
+
+    #: What the caller should use downstream: ``candidate`` unless
+    #: :attr:`blocked`, in which case ``original``.
+    text: str
+    #: The raw :func:`unsafe_reason` token; ``""`` when the rewrite was clean.
+    reason: str
+    #: Whether :attr:`text` fell back to the original.
+    blocked: bool
+    #: :func:`advisory_note` of :attr:`reason` -- ``""`` exactly when
+    #: :attr:`reason` is.
+    note: str
+
+
+def apply_guardrail(
+    original: str,
+    candidate: str,
+    *,
+    mode: GuardrailMode,
+    retracted: str = "",
+    correction_detected: bool = False,
+    expectation: OutputExpectation = NO_EXPECTATION,
+    intent: LanguageIntent = NO_LANGUAGE_INTENT,
+) -> GuardrailOutcome:
+    """The one place a caller decides what a guardrail trip *means*.
+
+    :func:`unsafe_reason` is untouched and does exactly what it always did:
+    name what looks wrong. What changes here is what happens next, and that
+    is purely a function of ``mode`` -- never of the reason itself and never
+    of what the fired transform claims to do. Under
+    :attr:`GuardrailMode.GATE` every reason blocks, matching the auto-paste
+    behaviour this module has always had. Under
+    :attr:`GuardrailMode.ADVISORY` only ``"empty"`` blocks -- there is
+    nothing to show a human for an empty response -- and every other reason
+    becomes a note attached to a result that is still handed back for review.
+
+    Reports only the *first* reason :func:`unsafe_reason` finds, the same
+    way the gate always has. Collecting every tripped guardrail would mean
+    running the entity scan and the question-overlap check on every
+    dictation cleanup to make one review panel's note more complete -- a
+    cost paid on the hot path for a benefit that only exists on the cold one.
+    """
+    reason = unsafe_reason(
+        original,
+        candidate,
+        retracted=retracted,
+        correction_detected=correction_detected,
+        expectation=expectation,
+        intent=intent,
+    )
+    blocked = bool(reason) if mode is GuardrailMode.GATE else reason == "empty"
+    return GuardrailOutcome(
+        text=original if blocked else candidate,
+        reason=reason,
+        blocked=blocked,
+        note=advisory_note(reason),
+    )
 
 
 class CleanupStats:
@@ -776,12 +1117,26 @@ __all__ = [
     "CLEANUP_SYSTEM_PROMPT",
     "CORRECTION_DIRECTIVE",
     "KEEP_FILLERS_DIRECTIVE",
+    "PRESERVE_SCRIPT_DIRECTIVE",
+    "LANGUAGE_HEADER_DIRECTIVE",
+    "LanguageIntent",
+    "LanguageVerdict",
+    "NO_LANGUAGE_INTENT",
+    "NO_LANGUAGE_VERDICT",
+    "TRANSLATE_DIRECTIVE",
+    "language_intent_for",
+    "parse_language_header",
     "FORMAL_CLEANUP_SYSTEM_PROMPT",
     "MIN_MS_PER_WORD",
     "CleanupStats",
+    "GuardrailMode",
+    "GuardrailOutcome",
     "NO_EXPECTATION",
     "SPOKEN_COMMAND_EXPECTATION",
     "OutputExpectation",
+    "advisory_note",
+    "apply_guardrail",
+    "guardrail_family",
     "has_filler_markers",
     "is_cleanup_output_safe",
     "looks_hallucinated",

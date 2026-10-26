@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from sway.cleanup import unsafe_reason
+from sway.cleanup import GuardrailMode, apply_guardrail, unsafe_reason
 from sway.transforms import (
     DEFAULT_TRANSFORMS,
     Transform,
@@ -202,3 +202,53 @@ def test_a_shortcut_fired_email_survives_the_guardrails():
     )
     expectation = expectation_for([email])
     assert unsafe_reason(selected, model_output, expectation=expectation) == ""
+
+
+def test_shortcut_transform_rejection_becomes_advisory_under_review():
+    """The architecture, pinned as one assertion. Every test above shows the
+    guardrails as a hard gate -- exactly right for what they were checking:
+    plain dictation cleanup and a mid-dictation phrase transform, both of
+    which auto-paste with nobody looking (see Engine._request_cleanup). A
+    shortcut-fired transform never auto-pastes at all -- Engine._run_command
+    hands its result to a review panel and only an explicit Apply click
+    injects it (see Engine._present_transform_result) -- yet it was checked
+    at that same gate strength. That mismatch is the underlying bug this
+    file's other tests chase symptom by symptom: a correct result, thrown
+    away, with the model never given a second look and the user shown "No
+    usable result" for a rewrite they were never shown.
+
+    A real, reported case: a "Developer prompt" transform instructed to
+    write "plain text, no markdown syntax" produces an indented "- " list
+    like the one below -- something ``allows_markdown`` was never ticked
+    for because the user, correctly, does not think of this as markdown.
+    GATE (what unsafe_reason alone, and every test above, checks) rejects
+    it outright. ADVISORY -- what Engine._run_command now actually uses,
+    since nothing on that path pastes without a human's Apply click --
+    keeps it, with a note, for that human to judge.
+    """
+    developer_prompt = Transform(
+        id="developer_prompt_like",
+        name="Developer prompt",
+        instruction="Rewrite as a plain-text actionable prompt. No markdown syntax.",
+        may_lengthen=True,
+    )
+    original = "the export button is broken, please fix it"
+    model_output = (
+        "Fix the broken export button.\n\n"
+        "Unknown - establish first:\n"
+        "  - what specifically happens when it is clicked\n"
+        "  - whether this ever worked"
+    )
+    expectation = expectation_for([developer_prompt])
+    assert unsafe_reason(original, model_output, expectation=expectation) == "markdown"
+
+    gate = apply_guardrail(original, model_output, mode=GuardrailMode.GATE, expectation=expectation)
+    assert gate.blocked is True
+    assert gate.text == original
+
+    advisory = apply_guardrail(
+        original, model_output, mode=GuardrailMode.ADVISORY, expectation=expectation
+    )
+    assert advisory.blocked is False
+    assert advisory.text == model_output
+    assert advisory.note

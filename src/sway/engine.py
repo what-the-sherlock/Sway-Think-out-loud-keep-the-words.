@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
@@ -50,16 +51,24 @@ from sway.audio.flac import encode_flac
 from sway.audio.ring_buffer import RingBuffer
 from sway.audio.vad import VadTrimmer
 from sway.cleanup import (
+    NO_LANGUAGE_INTENT,
     SPOKEN_COMMAND_EXPECTATION,
     CleanupStats,
+    GuardrailMode,
+    LanguageIntent,
     OutputExpectation,
+    advisory_note,
+    apply_guardrail,
+    language_intent_for,
     looks_hallucinated,
     normalize_cleanup_output,
+    parse_language_header,
     should_skip_cleanup,
     system_prompt_for_style,
     unsafe_reason,
 )
 from sway.commands import COMMAND_SYSTEM_PROMPT, build_command_user_message
+from sway import languages
 from sway.config import Config
 from sway.config import _validate  # noqa: PLC2701 - deliberately re-validating a settings-merged config
 from sway.corrections import CorrectionScan
@@ -318,6 +327,20 @@ def _short_failure(exc: Exception) -> str:
     return "failed"
 
 
+#: How many recent language verdicts to keep. Three is enough to ride out a
+#: single misdetection without making a genuine language switch feel sticky.
+_LANGUAGE_HISTORY = 3
+
+#: Below this much speech, Whisper's own language label is discarded: measured
+#: misdetections on this pipeline are concentrated under roughly two seconds
+#: ("Hello" -> hindi, "Mayfair." -> korean, "Hallo" -> dutch).
+_LANGUAGE_MIN_SPEECH_MS = 2000.0
+
+#: A re-transcribe on the accurate model is only worth its round trip while
+#: the clip is short; past this, the retry costs more than the error.
+_STT_RETRY_MAX_SPEECH_MS = 4000.0
+
+
 @dataclass(frozen=True, slots=True)
 class _Transcript:
     """A raw transcript plus what Whisper reported about it (see
@@ -343,9 +366,12 @@ class _Transcript:
 
 @dataclass
 class PendingTransformResult:
-    """One shortcut-run transform's result, held between the review panel
-    opening and the user acting on it (Apply, Copy, Retry, Undo, or simply
-    dismissing it).
+    """One reviewed rewrite's result, held between the review panel opening
+    and the user acting on it (Apply, Copy, Retry, Undo, or simply
+    dismissing it). Every path through :meth:`Engine._run_command` --
+    a shortcut-fired transform or a spoken voice command alike -- lands
+    here; ``transform_id`` is ``""`` for a spoken command, which has no
+    stored :class:`~sway.transforms.Transform` to point at.
 
     Mutable (not frozen) on purpose: Retry replaces ``transformed`` in place
     for a panel that is already open, and Apply flips ``applied`` so a
@@ -359,6 +385,17 @@ class PendingTransformResult:
     instruction: str
     focused_process: str | None
     activation: Activation | None
+    #: What the rewrite was allowed to do, so Retry can re-check a fresh
+    #: response the same way the first attempt was checked -- a stored
+    #: transform recomputes this from its own flags, but a spoken command
+    #: has nothing to recompute it from.
+    expectation: OutputExpectation = SPOKEN_COMMAND_EXPECTATION
+    #: The :func:`~sway.cleanup.unsafe_reason` token this result tripped, if
+    #: any. Advisory here, never a veto -- nothing on this path reaches the
+    #: document without an explicit Apply, so a tripped guardrail is
+    #: rendered as a note (see :func:`~sway.cleanup.advisory_note`) rather
+    #: than discarding the result the way it would on an auto-paste path.
+    guardrail_reason: str = ""
     applied: bool = False
 
 
@@ -488,6 +525,16 @@ class Engine:
         self._release_time = 0.0
         self._focused_process: str | None = None
         self._stream_session: ChunkStreamer | None = None
+        # Recent high-confidence language verdicts, newest last. Whisper's own
+        # detection is close to random under about two seconds of speech
+        # ("Hello" has come back as Hindi, a proper noun as Korean), so a
+        # one-word utterance must not be allowed to pick the model or the
+        # prompt on its own. People rarely switch language between
+        # consecutive dictations, which makes the recent past a far better
+        # prior than a coin flip. Guarded by _language_lock because the bar
+        # thread reads it while a worker writes it.
+        self._language_history: deque[str] = deque(maxlen=_LANGUAGE_HISTORY)
+        self._language_lock = threading.Lock()
 
         self._command_press_time = 0.0
         self._command_start_frame = 0
@@ -973,7 +1020,7 @@ class Engine:
         self._start_level_pump()
         self._set_ui_state(BarState.RECORDING)
         self._stream_session = (
-            self._start_streaming(self._start_frame) if self._config.streaming.enabled else None
+            self._start_streaming(self._start_frame) if self._streaming_wanted() else None
         )
 
     def _on_release(self) -> None:
@@ -1100,7 +1147,10 @@ class Engine:
         prompt_bias = self._build_prompt_bias()
         return self._network.submit(
             self._groq.transcribe(
-                flac_bytes, language=self._config.groq.language, prompt=prompt_bias or None
+                flac_bytes,
+                language=self._config.groq.language,
+                prompt=prompt_bias or None,
+                model=self._stt_model_for(self._language_prior()),
             )
         )
 
@@ -1881,6 +1931,8 @@ class Engine:
             )
 
         prompt_bias = self._build_prompt_bias()
+        prior = self._language_prior()
+        stt_model = self._stt_model_for(prior)
         with run.stage(Stage.TRANSCRIBE):
             self._require_groq()
             # Opened here and closed from the network thread when Groq's
@@ -1895,14 +1947,26 @@ class Engine:
                     flac_bytes,
                     language=self._config.groq.language,
                     prompt=prompt_bias or None,
+                    model=stt_model,
                     on_first_byte=lambda: run.end(first_byte),
                 )
             )
             result = future.result(timeout=self._config.groq.timeout_s + 5.0)
+            retried = self._retry_on_accurate_stt(
+                result,
+                flac_bytes,
+                prompt_bias=prompt_bias,
+                used_model=stt_model,
+                speech_ms=speech_ms,
+            )
+            if retried is not None:
+                result, stt_model = retried, self._config.groq.stt_accurate_model
+                run.annotate(stt_retried=True)
 
         run.annotate(
             characters=len(result.text),
             language=result.language or "",
+            stt_model=stt_model,
             avg_logprob=result.avg_logprob if result.avg_logprob is not None else "",
             confident=result.confident,
             audio_ms=round(audio_ms, 1),
@@ -1946,6 +2010,7 @@ class Engine:
                         flac_bytes,
                         language=self._config.groq.language,
                         prompt=prompt_bias or None,
+                        model=self._stt_model_for(self._language_prior()),
                     )
                 )
                 tail_result = future.result(timeout=self._config.groq.timeout_s + 5.0)
@@ -1985,6 +2050,175 @@ class Engine:
         # per-chunk gating into ChunkStreamer is a larger Phase 4 change and
         # out of scope here.
         return _Transcript(text=merged, language=tail_language, confident=tail_confident)
+
+    def _retry_on_accurate_stt(
+        self,
+        result: TranscriptionResult,
+        flac_bytes: bytes,
+        *,
+        prompt_bias: str,
+        used_model: str,
+        speech_ms: float,
+    ) -> TranscriptionResult | None:
+        """Re-transcribe on the full model when turbo looks out of its depth.
+
+        Fires only when turbo has just told us something we could not know
+        beforehand: that the speech is in a language it decodes badly. On Auto
+        that is the *only* signal available, and without this a Marathi
+        speaker who has not set their language gets a corrupted transcript
+        with nothing in the system aware of it.
+
+        Bounded deliberately. Long clips are excluded because a second full
+        transcription costs more than the error it fixes and would double the
+        audio spend against a daily quota. Returns ``None`` to keep the
+        original result, and never raises -- a failed retry degrades to the
+        transcript we already have rather than losing the user's words.
+        """
+        if used_model == self._config.groq.stt_accurate_model:
+            return None
+        # An explicit setting already picked the model; respect it.
+        if languages.normalize(self._config.groq.language):
+            return None
+        if speech_ms > _STT_RETRY_MAX_SPEECH_MS:
+            return None
+
+        detected = languages.get(result.language)
+        if detected is not None and detected.needs_accurate_stt:
+            # A language we know turbo decodes badly.
+            why, hint = f"{detected.code} decodes poorly on turbo", detected.code
+        elif result.language and detected is None:
+            # Whisper named a language Sway has no profile for at all. On a
+            # short Indic clip this is exactly what failure looks like: one
+            # speaker's Marathi came back as english, then indonesian, then
+            # arabic, then urdu, each reported confidently. Treat an
+            # unsupported label as evidence the detection is junk rather than
+            # as a fact, and let the full model have a go -- its language
+            # identification is markedly better than turbo's.
+            why, hint = f"{result.language!r} is not a language Sway supports", (
+                self._session_language()
+            )
+        elif not result.confident:
+            why, hint = "the decode was low-confidence", self._session_language()
+        else:
+            return None
+
+        logger.info(
+            "re-transcribing on %s: %s", self._config.groq.stt_accurate_model, why
+        )
+        try:
+            future = self._network.submit(
+                self._groq.transcribe(
+                    flac_bytes,
+                    language=hint,
+                    prompt=prompt_bias or None,
+                    model=self._config.groq.stt_accurate_model,
+                )
+            )
+            retried = future.result(timeout=self._config.groq.timeout_s + 5.0)
+        except Exception:
+            logger.warning(
+                "accurate re-transcribe failed; keeping the first result", exc_info=True
+            )
+            return None
+        return retried if retried.text.strip() else None
+
+    # -- language resolution ---------------------------------------------
+
+    def _session_language(self) -> str | None:
+        """The language of recent dictations, when they agree enough to be a
+        useful prior. ``None`` when there is no history or it is mixed."""
+        with self._language_lock:
+            recent = list(self._language_history)
+        if not recent:
+            return None
+        # The most recent verdict wins ties: a genuine switch should take
+        # effect on the next utterance, not after three.
+        return max(set(recent), key=lambda code: (recent.count(code), recent.index(code)))
+
+    def _remember_language(self, code: str | None) -> None:
+        """Record a confident language verdict for later utterances."""
+        normalized = languages.normalize(code)
+        if not normalized:
+            return
+        with self._language_lock:
+            self._language_history.append(normalized)
+
+    def _language_prior(self) -> str | None:
+        """The best guess at the language *before* any audio is sent.
+
+        Explicit beats remembered beats nothing. This is what picks the STT
+        model, so it can only use what is known ahead of the request -- the
+        transcript's own evidence arrives too late for that decision.
+        """
+        explicit = languages.normalize(self._config.groq.language)
+        if explicit:
+            return explicit
+        return self._session_language()
+
+    def _stt_model_for(self, code: str | None) -> str:
+        """Which Whisper to send this dictation to.
+
+        Turbo unless the language is one whose transcription measurably
+        degrades on the distilled decoder, in which case the full model earns
+        its extra ~140ms (see sway.languages.Language.needs_accurate_stt).
+        """
+        language = languages.get(code)
+        if language is not None and language.needs_accurate_stt:
+            return self._config.groq.stt_accurate_model
+        return self._config.groq.stt_model
+
+    def _streaming_wanted(self) -> bool:
+        """Whether to ship overlapping chunks while the user is still talking.
+
+        Off for languages that need the accurate decoder. Chunking splits
+        speech at arbitrary boundaries, and a decoder already bending Marathi
+        toward Hindi on a whole clip does it worse on a fragment with no
+        surrounding context -- then the errors are stitched together and
+        cannot be told apart. Falling back to the single-shot path costs the
+        streaming head start and buys a transcript that is right.
+        """
+        if not self._config.streaming.enabled:
+            return False
+        language = languages.get(self._language_prior())
+        return language is None or not language.needs_accurate_stt
+
+    def _language_for_transcript(self, transcript: _Transcript) -> str | None:
+        """The language to treat a finished transcript as being in.
+
+        An explicit setting is authoritative. Failing that, Whisper's label is
+        trusted only where it has been shown to be trustworthy:
+
+        * Under about two seconds of speech it is close to random, so the
+          session's recent language replaces it entirely.
+        * Between two languages that share a script it cannot discriminate at
+          all -- it reports every Marathi utterance as Hindi -- so a session
+          prior in the same script wins. Across scripts it is reliable and
+          wins, which is what lets a genuine switch take effect.
+        """
+        explicit = languages.normalize(self._config.groq.language)
+        if explicit:
+            return explicit
+        detected = languages.normalize(transcript.language)
+        session = self._session_language()
+        speech_ms = transcript.speech_ms
+        if speech_ms is not None and speech_ms < _LANGUAGE_MIN_SPEECH_MS:
+            return session or detected
+        if detected and session and detected != session:
+            # Same script means Whisper was choosing between two options it
+            # cannot tell apart; what the last few dictations actually were is
+            # the better evidence.
+            if languages.scripts_for(detected) & languages.scripts_for(session):
+                return session
+        return detected or session
+
+    def _target_language(self) -> str | None:
+        """The language the pasted text should end up in, or ``None`` for
+        "whatever was spoken" -- the default, and not a translation.
+
+        Read fresh from settings on every dictation, so the bar's popover and
+        the dashboard both take effect on the very next utterance.
+        """
+        return languages.normalize(self._settings.get().target_language)
 
     def _build_prompt_bias(self) -> str:
         """The personal dictionary, joined for Whisper's ``prompt`` parameter.
@@ -2052,14 +2286,45 @@ class Engine:
         # skip-rate analysis belongs.
         if correction is None:
             correction = CorrectionScan(text=raw_text)
-        skip_reason = self._cleanup_skip_reason(transcript, style, correction, transforms)
+        # Resolved once and threaded through, so the skip decision, the
+        # prompt, the model choice, and the guardrail all reason about the
+        # same language rather than each re-deriving it.
+        language = self._language_for_transcript(transcript)
+        target_language = self._target_language()
+        if language is None and transcript.language:
+            # The app's Logs view shows warnings and errors only, so an
+            # unresolvable language used to leave no trace anywhere: the user
+            # got confident-looking text in a script they cannot read and
+            # nothing in the product admitted anything had gone wrong.
+            logger.warning(
+                "this dictation was detected as %r, which Sway has no profile for, "
+                "so it was pasted exactly as transcribed. Auto-detect is unreliable "
+                "on short clips -- if that language is wrong, pick yours from the "
+                "globe on the bar.",
+                transcript.language,
+            )
+        skip_reason = self._cleanup_skip_reason(
+            transcript,
+            style,
+            correction,
+            transforms,
+            language=language,
+            target_language=target_language,
+        )
         if skip_reason:
             cleaned_text = raw_text
         else:
             try:
                 with run.stage(Stage.CLEANUP):
                     cleaned_text, guardrail = self._request_cleanup(
-                        raw_text, style, transcript, run, correction, transforms
+                        raw_text,
+                        style,
+                        transcript,
+                        run,
+                        correction,
+                        transforms,
+                        language=language,
+                        target_language=target_language,
                     )
             except (GroqError, TimeoutError) as exc:
                 # The transcript is the user's words and they are already
@@ -2082,6 +2347,8 @@ class Engine:
             cleanup_failure=failure,
             focused_process=focused_process or "",
             language=transcript.language or "",
+            resolved_language=language or "",
+            target_language=target_language or "",
             transcript_confident=transcript.confident,
             correction_detected=correction.detected,
             correction_markers=correction.describe(),
@@ -2139,6 +2406,8 @@ class Engine:
         style: CleanupStyle,
         correction: CorrectionScan,
         transforms: Sequence[Transform] = (),
+        language: str | None = None,
+        target_language: str | None = None,
     ) -> str:
         """Why this transcript bypasses the LLM, or ``""`` to run cleanup.
 
@@ -2156,17 +2425,44 @@ class Engine:
             return "disabled"
         if style is CleanupStyle.VERBATIM:
             return "verbatim_profile"
+        # Translation is held to a stricter bar than cleanup, and this check
+        # sits above the correction/transform override on purpose. That
+        # override exists because a stumbling speaker is exactly who a
+        # low-confidence tidy-up helps most -- but rewriting shaky words in
+        # the same language is recoverable, and rendering them into another
+        # language the user cannot read back is not. When the transcript
+        # cannot be trusted, the raw words are pasted untouched.
+        if target_language and not transcript.confident:
+            return "language_uncertain"
         # A fired transform has already had its phrase excised, so skipping the
         # call now would drop the words and deliver nothing for them.
         if transforms or correction.detected:
             return ""
+        # An explicit output language must survive the heuristic skips: a
+        # short, clean utterance still has to be translated, and
+        # "short_and_clean" would otherwise paste it in the spoken language.
+        if target_language:
+            return ""
         if cfg.skip_when_unconfident and not transcript.confident:
             return "low_confidence"
         if should_skip_cleanup(
-            transcript.text, language=transcript.language, min_words=cfg.skip_min_words
+            transcript.text, language=language, min_words=cfg.skip_min_words
         ):
             return "short_and_clean"
         return ""
+
+    def _cleanup_model_for(self, language: languages.Language | None) -> str:
+        """Which chat model rewrites this text.
+
+        Per-language routing exists because model quality in a language is
+        not uniform: the default is measurably stiffer in Hindi and Marathi,
+        producing textbook constructions where a person would keep the
+        English word. A language with no override uses the configured model,
+        so English is untouched.
+        """
+        if language is not None and language.cleanup_model:
+            return language.cleanup_model
+        return self._config.cleanup.model
 
     def _request_cleanup(
         self,
@@ -2176,6 +2472,8 @@ class Engine:
         run: RunRecorder,
         correction: CorrectionScan,
         transforms: Sequence[Transform] = (),
+        language: str | None = None,
+        target_language: str | None = None,
     ) -> tuple[str, str]:
         """The cleanup round trip plus its output checks. Returns the text to
         paste and the guardrail reason that rejected the rewrite (``""`` when
@@ -2188,6 +2486,20 @@ class Engine:
         # so the split says whether D3 should chase the model's latency or the
         # length of what it generates.
         first_token = run.begin(Stage.LLM_FIRST_TOKEN)
+        spoken = language if language is not None else languages.normalize(transcript.language)
+        spoken_language = languages.get(spoken)
+        target = languages.get(target_language)
+        # The register hint belongs to whichever language is being *written*:
+        # translating into Marathi needs Marathi's register, not the register
+        # of the language it came from.
+        register_source = target or spoken_language
+        # Ask the model what language it is actually looking at whenever that
+        # is in doubt. Whisper cannot tell Hindi from Marathi and is close to
+        # random on short clips; the model reading the text gets both right,
+        # and it is already being called. Deliberately not requested on the
+        # plain-English path, which keeps that prompt byte-identical to the
+        # one this build has always sent.
+        emit_header = spoken != "en"
         future = self._network.submit(
             self._groq.cleanup(
                 raw_text,
@@ -2196,11 +2508,14 @@ class Engine:
                     language=transcript.language,
                     correction=correction.detected,
                     remove_fillers=self._settings.get().remove_fillers,
+                    register=register_source.register_hint if register_source else "",
+                    target_language=target.code if target else None,
+                    emit_language_header=emit_header,
                 )
                 # Appended last, after the byte-identical style prompt, so the
                 # stable prefix stays cacheable (D8.3).
                 + build_directive_block(transforms),
-                model=cfg.model,
+                model=self._cleanup_model_for(register_source),
                 temperature=cfg.temperature,
                 reasoning_effort=cfg.reasoning_effort or None,
                 max_output_tokens=cfg.max_output_tokens or None,
@@ -2208,7 +2523,16 @@ class Engine:
             )
         )
         result = future.result(timeout=self._config.groq.timeout_s + 5.0)
-        candidate = normalize_cleanup_output(result.text, raw_text)
+        body = result.text
+        if emit_header:
+            verdict, body = parse_language_header(result.text)
+            if verdict.code:
+                run.annotate(detected_language=verdict.code, mixed_language=verdict.mixed or "")
+                if verdict.confident:
+                    # Improves the *next* dictation, not this one: the verdict
+                    # arrives after the transcript was already decoded.
+                    self._remember_language(verdict.code)
+        candidate = normalize_cleanup_output(body, raw_text)
         if not candidate:
             return raw_text, "empty"
         # The entity guard treats every number as protected, so a *correct*
@@ -2224,12 +2548,17 @@ class Engine:
         # Empty when nothing fired, which leaves plain dictation's guardrails
         # exactly as they were.
         expectation = expectation_for(transforms)
+        # What script change the user actually asked for. Empty unless a
+        # target language is set, which leaves the guardrail exactly as it
+        # has always been for everyone else.
+        intent = language_intent_for(source=spoken, target=target.code if target else None)
         reason = unsafe_reason(
             raw_text,
             candidate,
             retracted=retracted,
             correction_detected=correction.detected,
             expectation=expectation,
+            intent=intent,
         )
         if reason:
             logger.warning(
@@ -2374,73 +2703,67 @@ class Engine:
             # transformation; an empty result falls back to leaving the
             # selection untouched rather than pasting nothing over it.
             candidate = normalize_cleanup_output(result.text, selected_text)
-            # The dictation path has always re-checked the model's output; this
-            # one only normalised it. With a transform firing from a keystroke
-            # and no spoken instruction to confirm intent, a response that
-            # answered instead of rewriting would silently overwrite the
-            # selection.
-            #
-            # `expectation` is what makes that check survivable: a shortcut
-            # carries the fired transform's own declared expectation, and a
-            # *spoken* command carries a permissive one, because the speaker
-            # stating an arbitrary instruction over text they selected is the
-            # clearest possible "I asked for this". Neither relaxes the entity,
-            # assistant-voice, or answered-a-question guards -- those catch the
-            # model doing what nobody asked for.
-            reason = unsafe_reason(selected_text, candidate, expectation=expectation)
-            if candidate and not reason:
-                transformed = candidate
-            else:
-                if candidate:
+            # Every path through this function now ends in the review panel
+            # -- a shortcut-fired transform and a spoken voice command alike
+            # -- so nothing here pastes without an explicit Apply click.
+            # That is what makes ADVISORY the right mode: a tripped
+            # guardrail is worth flagging to the human about to decide, but
+            # it is never grounds to throw the model's answer away outright
+            # the way the dictation path's GATE mode does. Only a genuinely
+            # empty response blocks, because there is nothing to show for
+            # that. See apply_guardrail's docstring for the full rationale.
+            outcome = apply_guardrail(
+                selected_text, candidate, mode=GuardrailMode.ADVISORY, expectation=expectation
+            )
+            if outcome.reason:
+                run.annotate(
+                    command_guardrail_reason=outcome.reason,
+                    command_guardrail_blocked=outcome.blocked,
+                )
+                if outcome.blocked:
                     logger.warning(
                         "transform output rejected by the %s guardrail; leaving the selection alone",
-                        reason,
+                        outcome.reason,
                     )
-                run.annotate(command_guardrail_reason=reason)
-                transformed = selected_text
+                else:
+                    logger.info(
+                        "transform output flagged by the %s guardrail; showing it for review",
+                        outcome.reason,
+                    )
 
-        run.annotate(characters=len(transformed))
+        run.annotate(characters=len(outcome.text))
 
-        if transform is not None:
-            if transformed == selected_text:
-                # The guardrail rejected the model's output (or it produced
-                # nothing) -- there is no real change to preview, and an
-                # empty "0 Changes" panel would just be confusing. Say so on
-                # the bar instead, the same way a rejected result already
-                # does on the non-preview command path.
-                self._set_ui_state(
-                    BarState.DONE, detail="No usable result", kind="command_guardrail"
-                )
-                return
-            # Preview-first: a shortcut-run transform never pastes on its
-            # own. The result is handed to the review panel, and only
-            # Apply -- a deliberate, separate click -- actually injects it.
-            # See _present_transform_result.
-            self._present_transform_result(
-                transform,
-                original=selected_text,
-                transformed=transformed,
-                instruction=instruction_text,
-                focused_process=focused_process,
-                activation=activation,
-                run=run,
+        if outcome.blocked:
+            # Only an empty model response reaches here now -- there is
+            # nothing to preview. ERROR (not DONE) so the bar does not draw
+            # a success checkmark over a failure, and so it holds for
+            # ERROR_HOLD_S instead of the shorter DONE_HOLD_S. No RECOVERY
+            # entry: the only honest recovery is "try again", which is what
+            # pressing the shortcut/holding the command key already does,
+            # and bar.RECOVERY's own docstring is explicit that a button
+            # promising to retry and not doing so is worse than no button.
+            run.annotate(skipped="command_guardrail")
+            self._set_ui_state(
+                BarState.ERROR,
+                detail="Nothing came back — try again",
+                kind="command_guardrail",
             )
             return
 
-        with run.stage(Stage.INJECT):
-            pasted = self._inject_with_fallback(transformed, run, activation)
-        self._set_ui_state(
-            BarState.IDLE if pasted else BarState.ERROR,
-            detail="" if pasted else "elevated window — copied instead",
-            kind="" if pasted else "paste_blocked",
-        )
-
-        self._record_history(
-            kind=KIND_COMMAND,
-            text=transformed,
-            raw_text=selected_text,
+        # Preview-first: nothing on this path pastes on its own. The result
+        # is handed to the review panel, and only Apply -- a deliberate,
+        # separate click -- actually injects it. See
+        # _present_transform_result.
+        self._present_transform_result(
+            transform,
+            original=selected_text,
+            transformed=outcome.text,
             instruction=instruction_text,
+            expectation=expectation,
+            guardrail_reason=outcome.reason,
             focused_process=focused_process,
+            activation=activation,
+            run=run,
         )
 
     # -- dashboard control (Phase 6) ---------------------------------------
@@ -2607,6 +2930,7 @@ class Engine:
             # These two no longer navigate the user away from what they were
             # doing. They answer in place, with the choices themselves.
             ACTION_LANGUAGE: self._open_language_popover,
+            self._ACTION_TARGET_MENU: self._open_target_popover,
             ACTION_MIC: self._open_microphone_popover,
         }
         handler = handlers.get(action) or self._popover_choice_handler(action)
@@ -2624,19 +2948,26 @@ class Engine:
     #: renders rows and reports which one was clicked, exactly as it already
     #: does for the menu.
     _LANGUAGE_PREFIX = "lang:"
+    _TARGET_PREFIX = "target:"
     _DEVICE_PREFIX = "dev:"
+    #: Not a value, a navigation: opens the output-language list in place.
+    _ACTION_TARGET_MENU = "target-menu"
 
     def _open_language_popover(self) -> None:
-        """The dictation language, switchable in one click.
+        """The dictation language and the output language, in one popover.
 
-        Genuinely live -- ``language`` is re-read into the Groq call on the
-        next dictation (see :meth:`_apply_settings`) -- so this popover needs
-        no caveat, and deliberately does not invent one.
+        Both live here rather than behind two tray controls because they are
+        one question asked twice -- what goes in, what comes out -- and two
+        globes at 16px would be indistinguishable. Genuinely live: both are
+        re-read on the next dictation (see :meth:`_apply_settings`), so this
+        popover needs no caveat and deliberately does not invent one.
         """
         from sway.settings import LANGUAGES, language_label
 
-        current = self._settings.get().language
-        rows = [
+        settings = self._settings.get()
+        current = settings.language
+        rows: list[MenuItem] = [MenuItem("", "I'm speaking", enabled=False, footer=True)]
+        rows += [
             MenuItem(
                 self._LANGUAGE_PREFIX + (code or ""),
                 label,
@@ -2649,14 +2980,51 @@ class Engine:
             # current one, or the popover claims a value that is not in
             # effect.
             rows.insert(
-                1,
+                2,
                 MenuItem(
                     self._LANGUAGE_PREFIX + current,
                     language_label(current),
                     checked=True,
                 ),
             )
+
+        # The output language is one row that drills down, not a second full
+        # list. Both lists inline came to 27 rows -- 1146px, taller than the
+        # screen the popover has to open on.
+        target = languages.normalize(settings.target_language)
+        rows.append(MenuItem(""))
+        rows.append(
+            MenuItem(
+                self._ACTION_TARGET_MENU,
+                "Write it in",
+                detail=language_label(target) if target else "Same as spoken",
+                submenu=True,
+            )
+        )
         rows.append(MenuItem("settings", "More languages...", "gear"))
+        self._bar.open_popover(ACTION_LANGUAGE, tuple(rows), width=232)
+
+    def _open_target_popover(self) -> None:
+        """The output language, reached from the language popover.
+
+        "Same as spoken" leads and is the default: it is not a language and
+        not a translation, it is what Sway has always done.
+        """
+        from sway.settings import LANGUAGES, language_label
+
+        target = languages.normalize(self._settings.get().target_language)
+        rows: list[MenuItem] = [
+            MenuItem(ACTION_LANGUAGE, "Back", "globe"),
+            MenuItem("", "Write it in", enabled=False, footer=True),
+            MenuItem(self._TARGET_PREFIX, "Same as spoken", checked=target is None),
+        ]
+        rows += [
+            MenuItem(self._TARGET_PREFIX + code, label, checked=code == target)
+            for code, label in LANGUAGES
+            if code
+        ]
+        if target and all(code != target for code, _ in LANGUAGES):
+            rows.insert(3, MenuItem(self._TARGET_PREFIX + target, language_label(target), checked=True))
         self._bar.open_popover(ACTION_LANGUAGE, tuple(rows), width=232)
 
     def _open_microphone_popover(self) -> None:
@@ -2733,6 +3101,9 @@ class Engine:
 
     def _popover_choice_handler(self, action: str) -> Callable[[], None] | None:
         """Turn a popover row back into a settings write, or ``None``."""
+        if action.startswith(self._TARGET_PREFIX):
+            target = action[len(self._TARGET_PREFIX) :] or None
+            return lambda: self._choose_target_language(target)
         if action.startswith(self._LANGUAGE_PREFIX):
             language = action[len(self._LANGUAGE_PREFIX) :] or None
             return lambda: self._choose_language(language)
@@ -2754,6 +3125,27 @@ class Engine:
         # Confirm with the value, not with a tick: the user chose a language,
         # so the confirmation is that language.
         self._set_ui_state(BarState.DONE, detail=language_label(code))
+
+    def _choose_target_language(self, code: str | None) -> None:
+        """Set the language the pasted text should come out in.
+
+        ``None`` restores "same as spoken", which is not a translation at all
+        and is the default every user starts on.
+        """
+        from sway.settings import language_label
+
+        normalized = languages.normalize(code)
+        try:
+            self._settings.update(target_language=normalized)
+        except Exception:
+            logger.exception("could not change the output language")
+            self._set_ui_state(BarState.ERROR, detail="could not save that", kind="settings")
+            return
+        self._apply_settings()
+        self._set_ui_state(
+            BarState.DONE,
+            detail=language_label(normalized) if normalized else "Same as spoken",
+        )
 
     def _choose_device(self, name: str | None) -> None:
         try:
@@ -3022,7 +3414,9 @@ class Engine:
 
         started = time.perf_counter()
         try:
-            self._network.run(client.check_auth())
+            self._network.submit(client.check_auth()).result(
+                timeout=self._config.groq.timeout_s + 5.0
+            )
         except GroqRateLimitError as exc:
             # A 429 means the key is *valid* -- it authenticated far enough to
             # be rate limited. Reporting it as a bad key would send the user
@@ -3239,38 +3633,50 @@ class Engine:
 
     # -- the transform review panel: preview first, apply on demand --------
     #
-    # A shortcut-run transform never pastes on its own (D8's checkbox-era
-    # "opt-in default" became, in the redesign, "preview by default" instead
-    # -- nothing changes on screen until the user explicitly asks it to).
-    # _run_command computes the transformed text and calls
+    # Nothing pastes on its own on this path -- neither a shortcut-run
+    # transform nor a spoken voice command over a selection (D8's
+    # checkbox-era "opt-in default" became, in the redesign, "preview by
+    # default" instead: nothing changes on screen until the user explicitly
+    # asks it to). _run_command computes the transformed text and calls
     # _present_transform_result instead of injecting it; everything below is
     # what turns that into a panel and wires Apply/Copy/Retry/Undo back to
     # the actual pipeline.
 
     def _present_transform_result(
         self,
-        transform: Transform,
+        transform: Transform | None,
         *,
         original: str,
         transformed: str,
         instruction: str,
+        expectation: OutputExpectation,
+        guardrail_reason: str,
         focused_process: str | None,
         activation: Activation | None,
         run: RunRecorder,
     ) -> None:
+        # A spoken voice command has no stored Transform to point at -- it
+        # is reviewed the same way, but transform_id stays "" so Retry
+        # (see _transform_retry) knows there is nothing to re-resolve from
+        # storage.
+        transform_id = transform.id if transform is not None else ""
+        transform_name = transform.name if transform is not None else "Voice command"
         self._pending_transform = PendingTransformResult(
-            transform_id=transform.id,
-            transform_name=transform.name,
+            transform_id=transform_id,
+            transform_name=transform_name,
             original=original,
             transformed=transformed,
             instruction=instruction,
+            expectation=expectation,
+            guardrail_reason=guardrail_reason,
             focused_process=focused_process,
             activation=activation,
         )
-        self._auto_capture_example(transform, original, transformed)
+        if transform is not None:
+            self._auto_capture_example(transform, original, transformed)
         parts = word_diff(original, transformed)
         run.annotate(transform_changes=change_count(parts))
-        self._set_ui_state(BarState.DONE, detail=f"{transform.name} — see changes")
+        self._set_ui_state(BarState.DONE, detail=f"{transform_name} — see changes")
         self._bar.run_on_ui_thread(lambda root: self._show_transform_panel(root))
 
     def _auto_capture_example(self, transform: Transform, original: str, transformed: str) -> None:
@@ -3287,6 +3693,13 @@ class Engine:
             return
         if not original.strip() or not transformed.strip():
             return
+        if original.strip() == transformed.strip():
+            # A no-op run (the model legitimately returned the selection
+            # unchanged, or a guardrail note left it untouched pending
+            # review) makes a useless example -- it would show the same text
+            # on both sides of the editor's before/after well forever, since
+            # this only ever fires once per transform.
+            return
         try:
             current = self._settings.get().transforms
             updated = tuple(
@@ -3299,6 +3712,15 @@ class Engine:
         except Exception:
             logger.debug("could not store an example for %r", transform.name, exc_info=True)
 
+    @staticmethod
+    def _transform_panel_title(n: int) -> str:
+        """"No changes" for a legitimate no-op result (the model returned
+        the selection unchanged), never "0 Changes" -- see the blocked-vs-
+        no-op distinction in _run_command."""
+        if n == 0:
+            return "No changes"
+        return f"{n} Change" if n == 1 else f"{n} Changes"
+
     def _show_transform_panel(self, root: tk.Tk) -> None:
         """Runs on the Tk thread only, via SwayBar.run_on_ui_thread."""
         pending = self._pending_transform
@@ -3307,13 +3729,12 @@ class Engine:
         if self._transform_panel is None:
             self._transform_panel = TransformReviewPanel(root)
         parts = word_diff(pending.original, pending.transformed)
-        n = change_count(parts)
-        title = f"{n} Change" if n == 1 else f"{n} Changes"
         self._transform_panel.show(
-            title=title,
+            title=self._transform_panel_title(change_count(parts)),
             subtitle=pending.transform_name,
             parts=parts,
             applied=pending.applied,
+            note=advisory_note(pending.guardrail_reason),
             on_apply=self._transform_apply,
             on_copy=self._transform_copy,
             on_retry=self._transform_retry,
@@ -3327,9 +3748,11 @@ class Engine:
         if pending is None or panel is None or not panel.is_open:
             return
         parts = word_diff(pending.original, pending.transformed)
-        n = change_count(parts)
         panel.update(
-            title=(f"{n} Change" if n == 1 else f"{n} Changes"), parts=parts, applied=pending.applied
+            title=self._transform_panel_title(change_count(parts)),
+            parts=parts,
+            applied=pending.applied,
+            note=advisory_note(pending.guardrail_reason),
         )
 
     def _transform_apply(self) -> None:
@@ -3346,6 +3769,15 @@ class Engine:
                 )
                 return
             pending.applied = True
+            # Spent. A later Undo-then-Apply must not replay this token:
+            # ActivationLedger.mark_injected only ever honours an activation
+            # once, so a second Apply reusing it would be refused and
+            # reported as "elevated window -- copied instead" -- wrong on
+            # both counts, since that branch returns before copying either.
+            # `pending.applied` is what actually guards a repeat Apply; a
+            # deliberate second click after Undo doesn't need a fresh
+            # single-use token to do the same job again.
+            pending.activation = None
             self._record_history(
                 kind=KIND_COMMAND,
                 text=pending.transformed,
@@ -3366,18 +3798,27 @@ class Engine:
             logger.debug("could not copy the transform result", exc_info=True)
 
     def _transform_retry(self) -> None:
-        """Re-run the same transform over the same original text.
+        """Re-run the same instruction over the same original text.
 
-        Costs one more model call, same as any other transform run -- the
+        Costs one more model call, same as any other reviewed rewrite -- the
         panel stays open and its diff refreshes in place once the new
-        result is ready, rather than closing and reopening.
+        result is ready, rather than closing and reopening. Works for a
+        spoken command too: ``pending.instruction``/``pending.expectation``
+        are what get re-sent by default, and a stored transform is only
+        consulted (by id) to pick up an instruction edited since this
+        result was first shown.
         """
         pending = self._pending_transform
-        if pending is None:
+        if pending is None or not self._listening:
             return
-        transform = transforms_module.by_id(self._settings.get().transforms, pending.transform_id)
-        if transform is None or not self._listening:
-            return
+        instruction = pending.instruction
+        expectation = pending.expectation
+        if pending.transform_id:
+            transform = transforms_module.by_id(self._settings.get().transforms, pending.transform_id)
+            if transform is None:
+                return  # the transform was deleted while the panel was open
+            instruction = transform.instruction
+            expectation = expectation_for([transform])
         original = pending.original
         focused_process = pending.focused_process
 
@@ -3386,7 +3827,7 @@ class Engine:
                 self._run_pipeline(
                     run,
                     lambda: self._retry_command(
-                        original, transform, focused_process, run
+                        pending, original, instruction, expectation, focused_process, run
                     ),
                     label="command",
                 )
@@ -3395,20 +3836,30 @@ class Engine:
 
     def _retry_command(
         self,
+        pending: PendingTransformResult,
         original: str,
-        transform: Transform,
+        instruction: str,
+        expectation: OutputExpectation,
         focused_process: str | None,
         run: RunRecorder,
     ) -> None:
         """The retry path: same selection, no fresh capture -- the original
         is already known, so this skips straight to the model call rather
-        than re-reading the (possibly now-different) live selection."""
+        than re-reading the (possibly now-different) live selection.
+
+        ``pending`` is the exact :class:`PendingTransformResult` this retry
+        was launched for, captured by :meth:`_transform_retry` before the
+        network round-trip -- identity, not ``transform_id``, is what
+        detects whether the panel moved on while this was in flight, which
+        also makes this correct for a spoken command's blank
+        ``transform_id``.
+        """
         with run.stage(Stage.COMMAND):
             self._require_groq()
             cfg = self._config.commands
             future = self._network.submit(
                 self._groq.cleanup(
-                    build_command_user_message(transform.instruction, original),
+                    build_command_user_message(instruction, original),
                     system_prompt=COMMAND_SYSTEM_PROMPT,
                     model=cfg.model,
                     temperature=cfg.temperature,
@@ -3418,21 +3869,36 @@ class Engine:
             )
             result = future.result(timeout=self._config.groq.timeout_s + 5.0)
             candidate = normalize_cleanup_output(result.text, original)
-            expectation = expectation_for([transform])
-            reason = unsafe_reason(original, candidate, expectation=expectation)
-            transformed = candidate if candidate and not reason else original
-            if candidate and reason:
-                logger.warning(
-                    "retry output rejected by the %s guardrail; keeping the previous result", reason
+            # Advisory, same as the first attempt: only an empty response
+            # blocks, and it blocks by keeping the *previous* result on
+            # screen rather than falling back to the untransformed
+            # original -- the thing worth protecting here is what the user
+            # was already looking at, not the pre-transform text.
+            outcome = apply_guardrail(
+                original, candidate, mode=GuardrailMode.ADVISORY, expectation=expectation
+            )
+            if outcome.blocked:
+                run.annotate(
+                    command_guardrail_reason=outcome.reason,
+                    command_guardrail_blocked=True,
+                    skipped="command_guardrail",
                 )
-                run.annotate(command_guardrail_reason=reason)
+                logger.warning("retry produced nothing usable; keeping the previous result")
+                if self._pending_transform is pending:
+                    self._set_ui_state(
+                        BarState.ERROR,
+                        detail="Retry came back empty — the previous result is still here",
+                        kind="command_guardrail",
+                    )
                 return
+            if outcome.reason:
+                run.annotate(command_guardrail_reason=outcome.reason, command_guardrail_blocked=False)
 
-        run.annotate(characters=len(transformed))
-        pending = self._pending_transform
-        if pending is None or pending.transform_id != transform.id:
+        run.annotate(characters=len(outcome.text))
+        if self._pending_transform is not pending:
             return  # the panel was dismissed or moved on while retry was in flight
-        pending.transformed = transformed
+        pending.transformed = outcome.text
+        pending.guardrail_reason = outcome.reason
         pending.applied = False
         self._refresh_transform_panel()
 

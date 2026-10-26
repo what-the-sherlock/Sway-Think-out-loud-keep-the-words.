@@ -819,7 +819,7 @@ function renderTransformSheet() {
         </div>
         <details style="margin-top:18px">
           <summary class="small" style="cursor:pointer;color:var(--muted)">What it may do to the text</summary>
-          <div class="small muted" style="margin:8px 0">Sway checks the model's answer before pasting it and keeps your own words if it looks wrong. Tick what this prompt is <em>supposed</em> to do, so a correct result is not thrown away.</div>
+          <div class="small muted" style="margin:8px 0">Tick what this prompt is <em>supposed</em> to do, so Sway knows what's worth flagging. Run from its shortcut, you'll always see the result and decide yourself whether to use it. Said as a phrase mid-dictation, there's no review step — an answer that looks off is dropped and your raw words are pasted instead, so these checkboxes are what keep a correct one from being dropped there.</div>
           <label class="check-row"><input type="checkbox" id="x-md"${t.allows_markdown ? ' checked' : ''}>
             <span>Produces a list or headings <span class="muted">— bullets, numbered points</span></span></label>
           <label class="check-row"><input type="checkbox" id="x-short"${t.may_shorten ? ' checked' : ''}>
@@ -1043,6 +1043,22 @@ function performancePanel() {
         </div>`).join('')}</div>`
     : `<div style="padding:12px 0">${stat({ label: `errors in this window`, value: '0', foot: `across ${fmt.int(p.total)} dictations` })}</div>`;
 
+  // Unlike Failures, no zero-state card: a guardrail tally with nothing in
+  // it is not a fact worth a permanent card the way "0 errors" is -- most
+  // windows will never trip one, and a page of empty cards is noise (§6
+  // strategy: show a state only when there is a state to show).
+  const guardrails = p.guardrails.length
+    ? card(`<div class="sec-head"><span class="meta-label">Guardrails</span></div>
+        <div class="small muted" style="margin-top:2px">
+          Reviewed rewrites (transforms and voice commands) that a guardrail flagged before you saw them.
+        </div>
+        <div class="rows" style="margin-top:10px">${p.guardrails.map((g) => `
+          <div class="row">
+            <div class="body"><div class="text">${esc(guardrailLabel(g.reason))}</div></div>
+            <span class="small muted">${fmt.int(g.count)}</span>
+          </div>`).join('')}</div>`)
+    : '';
+
   return `
     <div class="stack">
       <div class="grid cols-3">
@@ -1060,6 +1076,7 @@ function performancePanel() {
                 <div class="small muted" style="margin-top:12px">Median per stage. The widest bar is your latency budget.</div>`)}
         ${card(`<div class="sec-head"><span class="meta-label">Failures</span></div>${errors}`)}
       </div>
+      ${guardrails}
       ${understandingPanel(p.understanding)}
     </div>`;
 }
@@ -1106,6 +1123,24 @@ function errorLabel(code) {
     ConnectError: 'Could not reach Groq',
   };
   return map[raw] || raw.replace(/_/g, ' ');
+}
+
+// Mirrors the family names sway.cleanup.guardrail_family collapses reason
+// tokens into ("lost_entity:200" -> "lost_entity") -- kept as a label map
+// rather than reusing advisory_note's sentences, which are written to sit
+// next to the specific result they describe, not to summarize a tally.
+function guardrailLabel(family) {
+  const map = {
+    empty: 'Model returned nothing',
+    shrank: 'Much shorter than selected',
+    grew: 'Much longer than selected',
+    markdown: 'Added list or heading formatting',
+    assistant_voice: 'Replied instead of rewriting',
+    answered_question: 'Answered instead of rewriting',
+    language_changed: 'Dropped a script from the text',
+    lost_entity: 'Dropped a number, date, or link',
+  };
+  return map[family] || String(family || '').replace(/_/g, ' ');
 }
 
 function barChart(buckets, key) {
@@ -1224,6 +1259,10 @@ function voicePanel() {
   const settings = s.settings || {};
   const engine = s.engine || {};
   const devices = (state.devices && state.devices.devices) || [];
+  // Served from sway.languages rather than hardcoded here: this list used to
+  // be its own copy and had already drifted from the bar's -- different
+  // names, a missing language, and no way to add one without editing both.
+  const langs = s.languages || [];
   // Started here rather than in a dedicated bind hook -- this panel has
   // none -- and self-terminates the moment the tab is no longer showing
   // (see watchActivationPreview), so a stray render never leaves it running.
@@ -1255,13 +1294,18 @@ function voicePanel() {
     ${activationRow(activation, 'command', 'Voice command hotkey', 'Hold it over selected text to transform it.')}
     ${handsFreeRow(activation)}
     ${registeredShortcutsTable(engine)}
-    ${settingRow('Language', 'Leave on auto-detect unless Sway keeps guessing wrong.',
+    ${settingRow("I'm speaking", 'Leave on auto-detect unless Sway keeps guessing wrong.',
       `<select class="input" data-act="set" data-field="language">
         <option value="">Auto-detect</option>
-        ${[['en', 'English'], ['hi', 'Hindi'], ['es', 'Spanish'], ['fr', 'French'],
-           ['de', 'German'], ['pt', 'Portuguese'], ['it', 'Italian'], ['ja', 'Japanese'],
-           ['zh', 'Chinese']].map(([v, l]) =>
-          `<option value="${v}" ${settings.language === v ? 'selected' : ''}>${l}</option>`).join('')}
+        ${langs.map((l) =>
+          `<option value="${l.code}" ${settings.language === l.code ? 'selected' : ''}>${l.label}</option>`).join('')}
+      </select>`)}
+    ${settingRow('Write it in',
+      'Sway normally writes back whatever you spoke. Pick a language here to always get that one instead.',
+      `<select class="input" data-act="set" data-field="target_language">
+        <option value="">Same as spoken</option>
+        ${langs.map((l) =>
+          `<option value="${l.code}" ${settings.target_language === l.code ? 'selected' : ''}>${l.label}</option>`).join('')}
       </select>`)}
     <div style="margin-top:34px">
       <span class="meta-label">Understanding</span>
@@ -1487,6 +1531,36 @@ function dataPanel() {
     </div>`;
 }
 
+// sway.logging_setup writes "YYYY-MM-DD HH:mm:ss,SSS" in the machine's own
+// local time (Python's default asctime, no timezone in the string) -- parsed
+// field-by-field into a local Date rather than handed to `new Date(string)`,
+// which would read the comma-millisecond format inconsistently across
+// browsers and some would read it as UTC.
+function parseLogTimestamp(ts) {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(ts);
+  if (!m) return null;
+  const [y, mo, day, h, mi, s, ms] = m.slice(1).map(Number);
+  return new Date(y, mo - 1, day, h, mi, s, ms);
+}
+
+// A raw "2026-08-26 15:28:29,346" is precise but unreadable at a glance;
+// this trades that precision for "how recent, on what day" -- the two
+// things that actually matter when triaging a burst of warnings -- and
+// keeps the exact value one hover away via `title`.
+function formatDiagnosticTime(ts) {
+  const date = parseLogTimestamp(ts);
+  if (!date) return { label: ts, title: ts };
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  const clock = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  const label = sameDay ? clock : `${date.toLocaleDateString([], { day: 'numeric', month: 'short' })}, ${clock}`;
+  const deltaMin = Math.floor((now - date) / 60000);
+  let relative = '';
+  if (deltaMin >= 0 && deltaMin < 60) relative = deltaMin < 1 ? 'just now' : `${deltaMin}m ago`;
+  else if (deltaMin >= 60 && deltaMin < 24 * 60) relative = `${Math.floor(deltaMin / 60)}h ago`;
+  return { label: relative ? `${label} · ${relative}` : label, title: date.toLocaleString() };
+}
+
 function diagnosticsPanel() {
   const d = state.diagnostics;
   if (!d) return '<div class="small muted">Loading…</div>';
@@ -1496,15 +1570,36 @@ function diagnosticsPanel() {
   if (!d.entries.length) {
     return `<div class="small muted">No warnings or errors recorded — that log file is at ${esc(d.path)}.</div>`;
   }
+  // Entries arrive newest-first. The same warning firing repeatedly in a
+  // burst (a guardrail tripping on every one of several transform runs) is
+  // one event that happened N times, not N separate things to read and
+  // compare -- so collapse a run of identical level+logger+message entries
+  // into a single row with a count and a time span.
+  const groups = [];
+  for (const e of d.entries) {
+    const last = groups[groups.length - 1];
+    if (last && last.level === e.level && last.logger === e.logger && last.message === e.message) {
+      last.count += 1;
+      last.oldest = e.timestamp;
+    } else {
+      groups.push({ level: e.level, logger: e.logger, message: e.message, newest: e.timestamp, oldest: e.timestamp, count: 1 });
+    }
+  }
   return `<div class="rows">
-    ${d.entries.map((e) => `
+    ${groups.map((g) => {
+      const newest = formatDiagnosticTime(g.newest);
+      const countBadge = g.count > 1
+        ? ` <span class="small" style="background:var(--well);border-radius:10px;padding:1px 8px;font-weight:600">×${g.count} since ${esc(formatDiagnosticTime(g.oldest).label)}</span>`
+        : '';
+      return `
       <div class="row" style="align-items:flex-start">
-        <span class="dot" style="margin-left:6px;margin-top:7px;background:${e.level === 'WARNING' ? 'var(--amber)' : 'var(--red)'}"></span>
+        <span class="dot" style="margin-left:6px;margin-top:7px;background:${g.level === 'WARNING' ? 'var(--amber)' : 'var(--red)'}"></span>
         <div class="body">
-          <div class="small muted">${esc(e.timestamp)} · ${esc(e.level)} · ${esc(e.logger)}</div>
-          <div class="mono small" style="white-space:pre-wrap;word-break:break-word;margin-top:2px">${esc(e.message)}</div>
+          <div class="small muted" title="${esc(newest.title)}">${esc(newest.label)} · ${esc(g.level)} · ${esc(g.logger)}${countBadge}</div>
+          <div class="mono small" style="white-space:pre-wrap;word-break:break-word;margin-top:2px">${esc(g.message)}</div>
         </div>
-      </div>`).join('')}
+      </div>`;
+    }).join('')}
   </div>`;
 }
 

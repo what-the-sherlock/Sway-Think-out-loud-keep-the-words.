@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from sway import credentials
+from sway import credentials, languages
 from sway.dictionary import SOURCES
 from sway.diff import as_dicts, word_diff
 from sway.hotkey import (
@@ -174,6 +174,12 @@ _SIMPLE_FIELDS: dict[str, Any] = {
     # one-field-at-a-time save cannot do.
     "audio_device": lambda p: _optional_str(p, "audio_device"),
     "language": lambda p: _optional_str(p, "language", max_chars=32),
+    # Normalised, unlike the input hint above: an unrecognised target has no
+    # script for the guardrail to verify against, so it resolves to None
+    # ("same language I spoke") rather than being stored as a live request.
+    "target_language": lambda p: languages.normalize(
+        _optional_str(p, "target_language", max_chars=32)
+    ),
     "launch_at_login": lambda p: _require_bool(p, "launch_at_login"),
     "onboarding_complete": lambda p: _require_bool(p, "onboarding_complete"),
     "history_retention_days": lambda p: _require_int(p, "history_retention_days", low=0, high=3650),

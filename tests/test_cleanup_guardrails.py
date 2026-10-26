@@ -15,10 +15,19 @@ from sway.cleanup import (
     CLEANUP_SYSTEM_PROMPT,
     NO_EXPECTATION,
     SPOKEN_COMMAND_EXPECTATION,
+    NO_LANGUAGE_INTENT,
+    GuardrailMode,
+    GuardrailOutcome,
+    LanguageIntent,
     OutputExpectation,
+    advisory_note,
+    apply_guardrail,
+    guardrail_family,
     has_filler_markers,
     is_cleanup_output_safe,
+    language_intent_for,
     normalize_cleanup_output,
+    parse_language_header,
     should_skip_cleanup,
     system_prompt_for_style,
     unsafe_reason,
@@ -157,6 +166,133 @@ def test_mixed_language_speech_keeps_both_scripts():
     dropped_hindi = "Can you send this to Rahul tomorrow morning at ten?"
     assert is_cleanup_output_safe(original, good)
     assert not is_cleanup_output_safe(original, dropped_hindi)
+
+
+# -- guardrails: an explicitly requested target language ---------------------
+#
+# Everything above this line is the default, no-target behaviour, and none of
+# it changed: LanguageIntent defaults to NO_LANGUAGE_INTENT. What follows is
+# what an explicit user-chosen output language does to the same guard -- which
+# is to make it stricter, not to switch it off.
+
+MR_MEETING = "मला उद्याची meeting reschedule करायची आहे"
+EN_MEETING = "I need to reschedule tomorrow's meeting"
+
+
+def test_the_default_intent_is_the_old_behaviour():
+    """The whole backward-compatibility story in one assertion."""
+    assert not NO_LANGUAGE_INTENT.translating
+    assert unsafe_reason(HI_TOMORROW_TEN, "Ten o'clock tomorrow morning works.") == (
+        unsafe_reason(
+            HI_TOMORROW_TEN,
+            "Ten o'clock tomorrow morning works.",
+            intent=NO_LANGUAGE_INTENT,
+        )
+    )
+
+
+def test_declared_target_permits_exactly_that_script():
+    intent = language_intent_for(source="en", target="mr")
+    assert unsafe_reason(EN_MEETING, MR_MEETING, intent=intent) == ""
+
+
+def test_declared_target_rejects_a_different_language():
+    """The model ignored the request and answered in the source language."""
+    intent = language_intent_for(source="en", target="hi")
+    assert unsafe_reason(EN_MEETING, EN_MEETING, intent=intent) == "wrong_target_language"
+
+
+def test_declared_target_rejects_romanized_drift():
+    """A measured failure mode: the model writes the right language in the
+    wrong script. The original script-subtraction check could not see this
+    at all, because no script disappeared."""
+    intent = language_intent_for(source="en", target="mr")
+    romanized = "Kal meeting reschedule karaychay"
+    assert unsafe_reason(EN_MEETING, romanized, intent=intent) == "wrong_target_language"
+
+
+def test_loanwords_are_not_a_stray_script():
+    """"meeting" and "client" inside a Marathi sentence are correct output --
+    that is how the language is actually written."""
+    intent = language_intent_for(source="en", target="mr")
+    assert unsafe_reason(EN_MEETING, "मला उद्याची meeting आहे client सोबत", intent=intent) == ""
+
+
+def test_a_script_neither_side_asked_for_is_still_caught():
+    intent = language_intent_for(source="en", target="mr")
+    assert unsafe_reason(EN_MEETING, MR_MEETING + " привет", intent=intent) == "unexpected_script"
+
+
+def test_asking_for_the_language_already_spoken_is_not_a_translation():
+    """Target == source must leave the original guard in force, or setting
+    "always Hindi" would disable the check for Hindi dictation."""
+    intent = language_intent_for(source="hindi", target="hi")
+    assert not intent.translating
+    assert unsafe_reason(HI_TOMORROW_TEN, "Ten o'clock works.", intent=intent) == (
+        "language_changed"
+    )
+
+
+def test_an_unresolvable_target_does_not_relax_anything():
+    """No catalogue entry means no script to verify against, so it must not
+    be honoured as a translation request."""
+    intent = language_intent_for(source="en", target="klingon")
+    assert intent is NO_LANGUAGE_INTENT
+
+
+def test_an_expectation_can_never_supply_a_language_intent():
+    """The ADR-008 regression test. A transform's own checkboxes must never
+    be able to authorise a translation, however many of them are ticked --
+    only a stored user setting can, and it arrives by a separate argument."""
+    loose = OutputExpectation(allows_markdown=True, may_shorten=True, may_lengthen=True)
+    assert not hasattr(loose, "translating")
+    assert not hasattr(loose, "target_scripts")
+    assert unsafe_reason(
+        HI_TOMORROW_TEN, "Ten o'clock tomorrow morning works.", expectation=loose
+    ) == "language_changed"
+
+
+def test_the_new_reasons_have_advisory_notes():
+    """A guardrail reason with no note renders as blank in the review panel."""
+    for reason in ("wrong_target_language", "unexpected_script"):
+        assert advisory_note(reason)
+
+
+# -- the language header -----------------------------------------------------
+
+
+def test_a_language_header_is_parsed_and_stripped():
+    verdict, body = parse_language_header("#lang: mr mixed=en conf=high\nमला घरी जायचं आहे")
+    assert (verdict.code, verdict.mixed, verdict.confident) == ("mr", "en", True)
+    assert body == "मला घरी जायचं आहे"
+
+
+def test_a_low_confidence_header_is_reported_as_such():
+    verdict, _ = parse_language_header("#lang: hi conf=low\nमुझे घर जाना है")
+    assert verdict.code == "hi"
+    assert not verdict.confident
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "no header at all, just the rewritten text",
+        "#lang: zz garbage\nbody",
+        "",
+        "the #lang: marker is not at the start\n",
+    ],
+)
+def test_a_missing_or_malformed_header_degrades_to_no_information(raw):
+    """A model that ignores the header instruction must behave exactly as it
+    did before the instruction existed."""
+    verdict, body = parse_language_header(raw)
+    assert verdict.code is None
+    assert body == raw
+
+
+def test_mixed_none_is_read_as_no_second_language():
+    verdict, _ = parse_language_header("#lang: mr mixed=none conf=high\nतयार")
+    assert verdict.mixed is None
 
 
 # -- guardrails: markdown and assistant voice --------------------------------
@@ -646,3 +782,169 @@ def test_is_safe_and_unsafe_reason_cannot_disagree():
     for original, cleaned, expectation in cases:
         reason = unsafe_reason(original, cleaned, expectation=expectation)
         assert is_cleanup_output_safe(original, cleaned, expectation=expectation) == (reason == "")
+
+
+# -- GuardrailMode: gate vs advisory -----------------------------------------
+#
+# The failure that motivated this section is in the user's own log, one step
+# past the bullets case above: a custom "Developer prompt" transform was
+# rejected by the grew guardrail, survived ticking "may_lengthen", and was
+# then rejected again by the markdown guardrail for an indented "- " line --
+# something its own instruction explicitly says not to produce ("Plain text,
+# no markdown syntax") and something no user could predict or fix by ticking
+# a box. apply_guardrail is what stops a *reviewed* rewrite (a shortcut-fired
+# transform or a spoken command, both shown in a panel behind an explicit
+# Apply click) from being thrown away the way an auto-pasted one has to be --
+# see its docstring for why GATE and ADVISORY differ only in what "blocked"
+# means, never in what unsafe_reason itself reports.
+
+_GUARDRAIL_CASES = [
+    ("hello world this is fine", "", "empty"),
+    (STANDUP, STANDUP_SUMMARY, "shrank"),
+    (NOTE, NOTE_AS_EMAIL, "grew"),
+    (GROCERIES, GROCERIES_BULLETED, "markdown"),
+    (
+        "lets meet on thursday afternoon if that works for everyone",
+        "As an AI, I can't help with scheduling meetings for you today.",
+        "assistant_voice",
+    ),
+    (
+        "what is the capital of france anyway do you know",
+        "The capital of France is Paris, one of the largest cities.",
+        "answered_question",
+    ),
+    (HI_TOMORROW_TEN, "Ten o'clock tomorrow morning works.", "language_changed"),
+    ("The invoice is 4471 and the total is 320.", "The invoice is 4471.", "lost_entity:320"),
+]
+
+#: Every token unsafe_reason can return, derived from the table above rather
+#: than duplicated, so the two can never quietly drift apart.
+_ALL_REASON_TOKENS = tuple(reason for _, _, reason in _GUARDRAIL_CASES)
+
+
+@pytest.mark.parametrize("reason", _ALL_REASON_TOKENS)
+def test_every_reason_token_has_an_advisory_note(reason: str):
+    """cleanup._ADVISORY_NOTES must stay exhaustive with whatever
+    unsafe_reason can actually return -- see the "developer prompt" case
+    this whole layer exists for."""
+    assert advisory_note(reason)
+
+
+def test_an_unknown_reason_token_still_produces_a_note():
+    """A guardrail added later must never render a blank note in the review
+    panel -- advisory_note falls back to a generic sentence instead."""
+    assert advisory_note("some_future_guardrail")
+
+
+def test_advisory_note_of_a_clean_result_is_empty():
+    assert advisory_note("") == ""
+
+
+def test_advisory_note_interpolates_the_dropped_entity():
+    assert '"320"' in advisory_note("lost_entity:320")
+
+
+@pytest.mark.parametrize(
+    "reason,family",
+    [
+        ("lost_entity:320", "lost_entity"),
+        ("lost_entity:10:30", "lost_entity"),
+        ("markdown", "markdown"),
+        ("", ""),
+    ],
+)
+def test_guardrail_family_collapses_lost_entity_variants(reason: str, family: str):
+    assert guardrail_family(reason) == family
+
+
+@pytest.mark.parametrize("original,candidate,reason", _GUARDRAIL_CASES)
+def test_gate_mode_is_exactly_the_old_behaviour(original: str, candidate: str, reason: str):
+    """GATE must reproduce unsafe_reason's own verdict exactly -- nothing on
+    the auto-pasted paths (dictation cleanup, a mid-dictation phrase
+    transform) may move as a side effect of adding the reviewed path."""
+    outcome = apply_guardrail(original, candidate, mode=GuardrailMode.GATE)
+    assert outcome.reason == reason
+    assert outcome.blocked is True
+    assert outcome.text == original
+
+
+def test_gate_mode_passes_a_clean_rewrite_through():
+    outcome = apply_guardrail("send it tomorrow", "Send it tomorrow.", mode=GuardrailMode.GATE)
+    assert outcome == GuardrailOutcome(text="Send it tomorrow.", reason="", blocked=False, note="")
+
+
+@pytest.mark.parametrize("original,candidate,reason", _GUARDRAIL_CASES)
+def test_advisory_mode_blocks_only_an_empty_response(original: str, candidate: str, reason: str):
+    """Every other guardrail becomes a note on a result that is still handed
+    back for a human to decide on -- the review panel already gives them
+    full control, so nothing here is grounds to throw the model's answer
+    away outright."""
+    outcome = apply_guardrail(original, candidate, mode=GuardrailMode.ADVISORY)
+    assert outcome.reason == reason
+    if reason == "empty":
+        assert outcome.blocked is True
+        assert outcome.text == original
+    else:
+        assert outcome.blocked is False
+        assert outcome.text == candidate
+        assert outcome.note == advisory_note(reason)
+
+
+def test_the_reported_developer_prompt_failure_survives_review():
+    """The actual bug. A real, user-written transform instruction that
+    explicitly says "Plain text, no markdown syntax" produces an indented
+    "- " list -- exactly the shape _MARKDOWN_PATTERNS exists to catch, and
+    something no user could have predicted or ticked a checkbox to fix.
+    GATE (what plain dictation cleanup is checked against) is right to
+    reject it; ADVISORY (what a reviewed transform result is checked
+    against) must not throw it away."""
+    original = "the login page is broken, can you take a look"
+    candidate = (
+        "Investigate why the login page is broken.\n\n"
+        "Unknown - establish first:\n"
+        "  - what specifically fails: error, wrong output, or no response\n"
+        "  - which inputs or conditions reproduce it"
+    )
+    expectation = OutputExpectation(allows_markdown=False, may_lengthen=True)
+
+    gate = apply_guardrail(original, candidate, mode=GuardrailMode.GATE, expectation=expectation)
+    assert gate.blocked is True
+    assert gate.reason == "markdown"
+
+    advisory = apply_guardrail(
+        original, candidate, mode=GuardrailMode.ADVISORY, expectation=expectation
+    )
+    assert advisory.blocked is False
+    assert advisory.text == candidate
+    assert "list" in advisory.note.lower() or "heading" in advisory.note.lower()
+
+
+def test_an_unfixable_answered_question_survives_review():
+    """assistant_voice and answered_question are deliberately unrelaxable by
+    any transform flag (see OutputExpectation's docstring): a transform that
+    turns a question-shaped request into an imperative brief can trip this
+    permanently, under every combination of the three checkboxes. GATE must
+    still reject it -- nothing about ticking a box changes that -- and
+    ADVISORY must still show it, because the human reviewing it, not a
+    checkbox, is what decides whether the rewrite is actually correct."""
+    original = "why is the login page broken can you tell me"
+    candidate = "The login page is broken because of a stale session cookie."
+
+    for allows_markdown in (False, True):
+        for may_shorten in (False, True):
+            for may_lengthen in (False, True):
+                expectation = OutputExpectation(
+                    allows_markdown=allows_markdown,
+                    may_shorten=may_shorten,
+                    may_lengthen=may_lengthen,
+                )
+                gate = apply_guardrail(
+                    original, candidate, mode=GuardrailMode.GATE, expectation=expectation
+                )
+                assert gate.blocked is True
+                assert gate.reason == "answered_question"
+
+    advisory = apply_guardrail(original, candidate, mode=GuardrailMode.ADVISORY)
+    assert advisory.blocked is False
+    assert advisory.text == candidate
+    assert advisory.reason == "answered_question"

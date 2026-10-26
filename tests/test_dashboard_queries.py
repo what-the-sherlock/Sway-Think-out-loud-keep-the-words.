@@ -233,6 +233,86 @@ class TestPerformance:
             assert health.detail
 
 
+def _add_guardrail_run(latency_db, *, reason, key="command_guardrail_reason", blocked=True, when=None):
+    """A run annotated the way Engine._run_command / _retry_command actually
+    annotate a guardrail decision (see engine.py): the reason token always
+    lands in metadata, and `skipped` is set only for a *blocked* run -- the
+    same distinction performance() relies on to exclude it from totals
+    without also erasing its guardrail tally (see the comment in
+    DashboardQueries.performance above the `guardrails` dict)."""
+    run_id = uuid.uuid4().hex
+    metadata: dict[str, object] = {"source": "hotkey", key: reason}
+    if blocked:
+        metadata["skipped"] = "command_guardrail"
+    with LatencyStore.open(latency_db) as store:
+        store.insert_runs(
+            [
+                RunRecord(
+                    id=run_id,
+                    started_at=when if when is not None else time.time(),
+                    total_ms=700.0,
+                    ok=True,
+                    error=None,
+                    metadata=metadata,
+                    stages=(),
+                )
+            ]
+        )
+    return run_id
+
+
+class TestPerformanceGuardrails:
+    """The observability half of the guardrail-mode fix: a blocked run must
+    stop counting as a successful request (it produced nothing), and its
+    reason must still be visible somewhere -- the two are in tension unless
+    performance() tallies over every row, not just the ones left after
+    filtering skipped runs out. See the `guardrails` block in
+    DashboardQueries.performance.
+    """
+
+    def test_a_blocked_guardrail_run_is_excluded_from_totals_and_tallied(self, paths) -> None:
+        history, latency = paths
+        _add_run(latency, ok=True, felt=500.0)
+        _add_guardrail_run(latency, reason="markdown")
+        with DashboardQueries.open(history, latency) as q:
+            perf = q.performance()
+            assert perf["total"] == 1  # the real dictation only
+            assert perf["ok"] == 1
+            assert perf["guardrails"] == [{"reason": "markdown", "count": 1}]
+
+    def test_lost_entity_variants_collapse_into_one_family(self, paths) -> None:
+        """sway.cleanup.guardrail_family is what stops "lost_entity:200" and
+        "lost_entity:450" from becoming two rows in a UI meant to summarize,
+        not enumerate, every value a model happened to drop."""
+        history, latency = paths
+        _add_guardrail_run(latency, reason="lost_entity:200")
+        _add_guardrail_run(latency, reason="lost_entity:450")
+        with DashboardQueries.open(history, latency) as q:
+            assert q.performance()["guardrails"] == [{"reason": "lost_entity", "count": 2}]
+
+    def test_both_guardrail_metadata_keys_are_counted(self, paths) -> None:
+        """cleanup_guardrail_reason (the dictation GATE path) and
+        command_guardrail_reason (the reviewed ADVISORY path) are two
+        different annotations on two different pipelines; the tally must
+        read both."""
+        history, latency = paths
+        _add_guardrail_run(latency, reason="grew", key="cleanup_guardrail_reason", blocked=False)
+        _add_guardrail_run(latency, reason="grew", key="command_guardrail_reason", blocked=True)
+        with DashboardQueries.open(history, latency) as q:
+            assert q.performance()["guardrails"] == [{"reason": "grew", "count": 2}]
+
+    def test_guardrails_is_empty_on_an_empty_database(self, paths) -> None:
+        history, latency = paths
+        with DashboardQueries.open(history, latency) as q:
+            assert q.performance()["guardrails"] == []
+
+    def test_guardrails_is_empty_when_nothing_tripped(self, paths) -> None:
+        history, latency = paths
+        _add_run(latency, ok=True, felt=500.0)
+        with DashboardQueries.open(history, latency) as q:
+            assert q.performance()["guardrails"] == []
+
+
 class TestStreaks:
     def test_consecutive_days(self, paths) -> None:
         history, latency = paths

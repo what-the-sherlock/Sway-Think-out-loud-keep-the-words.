@@ -52,6 +52,15 @@ TRANSCRIPTION_PATH = "/openai/v1/audio/transcriptions"
 CHAT_COMPLETIONS_PATH = "/openai/v1/chat/completions"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
+#: The full (non-distilled) Whisper. Turbo's distilled decoder degrades most
+#: on lower-resource languages: it decodes Marathi through a Hindi prior,
+#: returning both the wrong language label and a corrupted transcript (the
+#: Marathi copula "आहे" comes back as the Hindi "है"), which no downstream
+#: cleanup or translation can repair. Measured at +140ms median over turbo on
+#: this pipeline's fixtures -- affordable inside the latency budget, and paid
+#: only by the languages that need it (see Language.needs_accurate_stt).
+WHISPER_ACCURATE_MODEL = "whisper-large-v3"
+
 #: CLAUDE.md's Phase 2 named llama-3.1-8b-instant, which Groq has since
 #: retired: it now 404s ("The model `llama-3.1-8b-instant` does not exist or
 #: you do not have access to it"), which took the whole cleanup stage down.
@@ -275,6 +284,7 @@ class GroqClient:
         filename: str = "audio.flac",
         language: str | None = None,
         prompt: str | None = None,
+        model: str | None = None,
         on_first_byte: Callable[[], None] | None = None,
     ) -> TranscriptionResult:
         if not audio:
@@ -284,7 +294,10 @@ class GroqClient:
         # detected spoken language, which flow.cleanup uses to pick a
         # language-appropriate filler-word heuristic; the "text" field Sway
         # actually needs is present in both formats.
-        data: dict[str, str] = {"model": WHISPER_MODEL, "response_format": "verbose_json"}
+        data: dict[str, str] = {
+            "model": model or WHISPER_MODEL,
+            "response_format": "verbose_json",
+        }
         if language:
             data["language"] = language
         if prompt:
@@ -540,6 +553,7 @@ def _client_error_message(response: httpx.Response) -> str:
 __all__ = [
     "CHAT_COMPLETIONS_PATH",
     "CLEANUP_MODEL",
+    "WHISPER_ACCURATE_MODEL",
     "DEFAULT_MAX_OUTPUT_TOKENS",
     "DEFAULT_REASONING_EFFORT",
     "HIGH_NO_SPEECH_PROB",

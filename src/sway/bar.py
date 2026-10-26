@@ -3270,6 +3270,8 @@ class TransformReviewPanel:
         self._text: tk.Text | None = None
         self._title_label: tk.Label | None = None
         self._subtitle_label: tk.Label | None = None
+        self._note_label: tk.Label | None = None
+        self._body: tk.Frame | None = None
         self._apply_btn: tk.Button | None = None
         self._undo_btn: tk.Button | None = None
         self._copy_btn: tk.Button | None = None
@@ -3298,6 +3300,7 @@ class TransformReviewPanel:
         on_undo: Callable[[], None],
         on_close: Callable[[], None],
         subtitle: str = "",
+        note: str = "",
     ) -> None:
         """Open the panel, or refresh it in place if already open (Retry)."""
         self._on_close = on_close
@@ -3311,16 +3314,36 @@ class TransformReviewPanel:
             (self._retry_btn, on_retry),
         ):
             widget.configure(command=lambda h=handler: self._safe(h))
-        self.update(title=title, parts=parts, applied=applied)
+        self.update(title=title, parts=parts, applied=applied, note=note)
 
-    def update(self, *, title: str, parts: list[DiffPart], applied: bool) -> None:
+    def update(
+        self, *, title: str, parts: list[DiffPart], applied: bool, note: str = ""
+    ) -> None:
         """Redraw the diff and button states without reopening the window --
-        used by Retry, which produces a fresh diff for the same panel."""
+        used by Retry, which produces a fresh diff for the same panel.
+
+        ``note`` is an advisory from a guardrail that fired but did not
+        block (see :func:`sway.cleanup.advisory_note`) -- a caveat for the
+        human about to decide, never a reason this method would refuse to
+        show the result. Empty hides the note entirely rather than showing
+        a blank line.
+        """
         if self._top is None:
             return
         self._title_label.configure(text=title)
         if self._subtitle_label is not None:
             self._subtitle_label.configure(text=self._subtitle)
+        if note:
+            self._note_label.configure(text=note)
+            # Re-packed with an explicit `before` every time: a bare pack()
+            # after pack_forget() re-appends to the end of the manager's
+            # list instead of restoring its original position, which would
+            # drop the note below the diff instead of above it.
+            self._note_label.pack(
+                side="top", fill="x", padx=22, pady=(12, 0), before=self._body
+            )
+        else:
+            self._note_label.pack_forget()
         text = self._text
         text.configure(state="normal")
         text.delete("1.0", "end")
@@ -3355,6 +3378,8 @@ class TransformReviewPanel:
         self._text = None
         self._title_label = None
         self._subtitle_label = None
+        self._note_label = None
+        self._body = None
         self._apply_btn = None
         self._undo_btn = None
         self._copy_btn = None
@@ -3486,6 +3511,28 @@ class TransformReviewPanel:
             background=_rgb_hex(self._INSERT_BG),
         )
 
+        # -- advisory note: a guardrail that flagged, not blocked ----------
+        # Amber, the app's existing WARN ink (see _bar_text/HintTone.WARN
+        # above) reused rather than a new colour -- this is the same "worth
+        # a second look" register, not a new severity. Packed `before=body`
+        # so it sits under the divider and above the diff: the diff scrolls
+        # and can run well past the visible 11 lines, and the caveat must be
+        # read *before* the scrolled-past parts of the diff are, not after
+        # them. Starts hidden (no note yet) so it reserves no height until
+        # update() has something to say.
+        note_label = tk.Label(
+            top,
+            text="",
+            bg=bg,
+            fg=_rgb_hex(ACCENT_RECORDING),
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=self._WIDTH - 44,
+        )
+        note_label.pack(side="top", fill="x", padx=22, pady=(12, 0), before=body)
+        note_label.pack_forget()
+
         top.bind("<Escape>", self._request_close)
         top.protocol("WM_DELETE_WINDOW", self._request_close)
 
@@ -3493,6 +3540,8 @@ class TransformReviewPanel:
         self._text = text
         self._title_label = title_label
         self._subtitle_label = subtitle_label
+        self._note_label = note_label
+        self._body = body
         self._apply_btn = apply_btn
         self._undo_btn = undo_btn
         self._copy_btn = copy_btn

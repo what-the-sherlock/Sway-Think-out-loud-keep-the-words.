@@ -626,3 +626,27 @@ def test_the_transform_view_reports_shortcuts_and_runnability(store):
     assert view["polish"]["shortcuts"] == ["ctrl+alt+5"]
     assert view["polish"]["shortcut_labels"] == ["Ctrl + Alt + 5"]
     assert view["polish"]["runnable"] is True
+
+
+# -- the output language ----------------------------------------------------
+
+
+def test_target_language_is_writable_from_the_dashboard(store):
+    """_SIMPLE_FIELDS is a deliberate allowlist: a new Settings field is not
+    remotely writable until someone adds it there on purpose, and a field
+    that is missing fails silently rather than loudly."""
+    actions.update_settings(store, {"target_language": "Marathi"})
+    assert store.get().target_language == "mr"
+
+
+def test_clearing_the_target_language_restores_same_as_spoken(store):
+    actions.update_settings(store, {"target_language": "hi"})
+    actions.update_settings(store, {"target_language": ""})
+    assert store.get().target_language is None
+
+
+def test_an_unknown_target_language_is_not_stored(store):
+    """It has no script for the guardrail to check against, so storing it
+    would disable the check rather than enable a translation."""
+    actions.update_settings(store, {"target_language": "klingon"})
+    assert store.get().target_language is None

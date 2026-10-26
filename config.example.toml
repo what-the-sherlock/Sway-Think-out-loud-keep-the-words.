@@ -52,6 +52,19 @@ timeout_s = 15.0
 connect_timeout_s = 5.0
 max_retries = 1               # transient network errors and 5xx only; 429s are never retried
 # language = "en"             # ISO-639-1 hint; unset lets Whisper auto-detect
+#
+# Naming your language matters more than it looks for Hindi ("hi") and
+# Marathi ("mr"). On auto-detect, the turbo model decodes Marathi through a
+# Hindi prior: it reports the wrong language *and* corrupts the transcript
+# (the Marathi copula "aahe" comes back as the Hindi "hai"), which no amount
+# of cleanup downstream can repair. Setting it also picks the accurate model
+# below, without waiting to guess.
+#
+# The speech-to-text models. stt_accurate_model is used instead of stt_model
+# for languages that measurably need it (currently Hindi and Marathi); it
+# costs about 140ms more per dictation and is never used for English.
+# stt_model = "whisper-large-v3-turbo"
+# stt_accurate_model = "whisper-large-v3"
 
 [cleanup]
 enabled = true                 # false pastes the raw transcript, like Phase 1

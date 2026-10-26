@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from sway import languages
 from sway.dashboard import actions
 from sway.dashboard.actions import ActionError
 from sway.dashboard.queries import DashboardQueries, DashboardQueryError, start_of_today
@@ -361,6 +362,10 @@ class DashboardServer:
             "cleanup_styles": list(_CLEANUP_STYLES),
             "trigger_types": list(_TRIGGER_TYPES),
             "context_modes": list(_CONTEXT_MODES),
+            # Served rather than hardcoded in app.js, which used to keep its
+            # own list that had drifted from the bar's: different names, a
+            # missing language, and no way to add one without editing both.
+            "languages": [dict(row) for row in languages.options()],
         }
         if settings is not None:
             payload["settings"] = settings_to_dict(settings)

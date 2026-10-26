@@ -272,6 +272,17 @@ class GroqConfig:
     max_retries: int = 1
     #: ISO-639-1 hint (e.g. "en"); None lets Whisper auto-detect.
     language: str | None = None
+    #: The default speech-to-text model. Spelled out rather than imported
+    #: from sway.groq_client: this module is deliberately dependency-light
+    #: (it is loaded before anything else and must not drag in httpx), and
+    #: sway.groq_client already imports from here. Kept in step by
+    #: tests/test_config.py.
+    stt_model: str = "whisper-large-v3-turbo"
+    #: Used instead of stt_model for languages whose transcription quality
+    #: materially improves on the full model -- see
+    #: sway.languages.Language.needs_accurate_stt and groq_client's
+    #: WHISPER_ACCURATE_MODEL for the measured trade (+140ms median).
+    stt_accurate_model: str = "whisper-large-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,6 +810,10 @@ def _validate(config: Config) -> None:
         raise ConfigError("[groq].max_retries must be >= 0")
     if config.groq.language is not None and not config.groq.language.strip():
         raise ConfigError("[groq].language must not be blank")
+    if not config.groq.stt_model.strip():
+        raise ConfigError("[groq].stt_model must not be blank")
+    if not config.groq.stt_accurate_model.strip():
+        raise ConfigError("[groq].stt_accurate_model must not be blank")
 
     if not config.cleanup.model.strip():
         raise ConfigError("[cleanup].model must not be blank")
