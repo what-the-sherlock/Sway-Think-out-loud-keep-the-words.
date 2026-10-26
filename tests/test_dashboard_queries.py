@@ -469,3 +469,100 @@ class TestSessionListLatency:
         with DashboardQueries.open(history, latency) as q:
             assert len(q.sessions(kind="dictation")) == 1
             assert q.sessions(kind="command") == []
+
+
+class TestFillersRemoved:
+    """Pure function behind the Voice profile's filler count."""
+
+    def test_counts_fillers_said_but_not_pasted(self) -> None:
+        from sway.dashboard.queries import fillers_removed
+
+        assert fillers_removed("um so uh you know it works", "So it works", "en") == {
+            "um": 1, "uh": 1, "you know": 1,
+        }
+
+    def test_a_filler_kept_in_the_output_is_not_counted(self) -> None:
+        from sway.dashboard.queries import fillers_removed
+
+        assert fillers_removed("I mean it, um, I mean it", "I mean it, I mean it", "english") == {"um": 1}
+
+    def test_no_fillers_is_an_empty_count(self) -> None:
+        from sway.dashboard.queries import fillers_removed
+
+        assert fillers_removed("ship it today", "Ship it today.", "en") == {}
+
+    def test_unknown_language_is_uncountable_not_zero(self) -> None:
+        from sway.dashboard.queries import fillers_removed
+
+        assert fillers_removed("um ok", "ok", None) is None
+        assert fillers_removed("um ok", "ok", "klingon") is None
+
+
+class TestVoiceProfile:
+    def test_empty_install_reports_nothing_measured(self, paths) -> None:
+        with DashboardQueries.open(*paths, typing_wpm=45.0) as q:
+            profile = q.voice_profile()
+        assert profile["dictations"] == 0
+        assert profile["wpm"]["avg"] is None
+        assert profile["length"]["median_words"] is None
+        assert profile["fillers"]["per_100_words"] is None
+        assert profile["hours"] == [0] * 24
+
+    def test_measures_from_dictations_only(self, paths) -> None:
+        history_db, _ = paths
+        noon = time.mktime((2026, 10, 1, 12, 30, 0, 0, 0, -1))
+        with HistoryStore.open(history_db) as store:
+            for raw, text in [
+                ("um this is uh the first one", "This is the first one."),
+                ("and the second one here", "And the second one here."),
+            ]:
+                store.add(
+                    kind=KIND_DICTATION, text=text, raw_text=raw, created_at=noon,
+                    language="english",
+                    metrics=session_metrics(text, speech_ms=3_000.0, audio_ms=4_000.0, typing_wpm=45.0),
+                )
+            store.add(kind="command", text="x", raw_text="x", created_at=noon)
+
+        with DashboardQueries.open(*paths, typing_wpm=45.0) as q:
+            profile = q.voice_profile()
+
+        assert profile["dictations"] == 2
+        assert profile["fillers"]["removed"] == 2
+        assert profile["fillers"]["counted"] == 2
+        assert profile["fillers"]["per_100_words"] == pytest.approx(2 / 12 * 100)
+        assert profile["hours"][12] == 2 and sum(profile["hours"]) == 2
+        assert profile["languages"] == [
+            {"code": "en", "label": "English", "dictations": 2, "share": 1.0}
+        ]
+        assert profile["length"]["median_seconds"] == pytest.approx(3.0)
+        assert profile["wpm"]["measured"] == 2
+
+    def test_unrecorded_language_is_named_as_such(self, paths) -> None:
+        history_db, _ = paths
+        _add_session(history_db)
+        with DashboardQueries.open(*paths, typing_wpm=45.0) as q:
+            langs = q.voice_profile()["languages"]
+        assert langs == [{"code": None, "label": "Not recorded", "dictations": 1, "share": 1.0}]
+
+
+class TestAppCategory:
+    def test_app_usage_carries_the_style_category(self, paths) -> None:
+        history_db, _ = paths
+        _add_session(history_db, app="slack.exe")
+        _add_session(history_db, app="notepad.exe")
+        with DashboardQueries.open(*paths, typing_wpm=45.0) as q:
+            categories = {row["app"]: row["category"] for row in q.app_usage()}
+        assert categories == {"slack.exe": "chat", "notepad.exe": "other"}
+
+
+def test_stage_parts_separate_overlapping_spans():
+    """The Performance chart sums only "pipeline" stages; a sub-span or the
+    hold time added in would double-count or count the user's own speech."""
+    from sway.dashboard.queries import STAGE_PARTS
+    from sway.latency.models import Stage
+
+    assert STAGE_PARTS["cleanup"] == STAGE_PARTS["dispatch"] == "pipeline"
+    assert STAGE_PARTS["llm_first_token"] == STAGE_PARTS["stt_first_byte"] == "within"
+    assert STAGE_PARTS["hotkey_hold"] == "hold"
+    # Every stage the engine can record has a classification.
+    assert {stage.value for stage in Stage} <= set(STAGE_PARTS)

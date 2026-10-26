@@ -60,7 +60,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import lru_cache
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 from sway.branding import (
     ACCENT_BRAND,
@@ -68,13 +68,17 @@ from sway.branding import (
     ACCENT_IDLE,
     ACCENT_RECORDING,
     INK,
+    INK_MUTED,
     SURFACE,
+    SURFACE_HOVER,
     SURFACE_RAISED,
     app_badge_image,
 )
 from sway.diff import DiffPart
 from sway.motion import (
+    ACCENT_S,
     BUTTON_FILL_S,
+    LABEL_FADE_S,
     COLLAPSE_S,
     DOT_HOVER_S,
     DOT_UNHOVER_S,
@@ -91,10 +95,12 @@ from sway.motion import (
     ease_in_out_cubic,
     ease_out_back,
     ease_out_cubic,
+    ease_standard,
     lerp,
     lerp_rgb,
     shake_offset,
 )
+from sway.platform.layered import LayeredSurface, dpi_scale
 from sway.orb import (
     REDUCED_MOTION_PHASE,
     OrbVariant,
@@ -222,7 +228,7 @@ _BUTTON_GAP = 6
 #: (not a slow mood-lighting fade), long enough to be visibly a blend rather
 #: than a snap -- the gap between "Listening" (amber) and "Transcribing"
 #: (indigo) is otherwise the single most jarring instant in the whole bar.
-_ACCENT_CROSSFADE_S = 0.15
+_ACCENT_CROSSFADE_S = ACCENT_S
 
 #: The inline recovery pill on an error or a paused capsule.
 _PILL_H = 24
@@ -337,7 +343,9 @@ COLLAPSE_DWELL_S = 0.25
 _DISMISS_GRACE_S = 0.25
 
 
-def _finish(canvas: Image.Image, width: int, height: int) -> Image.Image:
+def _finish(
+    canvas: Image.Image, width: int, height: int, *, scale: float = 1.0, keyed: bool = True
+) -> Image.Image:
     """Downsample, then lay the result on the key colour.
 
     The order matters and is easy to get wrong. Drawing onto a canvas already
@@ -351,8 +359,14 @@ def _finish(canvas: Image.Image, width: int, height: int) -> Image.Image:
     transparent edge pixels blend toward it and read as a soft dark edge
     against any desktop.
     """
-    resized = canvas.resize((width, height), Image.LANCZOS)
-    ground = Image.new("RGBA", (width, height), (*_KEY_RGB, 255))
+    # ``scale`` is the monitor's DPI scale (DESIGN.md §8.5). The canvas is
+    # supersampled _SS times, so any scale up to _SS is still a downsample
+    # and stays crisp. ``keyed=False`` keeps true alpha for a layered window.
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    resized = canvas.resize(size, Image.LANCZOS)
+    if not keyed:
+        return resized
+    ground = Image.new("RGBA", size, (*_KEY_RGB, 255))
     ground.alpha_composite(resized)
     return ground
 
@@ -882,8 +896,15 @@ def render_bar(
     hollow: bool = False,
     reduced_motion: bool = False,
     accent_override: tuple[int, int, int] | None = None,
+    scale: float = 1.0,
+    keyed: bool = True,
+    label_t: float = 1.0,
 ) -> tuple[Image.Image, tuple[HitRegion, ...]]:
     """One full bar frame, plus where it can be clicked.
+
+    ``scale`` renders at the monitor's DPI (regions stay in logical pixels),
+    ``keyed=False`` keeps real alpha for a layered window, and ``label_t``
+    fades the state label in after a change (DESIGN.md §8.2).
 
     ``expand`` runs 0 (the resting dot) to 1 (the settled capsule) and every
     value between is a real frame of the morph, so there is one layout rather
@@ -1161,7 +1182,21 @@ def render_bar(
         text_x = _PAD_LEFT + _AVATAR + _GAP
         clip_right = max(text_x, cursor)
         layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-        _draw_rich(layer, text, x=text_x, centre_y=height / 2, ink=ink, opacity=detail_t)
+        label_opacity = detail_t * _clamp01(label_t)
+        timer = (
+            state is BarState.RECORDING and not detail and not hint and elapsed_s is not None
+        )
+        if timer:
+            # The running timer is secondary to the label and drawn muted,
+            # so "Listening" stays the thing that reads first (§8.2).
+            _draw_rich(layer, style.label, x=text_x, centre_y=height / 2, ink=ink, opacity=label_opacity)
+            _draw_rich(
+                layer, f" · {_elapsed_label(elapsed_s)}",
+                x=text_x + measure_rich(style.label), centre_y=height / 2,
+                ink=INK_MUTED, opacity=label_opacity,
+            )
+        else:
+            _draw_rich(layer, text, x=text_x, centre_y=height / 2, ink=ink, opacity=label_opacity)
         if clip_right < width:
             blank = Image.new("RGBA", (bw - clip_right * _SS, bh), (0, 0, 0, 0))
             layer.paste(blank, (clip_right * _SS, 0))
@@ -1171,7 +1206,7 @@ def render_bar(
     # precedence because they are checked first.
     regions.append(HitRegion(0, 0, width, height, ACTION_MENU))
 
-    return _finish(canvas, width, height), tuple(regions)
+    return _finish(canvas, width, height, scale=scale, keyed=keyed), tuple(regions)
 
 
 def _orb_amplitude(
@@ -1352,7 +1387,7 @@ def _draw_button(
         x * _SS + d - shrink,
         y * _SS + d - shrink,
     )
-    fill = lerp_rgb(SURFACE_RAISED, ACCENT_BRAND, _clamp01(fill_t))
+    fill = lerp_rgb(SURFACE_RAISED, SURFACE_HOVER, _clamp01(fill_t))
     draw.ellipse(box, fill=_alpha(fill, opacity * lerp(1.0, 0.92, press_t)))
     inset = (box[2] - box[0]) * 0.28
     ICONS[glyph](
@@ -1465,14 +1500,16 @@ def _draw_level(
 #: Panels are light where the bar is dark. That inversion does real work: it
 #: makes the panel read as sitting *above* the bar rather than being part of
 #: it, without needing a border or a shadow to say so.
-_MENU_BG = (252, 251, 249)
+#: DESIGN.md §3.2: the dashboard's tokens -- --field, --ink, --muted,
+#: --separator, --fill -- so the menu reads as part of the app.
+_MENU_BG = (255, 255, 255)
 _MENU_INK = (22, 21, 15)
-_MENU_MUTED = (119, 115, 106)
-_MENU_RULE = (230, 227, 221)
-_MENU_HOVER = (240, 238, 233)
+_MENU_MUTED = (107, 103, 95)
+_MENU_RULE = (235, 232, 225)
+_MENU_HOVER = (238, 235, 228)
 #: Disabled rows. Light enough to read as unavailable, dark enough to still
 #: be legible -- a row the user cannot use still has to explain itself.
-_MENU_DISABLED = (176, 172, 164)
+_MENU_DISABLED = (143, 138, 128)  # --faint
 
 _MENU_W = 268
 _MENU_ROW_H = 44
@@ -1532,6 +1569,8 @@ def render_menu(
     hover: str = "",
     focus: str = "",
     width: int = _MENU_W,
+    scale: float = 1.0,
+    keyed: bool = True,
 ) -> tuple[Image.Image, tuple[HitRegion, ...]]:
     """The panel, and where each row is.
 
@@ -1649,7 +1688,7 @@ def render_menu(
             regions.append(HitRegion(0, y, width, y + row_h, item.action))
         y += row_h
 
-    return _finish(canvas, width, height), tuple(regions)
+    return _finish(canvas, width, height, scale=scale, keyed=keyed), tuple(regions)
 
 
 _TOOLTIP_PAD_X = 9
@@ -1657,7 +1696,7 @@ _TOOLTIP_H = 26
 _TOOLTIP_FONT_SIZE = 11
 
 
-def render_tooltip(text: str) -> Image.Image:
+def render_tooltip(text: str, *, scale: float = 1.0, keyed: bool = True) -> Image.Image:
     """A small dark label. Dark on purpose, matching the bar and not the
     panels: a tooltip belongs to the control it describes."""
     font = _font(_TOOLTIP_FONT_SIZE, bold=False)
@@ -1679,7 +1718,7 @@ def render_tooltip(text: str) -> Image.Image:
         font=font,
         fill=(*INK, 255),
     )
-    return _finish(canvas, width, height)
+    return _finish(canvas, width, height, scale=scale, keyed=keyed)
 
 
 # ---------------------------------------------------------------------------
@@ -1813,6 +1852,36 @@ def build_menu(
     return tuple(built)
 
 
+#: The capsule's soft shadow (§8.5): 0 4px 16px rgba(0,0,0,.35), in
+#: logical pixels. Only possible with per-pixel alpha.
+_SHADOW_BLUR = 8
+_SHADOW_Y = 4
+_SHADOW_ALPHA = 0.35
+_SHADOW_MARGIN = 14
+
+
+def with_shadow(image: Image.Image, *, scale: float, strength: float) -> tuple[Image.Image, int]:
+    """``image`` on a larger transparent frame with a soft shadow under it.
+
+    Returns the frame and the margin added on every side, in physical
+    pixels. ``strength`` 0 adds the margin but no shadow, so the window does
+    not change size as the capsule opens. Pure, so testable without Tk.
+    """
+    margin = round(_SHADOW_MARGIN * scale)
+    w, h = image.size
+    frame = Image.new("RGBA", (w + 2 * margin, h + 2 * margin), (0, 0, 0, 0))
+    strength = _clamp01(strength)
+    if strength > 0.01:
+        alpha = image.getchannel("A").point(lambda v: round(v * _SHADOW_ALPHA * strength))
+        shadow = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        shadow.putalpha(alpha)
+        layer = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+        layer.paste(shadow, (margin, margin + round(_SHADOW_Y * scale)))
+        frame = layer.filter(ImageFilter.GaussianBlur(_SHADOW_BLUR * scale / 2))
+    frame.alpha_composite(image, (margin, margin))
+    return frame, margin
+
+
 def _set_window_alpha(window: tk.Misc, value: float) -> bool:
     """Best-effort whole-window opacity.
 
@@ -1901,6 +1970,15 @@ class SwayBar:
         self._panel_opened_at = 0.0
         self._tooltip: _Tooltip | None = None
         self._tooltip_for = ""
+        #: Per-pixel-alpha presentation (§8.5); None means the colour key.
+        self._surface: LayeredSurface | None = None
+        #: Monitor DPI scale. Frames, window and panels are physical pixels;
+        #: hit regions and layout stay logical.
+        self._scale = 1.0
+        self._dpi_checked_at = 0.0
+        #: Transparent margin around the capsule for its shadow, physical px.
+        self._margin = 0
+        self._screen_xy = (0, 0)
 
         self._motion = Motion()
         self._motion.set("expand", 0.0)
@@ -1908,6 +1986,7 @@ class SwayBar:
         self._motion.set("dot", 0.0)
         self._motion.set("hover", 0.0)
         self._motion.set("press", 0.0)
+        self._motion.set("label", 1.0)
         for index in range(3):
             self._motion.set(f"level{index}", 0.0)
         self._expand_dwell = Timer()
@@ -2039,17 +2118,25 @@ class SwayBar:
         root.configure(bg=key_hex)
 
         shaped = False
-        try:
-            root.wm_attributes("-transparentcolor", key_hex)
+        surface = LayeredSurface()
+        if surface.attach(root):
+            # True alpha: smooth edges and a shadow. Nothing may set -alpha or
+            # -transparentcolor on this window from now on (see layered.py).
+            self._surface = surface
+            self._scale = dpi_scale(root)
             shaped = True
-        except tk.TclError:
-            # Only Windows has colour-keyed transparency. Elsewhere fall back
-            # to whole-window translucency: the bar still works, it is just a
-            # soft-edged rectangle rather than a capsule.
+        else:
             try:
-                root.attributes("-alpha", 0.94)
+                root.wm_attributes("-transparentcolor", key_hex)
+                shaped = True
             except tk.TclError:
-                pass
+                # Only Windows has colour-keyed transparency. Elsewhere fall
+                # back to whole-window translucency: the bar still works, it
+                # is just a soft-edged rectangle rather than a capsule.
+                try:
+                    root.attributes("-alpha", 0.94)
+                except tk.TclError:
+                    pass
 
         try:
             self._icon_photo = ImageTk.PhotoImage(app_badge_image(64))
@@ -2120,6 +2207,11 @@ class SwayBar:
                 root.after(0, root.destroy)
             except tk.TclError:
                 pass  # already destroyed
+            except RuntimeError:
+                # Called off the Tk thread while its loop is not answering
+                # cross-thread calls. The poll loop drains this queue on the
+                # Tk thread, so the destroy still happens there.
+                self._ui_actions.put(lambda r: r.destroy())
 
     # -- input -------------------------------------------------------------
 
@@ -2133,11 +2225,21 @@ class SwayBar:
         self._hover_dwell.disarm()
         self._hide_tooltip()
 
+    def _local(self, event: tk.Event) -> tuple[float, float]:
+        """An event's position in logical capsule coordinates."""
+        return ((event.x - self._margin) / self._scale, (event.y - self._margin) / self._scale)
+
+    def _on_body(self, x: float, y: float) -> bool:
+        """Whether a logical point is on the capsule, not its shadow margin."""
+        body = next((r for r in self._regions if r.action == ACTION_MENU), None)
+        return body is None or body.contains(x, y)
+
     def _on_motion(self, event: tk.Event) -> None:
         self._pointer_inside = True
         hover = ""
+        x, y = self._local(event)
         for region in self._regions:
-            if region.action != ACTION_MENU and region.contains(event.x, event.y):
+            if region.action != ACTION_MENU and region.contains(x, y):
                 hover = region.action
                 break
         if hover != self._hover:
@@ -2155,18 +2257,21 @@ class SwayBar:
 
     def _on_press_down(self, event: tk.Event) -> None:
         self._hide_tooltip()
+        x, y = self._local(event)
         for region in self._regions:
-            if region.action != ACTION_MENU and region.contains(event.x, event.y):
+            if region.action != ACTION_MENU and region.contains(x, y):
                 self._press = region.action
                 return
-        self._press = ACTION_MENU
+        # A press on the shadow margin is not a press on the bar.
+        self._press = ACTION_MENU if self._on_body(x, y) else ""
 
     def _on_press_up(self, event: tk.Event) -> None:
         pressed, self._press = self._press, ""
         if not pressed:
             return
+        x, y = self._local(event)
         for region in self._regions:
-            if region.action != ACTION_MENU and region.contains(event.x, event.y):
+            if region.action != ACTION_MENU and region.contains(x, y):
                 if region.action == pressed:
                     self._activate(region.action)
                 return
@@ -2202,10 +2307,17 @@ class SwayBar:
     # -- panels ------------------------------------------------------------
 
     def _menu_geometry(self) -> tuple[int, int, int]:
+        """The capsule's screen x, y and width, without the shadow margin."""
         root = self._root
         if root is None:
             return (0, 0, _DOT_BOX)
-        return (root.winfo_x(), root.winfo_y(), root.winfo_width())
+        m = self._margin
+        return (root.winfo_x() + m, root.winfo_y() + m, root.winfo_width() - 2 * m)
+
+    def _physical_offset(self, action: str) -> int | None:
+        """:meth:`_anchor_offset` in physical pixels from the capsule's left."""
+        offset = self._anchor_offset(action)
+        return None if offset is None else round(offset * self._scale)
 
     def _open_menu(self) -> None:
         root = self._root
@@ -2228,6 +2340,8 @@ class SwayBar:
             anchor=self._menu_geometry(),
             position=self._position,
             on_choose=self._on_menu_choice,
+            scale=self._scale,
+            layered=self._surface is not None,
         )
         self._menu.open()
         self._panel_opened_at = time.monotonic()
@@ -2250,7 +2364,7 @@ class SwayBar:
             return
         self._hide_tooltip()
         self._popover_anchor = anchor
-        offset = self._anchor_offset(anchor)
+        offset = self._physical_offset(anchor)
         self._popover = _Panel(
             root,
             items,
@@ -2259,6 +2373,8 @@ class SwayBar:
             on_choose=self._on_popover_choice,
             width=width,
             anchor_offset=offset,
+            scale=self._scale,
+            layered=self._surface is not None,
         )
         self._popover.open()
         self._panel_opened_at = time.monotonic()
@@ -2418,14 +2534,14 @@ class SwayBar:
         root = self._root
         if root is None:
             return
-        offset = self._anchor_offset(self._hover)
+        offset = self._physical_offset(self._hover)
         if offset is None:
             return
         self._hide_tooltip()
-        self._tooltip = _Tooltip(root, text)
+        self._tooltip = _Tooltip(root, text, scale=self._scale, layered=self._surface is not None)
         self._tooltip.open(
             bar=self._menu_geometry(),
-            bar_height=root.winfo_height(),
+            bar_height=root.winfo_height() - 2 * self._margin,
             offset_x=offset,
             position=self._position,
         )
@@ -2459,6 +2575,9 @@ class SwayBar:
         try:
             while True:
                 state, detail, kind = self._queue.get_nowait()
+                if state != self._state or detail != self._detail:
+                    # The new label fades in (§8.2) instead of snapping.
+                    self._motion.set("label", 0.0)
                 if state != self._state:
                     self._state_entered_at = time.monotonic()
                     self._prev_accent = _STYLES[self._state].accent
@@ -2495,6 +2614,16 @@ class SwayBar:
                                 frozen=hold_error)
         changed |= self._expire(BarState.DONE, "_done_since", DONE_HOLD_S, now)
         changed |= self._expire(BarState.COACH, "_coach_since", self._coach_ttl, now)
+
+        if self._surface is not None and now - self._dpi_checked_at > 1.0:
+            # Follow the bar to a monitor with a different scale (§8.5).
+            self._dpi_checked_at = now
+            scale = dpi_scale(self._root) if self._root is not None else self._scale
+            if abs(scale - self._scale) > 0.01:
+                self._scale = scale
+                self._close_panels()
+                self._hide_tooltip()
+                changed = True
 
         self._dismiss_on_outside_click()
         self._update_phase(now)
@@ -2631,7 +2760,8 @@ class SwayBar:
         # Reset to 0 by the state-change handler above; always ticks toward
         # 1 here, so it is a no-op once settled and self-corrects if a
         # frame was ever dropped mid-blend.
-        self._motion.to("accent_t", 1.0, duration_s=_ACCENT_CROSSFADE_S, ease=ease_out_cubic)
+        self._motion.to("accent_t", 1.0, duration_s=_ACCENT_CROSSFADE_S, ease=ease_standard)
+        self._motion.to("label", 1.0, duration_s=LABEL_FADE_S, ease=ease_standard)
 
     def _apply_frame(self, *, force: bool = False) -> None:
         canvas = self._canvas
@@ -2712,6 +2842,7 @@ class SwayBar:
             round(press_t, 2), orb_t,
             tuple(round(value, 2) for value in level_t),
             round(opacity, 2), round(shake, 1), accent,
+            round(self._motion.value("label", 1.0), 2), self._scale,
         )
         if not force and key == self._render_key:
             return
@@ -2740,8 +2871,17 @@ class SwayBar:
             hollow=self._state is BarState.PAUSED,
             reduced_motion=self._reduced_motion,
             accent_override=accent,
+            scale=self._scale,
+            keyed=self._surface is None,
+            label_t=self._motion.value("label", 1.0),
         )
         self._regions = regions
+
+        if self._surface is not None:
+            # The shadow grows in with the capsule; at rest the tray has none.
+            image, self._margin = with_shadow(
+                image, scale=self._scale, strength=_clamp01((expand - 0.3) / 0.7) * opacity
+            )
 
         image_w, image_h = image.size
 
@@ -2750,9 +2890,24 @@ class SwayBar:
         # rectangle, which shows up as a visibly doubled, half-transparent
         # bar every time it changes width -- and it changes width on nearly
         # every state change.
-        self._reposition(image_w, image_h, shake=shake)
+        self._reposition(image_w, image_h, shake=shake * self._scale)
         if int(canvas.cget("width")) != image_w or int(canvas.cget("height")) != image_h:
             canvas.config(width=image_w, height=image_h)
+
+        if self._surface is not None:
+            if self._surface.present(image, *self._screen_xy):
+                return
+            # A failed present is not retried forever: fall back to the key.
+            logger.warning("layered presentation failed; using the colour key")
+            self._surface = None
+            self._margin = 0
+            try:
+                key_hex = "#%02x%02x%02x" % _KEY_RGB
+                self._root.wm_attributes("-transparentcolor", key_hex)
+            except (tk.TclError, AttributeError):
+                pass
+            self._render_key = None
+            return
 
         photo = ImageTk.PhotoImage(image)
         self._photo = photo  # Tk drops images with no live reference
@@ -2766,8 +2921,12 @@ class SwayBar:
         if root is None:
             return
         area = work_area((root.winfo_screenwidth(), root.winfo_screenheight()))
-        x, y = place(self._position, (width, height), area)
-        x += round(shake)
+        m = self._margin
+        # Docked by the capsule, not by its shadow margin.
+        x, y = place(self._position, (width - 2 * m, height - 2 * m), area)
+        x += round(shake) - m
+        y -= m
+        self._screen_xy = (x, y)
         wanted = f"{width}x{height}+{x}+{y}"
         if wanted == self._geometry:
             return
@@ -2798,8 +2957,15 @@ class _Panel:
         on_choose: Callable[[str], None],
         width: int = _MENU_W,
         anchor_offset: int | None = None,
+        scale: float = 1.0,
+        layered: bool = False,
     ) -> None:
         self._parent = parent
+        self._scale = scale
+        self._want_layered = layered
+        self._surface: LayeredSurface | None = None
+        self._image: Image.Image | None = None
+        self._alpha = 1.0
         self._items = items
         self._anchor = anchor
         self._position = position
@@ -2827,10 +2993,15 @@ class _Panel:
         top.overrideredirect(True)
         top.attributes("-topmost", True)
         top.configure(bg=key_hex)
-        try:
-            top.wm_attributes("-transparentcolor", key_hex)
-        except tk.TclError:
-            pass
+        if self._want_layered:
+            surface = LayeredSurface()
+            if surface.attach(top):
+                self._surface = surface
+        if self._surface is None:
+            try:
+                top.wm_attributes("-transparentcolor", key_hex)
+            except tk.TclError:
+                pass
 
         canvas = tk.Canvas(top, highlightthickness=0, bg=key_hex)
         canvas.pack()
@@ -2852,7 +3023,10 @@ class _Panel:
         self._draw()
         self._place()
         self._opened_at = time.monotonic()
-        if _Panel._fade_supported:
+        if self._surface is not None:
+            self._alpha = 0.0
+            self._animate()
+        elif _Panel._fade_supported:
             if _set_window_alpha(top, 0.0):
                 self._animate()
             else:
@@ -2863,23 +3037,29 @@ class _Panel:
         if top is None:
             return
         bar_x, bar_y, bar_w = self._anchor
-        width, height = self._width, menu_height(self._items)
+        s = self._scale
+        if self._image is not None:
+            width, height = self._image.size
+        else:
+            width, height = round(self._width * s), round(menu_height(self._items) * s)
         if self._anchor_offset is None:
             x = bar_x + (bar_w - width) // 2
         else:
             x = bar_x + self._anchor_offset - width // 2
         # Panels always open toward the middle of the screen, so one docked at
-        # the bottom never opens off the bottom edge.
+        # the bottom never opens off the bottom edge. 52 = capsule + 8 gap.
         below = not self._position.startswith("bottom-")
-        y = bar_y + 52 if below else bar_y - height - 8
+        y = bar_y + round(52 * s) if below else bar_y - height - round(8 * s)
         # The rise: a panel arrives from the direction it is anchored to.
-        y += round(rise if below else -rise)
+        y += round((rise if below else -rise) * s)
         area = work_area(
             (self._parent.winfo_screenwidth(), self._parent.winfo_screenheight())
         )
         x, y = clamp_to_area(x, y, (width, height), area)
         self._origin = (x, y)
         top.geometry(f"{width}x{height}+{x}+{y}")
+        if self._surface is not None and self._image is not None:
+            self._surface.present(self._image, x, y, alpha=self._alpha)
 
     def _animate(self) -> None:
         """Fade and rise on open, fade on close. ~160ms and ~110ms."""
@@ -2891,7 +3071,11 @@ class _Panel:
         t = _clamp01(elapsed / duration) if duration > 0 else 1.0
         eased = ease_out_cubic(t)
         alpha = (1.0 - eased) if self._closing else eased
-        if not _set_window_alpha(top, alpha):
+        if self._surface is not None:
+            self._alpha = alpha
+            if self._closing:
+                self._place()
+        elif not _set_window_alpha(top, alpha):
             _Panel._fade_supported = False
             self._finish_animation()
             return
@@ -2919,9 +3103,16 @@ class _Panel:
         if canvas is None:
             return
         image, regions = render_menu(
-            self._items, hover=self._hover, focus=self._focus, width=self._width
+            self._items, hover=self._hover, focus=self._focus, width=self._width,
+            scale=self._scale, keyed=self._surface is None,
         )
         self._regions = regions
+        self._image = image
+        if self._surface is not None:
+            canvas.config(width=image.width, height=image.height)
+            if self._top is not None and self._origin != (0, 0):
+                self._surface.present(image, *self._origin, alpha=self._alpha)
+            return
         photo = ImageTk.PhotoImage(image)
         self._photo = photo
         if self._item_id is None:
@@ -2963,15 +3154,17 @@ class _Panel:
     # -- input -------------------------------------------------------------
 
     def _on_motion(self, event: tk.Event) -> None:
+        x, y = event.x / self._scale, event.y / self._scale
         for region in self._regions:
-            if region.contains(event.x, event.y):
+            if region.contains(x, y):
                 self._set_hover(region.action)
                 return
         self._set_hover("")
 
     def _on_click(self, event: tk.Event) -> None:
+        x, y = event.x / self._scale, event.y / self._scale
         for region in self._regions:
-            if region.contains(event.x, event.y):
+            if region.contains(x, y):
                 self._choose(region.action)
                 return
         self._choose("")
@@ -3086,9 +3279,11 @@ class _Tooltip:
     a click that was meant for the button it describes.
     """
 
-    def __init__(self, parent: tk.Tk, text: str) -> None:
+    def __init__(self, parent: tk.Tk, text: str, *, scale: float = 1.0, layered: bool = False) -> None:
         self._parent = parent
         self._text = text
+        self._scale = scale
+        self._layered = layered
         self._top: tk.Toplevel | None = None
         self._photo: ImageTk.PhotoImage | None = None
 
@@ -3102,15 +3297,19 @@ class _Tooltip:
     ) -> None:
         key_hex = "#%02x%02x%02x" % _KEY_RGB
         try:
-            image = render_tooltip(self._text)
             top = tk.Toplevel(self._parent)
             top.overrideredirect(True)
             top.attributes("-topmost", True)
             top.configure(bg=key_hex)
-            try:
-                top.wm_attributes("-transparentcolor", key_hex)
-            except tk.TclError:
-                pass
+            surface = LayeredSurface() if self._layered else None
+            if surface is not None and not surface.attach(top):
+                surface = None
+            image = render_tooltip(self._text, scale=self._scale, keyed=surface is None)
+            if surface is None:
+                try:
+                    top.wm_attributes("-transparentcolor", key_hex)
+                except tk.TclError:
+                    pass
             canvas = tk.Canvas(
                 top,
                 highlightthickness=0,
@@ -3126,12 +3325,15 @@ class _Tooltip:
             bar_x, bar_y, _bar_w = bar
             x = bar_x + offset_x - image.width // 2
             below = position.startswith("top-")
-            y = bar_y + bar_height + 8 if below else bar_y - image.height - 8
+            gap = round(8 * self._scale)
+            y = bar_y + bar_height + gap if below else bar_y - image.height - gap
             area = work_area(
                 (self._parent.winfo_screenwidth(), self._parent.winfo_screenheight())
             )
             x, y = clamp_to_area(x, y, (image.width, image.height), area)
             top.geometry(f"{image.width}x{image.height}+{x}+{y}")
+            if surface is not None:
+                surface.present(image, x, y)
             self._top = top
         except Exception:
             # A tooltip is the least important thing on screen; it must never
@@ -3401,7 +3603,7 @@ class TransformReviewPanel:
     def _build(self, *, title: str) -> None:
         top = tk.Toplevel(self._root)
         top.withdraw()
-        top.title("Sway — Changes")
+        top.title("Sway: Changes")
         top.overrideredirect(True)
         top.attributes("-topmost", True)
 

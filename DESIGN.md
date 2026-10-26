@@ -1,14 +1,14 @@
-# Sway — Design System & UX Guide
+# Sway - Design System & UX Guide
 
 The single reference for how Sway looks, moves, and speaks. Read this before
 adding or changing any screen, component, overlay state, or user-facing string.
 
-**v2 — 2026-10-26.** v1 was copied from the working tree on 2026-10-22. v2
-changes values on purpose; every changed value is marked **Δ** and listed in
-§0 with the file that has to follow. Until §0 is empty, the code and this file
-disagree *by design* — work through §0, then delete each line as it lands.
-After that the old rule applies again: when code and this file disagree, fix
-one of them in the same change.
+**v2.2 - 2026-10-26.** v1 was copied from the working tree on 2026-10-22. v2
+changed values on purpose (marked **Δ**); v2.1 records them landing in the
+dashboard, the two open questions resolved (§16), and indigo becoming the
+brand colour for primary actions (§3.1). §0 now lists only what is still
+outstanding. Everywhere else the rule applies: when code and this file
+disagree, fix one of them in the same change.
 
 | Surface | Source of truth |
 |---|---|
@@ -39,7 +39,7 @@ is a thing people *feel* without being able to name:
    reserved for the things you type into. (Measured from the reference:
    panel `#fcfcfb`, card `#f5f4f0` with no border, row separators `#eeebe3`,
    secondary buttons `#eeebe3` fill, inputs `#ffffff`.)
-2. **Spacing with no scale.** 60, 70, 35, 50, 28, 22×24, 56 — none share a
+2. **Spacing with no scale.** 60, 70, 35, 50, 28, 22×24, 56 - none share a
    base, so nothing lines up by accident and every new screen invents its own.
 3. **Five control heights** (32, 34, 38, 40, 42). A 38px button next to a 40px
    input is off by 2px, and people see it.
@@ -51,26 +51,32 @@ is a thing people *feel* without being able to name:
    flashes white on launch, and lets you drag the logo out as an image. That
    is exactly "feels like a test site".
 6. **The overlay's edges.** A colour-keyed Tk window has 1-bit transparency, so
-   anti-aliased PIL edges get a fringe and corners look jagged — and if the
+   anti-aliased PIL edges get a fringe and corners look jagged - and if the
    process isn't per-monitor DPI aware it's also blurry at 125–150% scaling.
 
-### Code that must follow v2
+### Status of v2 in code
 
-| Δ | File | Change |
-|---|---|---|
-| Surfaces + ink tokens | `styles.css` | §3.1 — `--panel`, `--card`, `--fill`, `--field`, `--separator`, `--muted`, `--faint`, `--red-ink`, `--amber-ink` |
-| Card / button / list restyle | `styles.css` | §7 — remove borders from `.card`, `.btn`; add `.list` container |
-| Spacing scale | `styles.css` | §5.2 — replace raw px with `--s-*` tokens |
-| Control heights | `styles.css` | §5.3 — `.btn` 38→40, chips 34→32 |
-| Radii | `styles.css` | §5.4 |
-| Type: optical sizes | `styles.css` | §4 — Display/Text/Small Segoe variants |
-| Elevation | `styles.css` | §5.5 — new shadow tokens |
-| Easing + dashboard motion | `styles.css`, `motion.py` | §10 |
-| Loading, toasts, tooltips, feedback | `app.js`, `styles.css` | §9, §11 |
-| Form states + validation | `app.js`, `styles.css` | §7 Inputs |
-| Key-held colour | `styles.css` | §3.1 — `.cap.held` indigo → amber pressed |
-| WebView2 hardening | window host | §13 |
-| Overlay alpha + DPI | `bar.py` | §8.5 |
+Landed (2026-10-26): every dashboard Δ - tokens, tonal surfaces, the spacing
+scale, three control heights, radii, optical sizes, elevation, the three
+easing curves, borderless cards and buttons, `.list` containers, form states
+and validation, busy states, skeleton loading, toasts, tooltips, the sliding
+tab underline, sticky tab row, icon rail below 1180px, keyboard shortcuts,
+amber held key, 1.5px icons, `draggable="false"`, zoom/context-menu/drag
+blocked in the page, the canvas-coloured window background, the bar menu on
+the dashboard palette, and `motion.py`'s `ease_standard` / `ease_enter` /
+`ease_exit`, `ACCENT_S`, `LABEL_FADE_S`.
+
+Also landed (2026-10-26, second pass): per-pixel alpha for the bar, its
+panels and its tooltip (`platform/layered.py`, `UpdateLayeredWindow`, with
+the colour key kept as an automatic fallback), DPI-scaled rendering that
+follows the monitor, the capsule's soft shadow, the label fade, the muted
+timer, `SURFACE_HOVER` / `INK_MUTED`, the custom select list, the text-field
+menu, window size/position/maximized restore with show-after-first-load,
+stat cross-fades, new-row flashes, snippet Undo, and the key-capture
+interaction (§7 Key caps).
+
+Nothing is outstanding. From here the normal rule applies: when code and
+this file disagree, fix one of them in the same change.
 
 ---
 
@@ -80,9 +86,9 @@ These decide arguments. If a proposal breaks one, it needs a decision-log entry.
 
 1. **The product disappears when it isn't being used.** At rest the bar is an
    empty outlined tray. Nothing pulses, nothing reminds you it exists.
-2. **Real data only.** Never show a number we did not measure. Unmeasured is an
-   em dash (`—`), not `0`. Anything built on an assumption is labelled
-   **Estimate**. (CLAUDE.md, Phase 6 — non-negotiable.)
+2. **Real data only.** Never show a number we did not measure. Unmeasured
+   reads **"Not yet"** in a stat tile and **"n/a"** inline, never `0`. Anything built on an assumption is labelled
+   **Estimate**. (CLAUDE.md, Phase 6 - non-negotiable.)
 3. **State facts, not moods.** "Transcribing", not "Thinking". "47 words", not
    "✓". "Ready in 47s", not "Please wait".
 4. **Every colour has one job.** Four accents, each with a single meaning
@@ -92,7 +98,7 @@ These decide arguments. If a proposal breaks one, it needs a decision-log entry.
 6. **Never steal focus.** Paste goes to the focused window. Any surface that
    activates itself mid-dictation sends the user's words to the wrong place.
 7. **Fast feels calm.** Motion lives in the 90–260 ms band, on the curves in
-   §10. Decoration competes with the one animation that matters — the bar
+   §10. Decoration competes with the one animation that matters - the bar
    reacting to your voice.
 8. **Keyboard users are first-class.** Every action reachable by mouse is
    reachable by keyboard, with a visible focus ring.
@@ -114,11 +120,11 @@ Never lead with API calls, latency or tokens.
 | Dashboard window (WebView2) | **Light, only.** Closed. | No dark block, no `prefers-color-scheme`, no theme switcher, no theme abstraction. |
 | Floating bar capsule | **Dark, fixed** | It floats over apps we don't control. Dark is legible over both light and dark content. One fixed surface, not a second theme. |
 | Bar menu / popovers | Light (matches dashboard) | Opened on purpose, read like part of the app. |
-| Hero cards, primary buttons, toasts, tooltips | Dark accents inside the light theme | Deliberate emphasis, not a mode. |
+| Hero cards, toasts, tooltips | Dark accents inside the light theme | Deliberate emphasis, not a mode. |
 
-> **Δ Decision.** Dark mode is ruled out, not deferred. Update the "dark-first"
-> lines in `CLAUDE.md` (Phase 6) and `PRODUCTION_BRIEF.md` to "light-only
-> dashboard, dark overlay capsule" so no future change reintroduces it.
+> **Decision.** Dark mode is ruled out, not deferred. `CLAUDE.md` (Phase 6)
+> and `PRODUCTION_BRIEF.md` say "light-only dashboard, dark overlay capsule"
+> so no future change reintroduces it.
 
 ---
 
@@ -126,21 +132,21 @@ Never lead with API calls, latency or tokens.
 
 ### 3.1 Dashboard tokens (`styles.css :root`)
 
-**Surfaces — a tonal ladder.** Each step means something. An element gets a
+**Surfaces - a tonal ladder.** Each step means something. An element gets a
 fill *or* a border, never both (inputs are the one exception).
 
 | Token | Value | Meaning |
 |---|---|---|
 | `--canvas` | `#f5f3ef` | Behind everything: window, sidebar |
 | `--panel` | **Δ** `#fcfbf9` | The content panel. Warm off-white, not `#fff` |
-| `--card` | **Δ** `#f5f3ef` | Cards, stat tiles, list containers' hover. Same value as canvas — the panel is a window onto the canvas |
+| `--card` | **Δ** `#f5f3ef` | Cards, stat tiles, list containers' hover. Same value as canvas - the panel is a window onto the canvas |
 | `--fill` | **Δ** `#eeebe4` | Secondary buttons, chips, active nav, segmented controls, wells |
 | `--fill-hover` | **Δ** `#e7e3da` | Hover on anything with `--fill` |
 | `--row-hover` | **Δ** `#f7f5f1` | Hover on list rows on the panel |
 | `--field` | **Δ** `#ffffff` | **Things you type into or that float**: inputs, textareas, menus, popovers, editable cards inside sheets. White means "interactive surface" |
 | `--separator` | **Δ** `#ebe8e1` | Row separators, rules under tab rows, card dividers (was `--hairline`) |
 | `--field-border` | **Δ** `#dedad2` | Input borders only. Hover `#cdc8be` |
-| `--dark` | **Δ** `#1c1a17` | Hero cards, primary buttons, toggle-on, toasts, tooltips. Warm black, not neutral `#1a1a1a` |
+| `--dark` | **Δ** `#1c1a17` | Hero cards, toasts, tooltips. Warm black, not neutral `#1a1a1a` |
 | `--dark-hover` | **Δ** `#2e2b26` | Hover on `--dark` |
 | `--onboard` | `#eae7e0` | Onboarding canvas |
 
@@ -150,26 +156,31 @@ fill *or* a border, never both (inputs are the one exception).
 |---|---|---|---|
 | `--ink` | `#16150f` | Primary text | 17.7:1 on panel |
 | `--muted` | **Δ** `#6b675f` | Labels, timestamps, hints | 5.4 panel · 5.1 canvas · 4.7 fill |
-| `--faint` | **Δ** `#8f8a80` | Placeholders, disabled text, the unmeasured em dash | ≥ 3.1:1 everywhere — never for information a user must read |
+| `--faint` | **Δ** `#8f8a80` | Placeholders, disabled text, unmeasured "Not yet" | ≥ 3.1:1 everywhere - never for information a user must read |
 | `--on-dark` | `#ffffff` | Text on `--dark` | 17.4:1 |
 | `--on-dark-muted` | **Δ** `#a8a49b` | Secondary text on `--dark` | 7.0:1 |
 
-v1's `#77736b` was 4.2:1 on canvas — the sidebar sits on canvas, so sidebar
+v1's `#77736b` was 4.2:1 on canvas - the sidebar sits on canvas, so sidebar
 hints failed AA. `--muted` now passes on every surface it lands on.
 
-**The four accents** — each has exactly one job:
+**The four accents** - each has exactly one job:
 
 | Token | Value | Fill | Text on fill | Its one job |
 |---|---|---|---|---|
-| `--indigo` | `#4f46e5` | `--indigo-fill #eef2ff` | `--indigo` | **Sway, and where you are.** Brand mark, onboarding progress, selection, focus rings, Beta |
-| `--amber` | `#ffb84d` | `--amber-fill #fff1d9` | **Δ** `--amber-ink #7a4a00` | **The hotkey — in every state**, and newness |
+| `--indigo` | **Δ** `#5146d9` (hover `#4439c4`) | `--indigo-fill #efeefc` | `--indigo` | **Sway, and where you are.** Brand mark, primary buttons, active tab underline, active nav icon, toggles that are on, onboarding progress, selection, focus rings |
+| `--amber` | `#ffb84d` | `--amber-fill #fff1d9` | **Δ** `--amber-ink #7a4a00` | **The hotkey - in every state**, and newness |
 | `--teal` | `#17706b` | `--teal-fill #d9ebe9` | `--teal` | **Data, and only data.** Charts, progress, quotas, healthy dot, diff insertions |
 | `--red` | `#e5484d` | `--red-fill #fdecec` | **Δ** `--red-ink #c8373c` | **The user must act.** Badges, actionable errors, conflicts, danger buttons |
 
-- **Δ `--red-ink` for all red text.** `#e5484d` as text is 3.8:1 — it fails.
+- **Δ `--red-ink` for all red text.** `#e5484d` as text is 3.8:1 - it fails.
   Use `--red` only for dots, borders and icon strokes; red *text*, danger
   button labels, and count badges (white digits on a `--red-ink` pill, 5.2:1)
   use `--red-ink`.
+- **Δ Indigo is the brand colour for actions (2026-10-26 decision).** Primary
+  buttons, the active tab underline and toggles-on are indigo; headings and
+  text stay near-black `--ink`. Indigo is still never decoration and never
+  data. `#5146d9` replaces Tailwind's `#4f46e5`: 6.6:1 for white on it,
+  6.3:1 as text on `--panel`.
 - **Δ "Key is held" moves from indigo to amber.** v1 gave indigo five jobs.
   The hotkey is amber whether it's resting, highlighted, or pressed; pressed
   is a state of the same key, not a new meaning (§7 Key caps).
@@ -186,9 +197,9 @@ Teal ramp for heatmaps: `--fill` → `#cfe3e1` → `#8fbfbb` → `#479690` → `
 | `INK` | `(235, 236, 240)` | Capsule text |
 | `INK_MUTED` | **Δ** `(150, 153, 165)` | Secondary capsule text (timer, word count) |
 | `ACCENT_BRAND` / `ACCENT_THINKING` | `(79, 70, 229)` | Transcribing, Pasting |
-| `ACCENT_RECORDING` | `(255, 184, 77)` | Listening — the hotkey being held |
+| `ACCENT_RECORDING` | `(255, 184, 77)` | Listening - the hotkey being held |
 | `ACCENT_ERROR` | `(229, 72, 77)` | Errors the user must fix |
-| `ACCENT_IDLE` | `(108, 111, 125)` | Idle, Done, Paused — deliberately *not* a fifth hue |
+| `ACCENT_IDLE` | `(108, 111, 125)` | Idle, Done, Paused - deliberately *not* a fifth hue |
 
 The bar's popover menu uses the dashboard palette: background `--field`,
 ink `--ink`, muted `--muted`, rule `--separator`, hover `--fill`, with the
@@ -197,10 +208,10 @@ ink `--ink`, muted `--muted`, rule `--separator`, hover `--fill`, with the
 ### 3.3 Colour rules
 
 - **Red means "act on this."** A transient network error or a rate limit is
-  **muted**, not red — there is nothing for the user to do.
+  **muted**, not red - there is nothing for the user to do.
 - **Red never goes on recording.** Recording is amber because it *is* the hotkey.
-- **Active nav is a fill, not a colour.** Active tab is ink weight + a 2px ink
-  underline. Toggle "on" is a `--dark` track.
+- **Active nav is a fill**, with its icon in indigo. Active tab is `--ink` 600
+  + a 2px **indigo** underline. Toggle "on" is an **indigo** track.
 - **Colour is never the only signal.** Every state also changes shape, glyph,
   or words.
 - **No new accent tokens.** If a fifth colour seems necessary, the design is
@@ -229,14 +240,14 @@ at 30px is a big part of why titles looked heavy and loose:
 
 Never mix serif and sans in one functional string.
 
-**Δ The scale — exact sizes, no ranges.** v1's "16–20px" and "25–28px" let
+**Δ The scale - exact sizes, no ranges.** v1's "16–20px" and "25–28px" let
 every screen pick its own size.
 
 | Level | Token | Family | Size / line-height | Weight | Tracking | Example |
 |---|---|---|---|---|---|---|
 | 1 Display | `--t-display` | serif | 44 / 52 | 400 | -0.015em | Onboarding "Talk. It types." |
 | 1 Hero | `--t-hero` | serif | 28 / 36 | 400 | -0.01em | Hero card, sheet title |
-| — Big number | `--t-number` | serif | 34 / 40 | 400 | -0.01em | "1,204" in a stat tile |
+| - Big number | `--t-number` | serif | 34 / 40 | 400 | -0.01em | "1,204" in a stat tile |
 | 2 Page title | `--t-title` | sans-display | 28 / 36 | 600 | -0.02em | "Dictionary" |
 | 3 Section | `--t-section` | sans-display | 20 / 28 | 600 | -0.01em | "Recent errors" |
 | 3 Card title | `--t-card` | sans | 16 / 24 | 600 | 0 | Status headline, setting group |
@@ -273,8 +284,9 @@ every screen pick its own size.
 │  ▢ Dictionary  │ │  32 ↓                                         │ │
 │  ▢ Snippets    │ │  Hero / content                               │ │
 │  ▢ Transforms  │ │  48 ↓ between sections                        │ │
-│  ▢ Insights    │ │                                               │ │
-│                │ │  ←48→                           max-width 1120│ │
+│  ▢ Style       │ │                                               │ │
+│  ▢ Insights    │ │  ←48→                           max-width 1120│ │
+│  ▢ Voice prof. │ │                                               │ │
 │  ────────────  │ │                                               │ │
 │  ▢ Settings    │ │                                               │ │
 │  ▢ About       │ └───────────────────────────────────────────────┘ │
@@ -320,7 +332,7 @@ Every margin, padding and gap is one of these. Nothing else.
 | `--row-h` | Δ 64px | List row and setting row min height |
 | `--nav-h` | Δ 44px | Sidebar item; items are 4px apart |
 
-### 5.3 Δ Control heights — three, everywhere
+### 5.3 Δ Control heights - three, everywhere
 
 | Size | Height | Used by | Padding-x | Radius |
 |---|---|---|---|---|
@@ -383,9 +395,9 @@ doubt, remove something rather than shrink it.
 
 ### 6.1 Two modes, hard separated
 
-1. **Onboarding** — full-screen, no sidebar. A rail across the top, one
+1. **Onboarding** - full-screen, no sidebar. A rail across the top, one
    decision per screen, a Back button in the body. The user can't wander.
-2. **App** — persistent sidebar, reached only after onboarding completes.
+2. **App** - persistent sidebar, reached only after onboarding completes.
 
 ### 6.2 Navigation
 
@@ -393,18 +405,20 @@ One flat level. Ordered by frequency of use.
 
 | Group | Items |
 |---|---|
-| Primary | Home · History · Dictionary · Snippets · Transforms · Insights |
+| Primary | Home · History · Dictionary · Snippets · Transforms · Style · Insights · Voice profile |
 | Secondary (after divider) | Settings · About |
 
 - Sub-navigation is **tabs directly under the page title**, never nested nav.
   - Insights: Your usage · Your speed · Performance
-  - Settings: General · Voice · Apps · Data
-- Δ Tabs: 15px, `--muted` at rest, `--ink` 500 on hover, `--ink` 600 when
-  active, with a 2px `--ink` underline that **slides** between tabs (200ms,
+  - Settings: General · Voice · Data (per-app rules moved to **Style**;
+    `#settings/apps` redirects there)
+  - Style and Voice profile have no tabs: one page each, title → content.
+- Δ Tabs: 15px, `--muted` at rest, `--ink` on hover, `--ink` 600 when
+  active, with a 2px `--indigo` underline that **slides** between tabs (200ms,
   `--ease-standard`). Tab state is in the URL hash so Back/refresh keep it.
 - Settings is demoted to the bottom group but **badged** when it needs the user.
 - Red count badges only count problems **that screen can fix**.
-- Δ Keyboard: `Ctrl+1`…`Ctrl+6` jump to the primary items, `Ctrl+,` opens
+- Δ Keyboard: `Ctrl+1`…`Ctrl+8` jump to the primary items, `Ctrl+,` opens
   Settings, `Ctrl+K` focuses the page's search when it has one.
 
 ### 6.3 Onboarding rail
@@ -414,8 +428,8 @@ One flat level. Ordered by frequency of use.
 - Uppercase `--t-meta` labels with `›` separators.
 - One continuous indigo underline whose **width carries progress**.
 - The rail is not clickable navigation.
-- The last step is the real pipeline, not a simulation — and closes the loop
-  with a measured number ("47 words — that is Sway working.").
+- The last step is the real pipeline, not a simulation - and closes the loop
+  with a measured number ("47 words - that is Sway working.").
 - Δ Each step has exactly one `.btn.primary` (Large, 48px), bottom-right of
   the content; Back is `.btn.ghost`, bottom-left. `Enter` triggers the primary
   action when it's enabled.
@@ -424,10 +438,10 @@ One flat level. Ordered by frequency of use.
 
 | Pattern | Width | Use for |
 |---|---|---|
-| **Page** | — | Anything in the sidebar |
-| **Drawer** (right) | 560px | Detail of one item — raw vs. cleaned text, timings |
+| **Page** | - | Anything in the sidebar |
+| **Drawer** (right) | 560px | Detail of one item - raw vs. cleaned text, timings |
 | **Modal** | 560px | A short focused task or a destructive confirm |
-| **Wide sheet** (two columns) | 960px | Editing a transform — prompt one side, live example the other |
+| **Wide sheet** (two columns) | 960px | Editing a transform - prompt one side, live example the other |
 | **Toast** | ≤ 420px | Confirmation of a completed action, optional Undo (§11) |
 | **Banner** | full content width | A persistent condition on the current page |
 
@@ -443,7 +457,7 @@ that opened them**.
 All built once in `app.js` (helpers at the top) and styled once in
 `styles.css`. Reuse them; don't restyle per page.
 
-### Δ Interaction states — every interactive element has all five
+### Δ Interaction states - every interactive element has all five
 
 | State | Treatment |
 |---|---|
@@ -453,7 +467,7 @@ All built once in `app.js` (helpers at the top) and styled once in
 | Focus (`:focus-visible`) | 2px `--indigo` outline, 2px offset. Never on mouse click |
 | Disabled | 45% opacity, `cursor: default`, no hover, `aria-disabled`. Δ A disabled primary button gets a tooltip saying what enables it ("Add a name to save") |
 
-Δ Cursor: `default` (arrow) on buttons, tabs, nav and rows — that's the
+Δ Cursor: `default` (arrow) on buttons, tabs, nav and rows - that's the
 Windows-native convention, and a hand cursor on every control is one of the
 "this is a web page" tells. The hand is for real links only.
 
@@ -461,7 +475,7 @@ Windows-native convention, and a hand cursor on every control is one of the
 
 | Class | Look | Rule |
 |---|---|---|
-| `.btn.primary` | `--dark` fill, white text | **At most one per page.** The page's main action |
+| `.btn.primary` | `--indigo` fill, white text; `--indigo-hover` on hover | **At most one per page.** The page's main action |
 | `.btn` | Δ `--fill`, ink text, **no border** | Secondary actions |
 | `.btn.ghost` | No fill; `--row-hover` on hover | Back, Cancel, low-emphasis |
 | `.btn.danger` | Δ `--red-fill` fill, `--red-ink` text | Destructive only, always confirmed or undoable |
@@ -499,21 +513,38 @@ shows the past tense ("Saved") with a check for 1.2s, then reverts.
 
 ### Toggle
 
-42×24 pill. Off = `#c9c4ba` track. On = `--dark` track. White 20px knob with a
+42×24 pill. Off = `--toggle-off #c9c4ba` track. On = `--indigo` track. White 20px knob with a
 `0 1px 2px rgb(22 21 15 / .2)` shadow, travels in 160ms `--ease-standard`.
 Always `role="switch"` + `aria-checked`. Label and hint sit to its left in a
 `.setting` row; clicking the label toggles it. Δ Toggles apply **immediately**
-— a toggle never needs a Save button.
+- a toggle never needs a Save button.
 
 ### Key caps
 
 | Class | Meaning |
 |---|---|
 | `.cap` | Neutral key: `--field` fill, 1px `--field-border`, 0 1px 0 `--field-border` bottom edge, `--t-small` 500 |
-| `.cap.hot` | Amber — "this is your hotkey": `--amber-fill`, `--amber` border, `--amber-ink` text |
-| `.cap.held` | Δ Amber, **pressed**: `--amber` fill, ink text, bottom edge removed, `translateY(1px)` — the key is physically down |
+| `.cap.hot` | Amber - "this is your hotkey": `--amber-fill`, `--amber` border, `--amber-ink` text |
+| `.cap.held` | Δ Amber, **pressed**: `--amber` fill, ink text, bottom edge removed, `translateY(1px)` - the key is physically down |
 | `.cap.big` | 76px capture box; `.capturing` pulses (1.6s, opacity .55→1) to invite a press |
 | `.cap-row.conflict` | One 240ms shake on a detected collision. Not a persistent wobble |
+
+**Capturing a shortcut** is one surface (`.capture-stage`) whose state the
+user can read at a glance:
+
+| State | Looks like | Says |
+|---|---|---|
+| listening | dashed border breathing (1.8s), a dashed ghost key pulsing | "Listening for keys…" with an amber live dot |
+| holding | amber wash, solid amber border; each key pops in (220ms, `--ease-enter`, from 8px below at .82) joined by `+`; held keys are solid amber with a 4px amber glow | "Keep holding, or add a key" / "Got it. Let go to set it" |
+| captured | neutral; the caps settle with one small bounce (280ms) | ✓ "Ready to save", plus a badge naming the shape: Hold key, Combo, Shortcut, Mouse button |
+| conflict | red border, one shake | "Already used by Voice command hotkey"; Save becomes "Save anyway" |
+| error | red border, one shake, reason in `--red-ink` | e.g. "Ctrl + V is used internally to paste. Pick something else." |
+
+`Enter` saves, `Backspace` starts over, `Esc` cancels; the three are shown as
+small caps under the stage. After saving, the new chip pops into its row and
+the row flashes `--indigo-fill` once (1.2s), so the user sees where it went.
+Keys already shown keep their element across updates, so transitions run
+instead of the row re-drawing.
 
 ### Chips and pairs
 
@@ -524,23 +555,23 @@ hover). A **pair** (`"trigger" → expansion`) explains a mapping with no prose.
 
 ### Cards and stats
 
-- `.card` — Δ `--card` fill, **no border**, `--r-lg`, 24px padding.
+- `.card` - Δ `--card` fill, **no border**, `--r-lg`, 24px padding.
   A card on the canvas (sidebar) uses `--field` instead so it still separates.
-- `stat({label, value, foot, estimate})` — `--t-number` serif over `--t-meta`.
-  - `value: null` → em dash in `--faint`, with `title="Not measured yet"`.
+- `stat({label, value, foot, estimate})` - `--t-number` serif over `--t-meta`.
+  - `value: null` → "Not yet" in `--faint` (sans 20px, same 40px line so tiles never jump), tooltip "Not measured yet".
     **Never 0.**
   - `estimate: true` → an "Estimate" line in `--t-small` muted, with an info
     tooltip naming the assumption ("Assumes you type at 40 wpm").
   - Δ A changed number animates by **cross-fade (140ms), not by counting up**.
     Counting up implies a measurement in progress that isn't happening.
-- `.hero` — `--dark`, `--r-lg`, 32px padding, serif headline, sans body, one
+- `.hero` - `--dark`, `--r-lg`, 32px padding, serif headline, sans body, one
   action. Δ Depth without photography (CSP-safe, no images):
   `background: radial-gradient(120% 90% at 100% 0%, rgb(79 70 229 / .22), transparent 60%), radial-gradient(90% 80% at 0% 100%, rgb(255 184 77 / .10), transparent 55%), var(--dark);`
-  This is Sway's identity against Wispr's photo heroes — keep it subtle.
+  This is Sway's identity against Wispr's photo heroes - keep it subtle.
   A dismissable hero has a 32px `.icon-btn` close (top-right, 16px inset) and
   the dismissal persists.
 
-### Δ Lists — rows live in a container
+### Δ Lists - rows live in a container
 
 Rows are grouped in one `.list` container, not floated as loose lines:
 `--panel` fill, 1px `--separator` border, `--r-lg`, `overflow: hidden`.
@@ -562,8 +593,8 @@ containers are 32px apart.
 
 ### Status
 
-- `.dot` — 8px. `.ok` teal, `.warn` muted, `.act` red.
-- Status card — dot + `--t-card` headline + 13px muted explanation + at most
+- `.dot` - 8px. `.ok` teal, `.warn` muted, `.act` red.
+- Status card - dot + `--t-card` headline + 13px muted explanation + at most
   one button that goes **straight to the field that fixes it** (and focuses it).
 
 ### Progress
@@ -580,6 +611,23 @@ only to mark a stage over budget. Δ Every bar, cell and point has a tooltip
 with the exact value and its unit/date. Axes and gridlines use `--separator`;
 labels `--t-small` muted.
 
+- **Bar charts** get a 3-step y scale rounded to 1/2/5 × 10ⁿ, about five
+  date labels, and today's bar in `--indigo` (the one place indigo appears in
+  a chart: it marks *where you are*, not a value). Unmeasured days draw an
+  empty baseline, never a zero-height value.
+- **Consistency heatmap** always spans 26 weeks regardless of the range
+  picker, laid out from the right so a narrow card drops the oldest weeks,
+  never this week. Weekday labels Mon/Wed/Fri, month labels, a Less→More
+  legend, today ringed in `--indigo`.
+- **Latency** stacks only stages that run one after another after the key
+  is released (`queries.STAGE_PARTS == "pipeline"`). Sub-spans
+  (`stt_first_byte`, `llm_first_token`) and `hotkey_hold` are listed under
+  "Also recorded", never summed. The target line is `TARGET_P50_MS`
+  (1,000 ms). Amber marks only the largest stage, only when the medians
+  exceed the target.
+- **No invented comparisons.** No percentile against other users ("Top 44%"):
+  there is no cohort to measure, so there is no such number.
+
 ### Diff
 
 Deletions: `--muted` + strikethrough. Insertions: `--teal-fill` background,
@@ -591,7 +639,7 @@ their corners.
 Inline SVG sprite in `index.html`, 20×20 viewBox. Δ **One stroke width:
 1.5px** (v1's 1.4–1.9 range shows up as icons of different weights side by
 side). Round caps and joins, `currentColor`. Rendered at 20px in nav and
-buttons, 16px in inputs and dense rows. Line icons only — no emoji as icons.
+buttons, 16px in inputs and dense rows. Line icons only - no emoji as icons.
 Δ Every `<svg>` and `<img>` in the UI has `draggable="false"`.
 
 ---
@@ -604,12 +652,12 @@ target.
 
 ### 8.1 Three tiers
 
-1. **At rest** — a 48×16 outlined tray, interior at 30% opacity. Swells 1.5px
+1. **At rest** - a 48×16 outlined tray, interior at 30% opacity. Swells 1.5px
    on hover.
-2. **Engaged** — the tray morphs (one renderer, `expand` 0→1) into a 44px dark
+2. **Engaged** - the tray morphs (one renderer, `expand` 0→1) into a 44px dark
    capsule: orb avatar (34px), state label, level meter, and in Idle the two
-   controls people change mid-session — language and microphone.
-3. **Menu** — right-click or click the body. Pause/Resume, Hide for 1 hour /
+   controls people change mid-session - language and microphone.
+3. **Menu** - right-click or click the body. Pause/Resume, Hide for 1 hour /
    Unhide, Settings, Language ›, Microphone ›, Transcript history, Paste last,
    Copy last. Rows reflect the current state.
 
@@ -620,7 +668,7 @@ before it closes.
 
 | State | Label | Accent | Orb | Holds |
 |---|---|---|---|---|
-| Idle | — | grey | breathing | collapses to tray |
+| Idle | - | grey | breathing | collapses to tray |
 | Listening | "Listening · 0:03" + level meter | **amber** | listening | while key held |
 | Transcribing | "Transcribing" (names the real stage) | indigo | working | until done |
 | Pasting | "Pasting" | indigo | composing | sub-100ms usually |
@@ -656,7 +704,7 @@ Every error offers one inline recovery pill, and only one that actually works:
 | Mic in use / missing | "Microphone unavailable" | Fix → microphone menu |
 | Bad or missing API key | "API key needs attention" | Fix → Settings › General, key field focused |
 | Network / timeout | "Couldn't reach Groq" | Copy (only if there's a transcript) |
-| Rate limited | "Groq limit — ready in 23s" | *none* — counts down, rounds up |
+| Rate limited | "Groq limit - ready in 23s" | *none* - counts down, rounds up |
 
 A button that claims to retry and doesn't is worse than no button.
 
@@ -687,13 +735,13 @@ These are what separate a native-feeling overlay from a prototype one:
 
 ## 9. Empty, loading, and not-yet states
 
-### 9.1 Empty and zero — pick by cause, not by page
+### 9.1 Empty and zero - pick by cause, not by page
 
 | Cause | Treatment | Helper |
 |---|---|---|
 | Never configured | Hero card with **worked examples** of what would be here + one create action | `hero()` |
 | Measured zero | Print `0`. Zero is a fact | `stat({value: 0})` |
-| Not measured | Em dash in `--faint`, never `0` | `stat({value: null})` |
+| Not measured | "Not yet" in `--faint` ("n/a" inline), never `0` | `stat({value: null})` |
 | Not enough data yet | The real skeleton at 42% opacity + exact remaining count. **No blur, no fake content** | `locked()` |
 | Filter matched nothing | Centred muted text naming the query + a "Clear search" ghost button | `nothingFound()` |
 | Feature unavailable here | Info banner saying why | `.banner.info` |
@@ -702,7 +750,7 @@ Bad: "No data yet!", "All good ✓", a dashed box with "Nothing here".
 Good: "0 errors in the last 30 days, across 412 dictations."
 Good: "No words match “karol”." + Clear search.
 
-### 9.2 Δ Loading — by how long it takes
+### 9.2 Δ Loading - by how long it takes
 
 | Duration | Treatment |
 |---|---|
@@ -722,7 +770,7 @@ Good: "No words match “karol”." + Clear search.
 
 Toggles, renames, reorders, favourites and deletes update the UI **immediately**
 and sync in the background. If the save fails, revert the change, and say so
-inline next to it ("Couldn't save — try again" with a Retry ghost button that
+inline next to it ("Couldn't save - try again" with a Retry ghost button that
 actually retries). Only network-bound creation (validating an API key) waits.
 
 ---
@@ -730,10 +778,10 @@ actually retries). Only network-bound creation (validating an API key) waits.
 ## 10. Motion
 
 Durations live in one table in `motion.py`, mirrored as CSS custom properties.
-Animation is a **function of wall clock**, sampled per frame — never a stepped
+Animation is a **function of wall clock**, sampled per frame - never a stepped
 timer.
 
-### 10.1 Δ Easing — three curves, nothing else
+### 10.1 Δ Easing - three curves, nothing else
 
 v1 named durations but no curves; every transition fell back to `ease`, which
 is what makes motion feel "web default".
@@ -772,18 +820,18 @@ and the dashboard move with the same character.
 
 | What | Enter | Exit | Detail |
 |---|---|---|---|
-| Hover backgrounds | 120ms standard | 120ms | `background-color` only — never `transition: all` |
+| Hover backgrounds | 120ms standard | 120ms | `background-color` only - never `transition: all` |
 | Press | 90ms | 160ms | `scale(.98)` |
-| Toggle knob | 160ms standard | — | |
-| Tab underline | 200ms standard | — | Slides between tabs |
-| Page change | 140ms | 0 | New page fades in + rises 4px. Old page is removed at once — no cross-page choreography |
+| Toggle knob | 160ms standard | - | |
+| Tab underline | 200ms standard | - | Slides between tabs |
+| Page change | 140ms | 0 | New page fades in + rises 4px. Old page is removed at once - no cross-page choreography |
 | Menu / popover | 140ms enter | 100ms exit | Opacity + `scale(.97 → 1)` from the trigger's side |
 | Modal / sheet | 200ms enter | 140ms exit | Opacity + `scale(.98 → 1)` + `translateY(8px → 0)`; scrim fades 180ms |
 | Drawer | 220ms enter | 160ms exit | `translateX(24px → 0)` + opacity |
 | Toast | 200ms enter | 140ms exit | Rises 8px |
-| Row delete | 200ms | — | Height + opacity collapse |
-| Progress width | 240ms standard | — | |
-| Onboarding rail | 320ms standard | — | The one deliberate exception to the band: it carries progress |
+| Row delete | 200ms | - | Height + opacity collapse |
+| Progress width | 240ms standard | - | |
+| Onboarding rail | 320ms standard | - | The one deliberate exception to the band: it carries progress |
 
 Rules:
 
@@ -838,16 +886,20 @@ Rules:
 
 ### 11.4 Voice and copy
 
-- **Second person, plain words.** "Your text is on the clipboard — press
+- **Second person, plain words.** "Your text is on the clipboard - press
   Ctrl+V." Not "Clipboard injection failed (E_PASTE)".
-- **Name the cause and the fix.** "Microphone is in use — another app has
+- **Name the cause and the fix.** "Microphone is in use - another app has
   exclusive control." Then one button.
 - **No error codes, no stack traces, no tokens** in the UI. Diagnostics live
   in Settings › Data and the log file.
 - **Overlay labels ≤ ~34 characters.**
-- **Sentence case** everywhere except `.meta-label` (uppercase by CSS — write
+- **Sentence case** everywhere except `.meta-label` (uppercase by CSS - write
   it in sentence case in the source).
-- **Em dash** (`—`) joins a headline and its reason: "Paused — no API key".
+- **No em dashes in UI copy** (2026-10-26 decision). A headline and its reason
+  join with a colon ("Paused: no API key"); a label and its detail with a
+  middle dot ("Rewriting · Polish"); two thoughts are two sentences.
+  Parentheses for asides. The only em dashes left in code are the regexes
+  that *recognise* them in transcripts.
 - **Curly quotes** (“ ”) and apostrophes (’) in UI text, a real ellipsis (`…`)
   in "Saving…".
 - Δ **Ellipsis on a button label** only when the action needs more input
@@ -865,8 +917,8 @@ Rules:
   |---|---|---|
   | Empty search | No words match “karol”. | No results found |
   | Locked insight | Unlocks at 2,000 words · 1,900 to go | Not enough data |
-  | Save failed | Couldn't save — check your connection | Error saving |
-  | Key invalid | That key was rejected by Groq — check it's copied in full | Invalid API key |
+  | Save failed | Couldn't save - check your connection | Error saving |
+  | Key invalid | That key was rejected by Groq - check it's copied in full | Invalid API key |
   | Shortcut taken | Win + Alt is already used by “Prompt engineer” | Conflict detected |
   | Hotkey prompt | Hold `Right Ctrl` and speak | Press hotkey to start dictation |
 
@@ -874,7 +926,7 @@ Rules:
 
 ## 12. Accessibility
 
-- Visible focus via `:focus-visible` — 2px indigo outline, 2px offset. Never a
+- Visible focus via `:focus-visible` - 2px indigo outline, 2px offset. Never a
   ring on mouse click.
 - Skip link to `#page` as the first focusable element.
 - Hover-revealed actions also reveal on `:focus-within`.
@@ -883,13 +935,13 @@ Rules:
   `aria-modal`, `aria-labelledby`, Esc closes, focus is trapped and restored.
 - Colour is never the only signal (§3.3).
 - Δ All text pairs in §3.1 meet AA (≥ 4.5:1). `--faint` is ≥ 3:1 and only for
-  placeholders, disabled text and the unmeasured dash. Don't introduce a
+  placeholders, disabled text and unmeasured values. Don't introduce a
   lighter text colour.
 - Δ Live regions: toasts `polite`; inline errors `role="alert"` only when they
   appear in response to submit.
 - The window is an app, not a document: `user-select: none` by default;
   transcripts, inputs, and `.selectable` stay selectable.
-- Δ Targets are ≥ 32×32 px (small controls) — 24px icons get 32px hit areas.
+- Δ Targets are ≥ 32×32 px (small controls) - 24px icons get 32px hit areas.
 
 ---
 
@@ -913,7 +965,7 @@ host settings, set once:
 And in CSS / markup:
 
 - `draggable="false"` on images and SVGs; `-webkit-user-drag: none` on links.
-- `overscroll-behavior: none` on the panel — no rubber-banding.
+- `overscroll-behavior: none` on the panel - no rubber-banding.
 - Δ Scrollbars: 10px, transparent track, `--fill-hover` thumb with 3px inset
   border in the panel colour (so it looks 4px wide), `--faint` thumb on hover.
   `scrollbar-gutter: stable` so content doesn't shift when a scrollbar appears.
@@ -950,7 +1002,8 @@ And in CSS / markup:
 - [ ] Every interactive element has rest, hover, pressed, focus and disabled.
 - [ ] Every action gives feedback within 100ms (§11.1); slow ones have a busy state.
 - [ ] Loading follows §9.2: nothing < 150ms, busy state < 1s, skeleton beyond.
-- [ ] Every number is measured; unmeasured is `—`; assumptions say **Estimate**.
+- [ ] Every number is measured; unmeasured is "Not yet" / "n/a"; assumptions say **Estimate**.
+- [ ] No em dashes in any user-facing string.
 - [ ] Empty state chosen by cause (§9.1).
 - [ ] Errors are inline, name cause + fix, red only if the user must act, one recovery action.
 - [ ] Keyboard reachable, visible focus, labelled icon buttons with tooltips.
@@ -963,13 +1016,18 @@ And in CSS / markup:
 
 ---
 
-## 16. Open questions
+## 16. Resolved questions
 
-- **Style and Voice Profile pages** are named in CLAUDE.md Phase 6 but don't
-  exist in the nav yet. When they ship, they follow the page skeleton
-  (title → tabs → hero/content) and get a row in §6.2.
-- **Brand mark.** `--indigo #4f46e5` is Tailwind's indigo-600 exactly, and
-  `--red #e5484d` is Radix red-9 — both read as framework defaults to anyone
-  who has seen them a hundred times. Worth one deliberate pass on a Sway-only
-  indigo (e.g. a slightly warmer `#5146d9`–`#5b4fd6` range, re-checked for
-  ≥ 4.5:1 on `--panel`) before launch. Not a blocker.
+- **Style and Voice profile pages** (2026-10-26) ship as their own pages.
+  *Style* shows the three cleanup styles with labelled examples, the apps
+  each one applies to by default (served from `sway.profiles.default_groups`
+  so the page cannot describe a default the engine does not apply), and the
+  user's per-app rules. *Voice profile* is measured from the user's own
+  dictations, all time: speaking rate, typical length, filler words removed
+  (`queries.fillers_removed`), hour-of-day rhythm, languages, the fillers
+  removed most, and self-corrections. **No unlock threshold**: each figure
+  shows as soon as it has data, says how many dictations it covers, and reads
+  "Not yet" until then.
+- **Brand mark** (2026-10-26): indigo is the brand colour for buttons, active
+  tabs and brand elements; near-black for headings and text. The value moved
+  off Tailwind's `#4f46e5` to the Sway-only `#5146d9` (§3.1).

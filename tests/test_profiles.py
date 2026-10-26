@@ -50,3 +50,33 @@ def test_matching_tolerates_surrounding_whitespace():
 
 def test_empty_string_falls_back_to_default():
     assert style_for_process("") == DEFAULT_STYLE
+
+
+# -- app categories (shown on the Style page and the Insights usage chart) --
+
+from sway.profiles import AppCategory, category_for_process, default_groups  # noqa: E402
+
+
+def test_categories_follow_the_style_lists():
+    assert category_for_process("slack.exe") == AppCategory.CHAT
+    assert category_for_process("OUTLOOK.EXE ") == AppCategory.MAIL
+    assert category_for_process("pwsh.exe") == AppCategory.TERMINAL
+    assert category_for_process("code.exe") == AppCategory.CODE
+
+
+def test_unknown_or_missing_process_is_other():
+    assert category_for_process("notepad.exe") == AppCategory.OTHER
+    assert category_for_process(None) == AppCategory.OTHER
+    assert category_for_process("") == AppCategory.OTHER
+
+
+def test_default_groups_describe_what_the_engine_applies():
+    """The Style page reads these; each group's style must be the one
+    style_for_process actually returns for every app listed in it."""
+    groups = default_groups()
+    assert [g["category"] for g in groups] == ["chat", "mail", "terminal", "code", "other"]
+    for group in groups:
+        for app in group["apps"]:
+            assert style_for_process(app).value == group["style"]
+    other = groups[-1]
+    assert other["apps"] == [] and other["style"] == DEFAULT_STYLE.value

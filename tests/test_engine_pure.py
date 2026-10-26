@@ -384,7 +384,7 @@ def _tap_engine(bar, *, onboarded, successes=0):
 def test_a_first_run_tap_is_answered():
     bar = FakeBar()
     _tap_engine(bar, onboarded=False)._coach_tap(100.0)
-    assert bar.coached == ["Don't tap — hold [[Right Ctrl]] while you speak"]
+    assert bar.coached == ["Don't tap. Hold [[Right Ctrl]] while you speak"]
 
 
 def test_the_hotkey_is_shown_as_a_key_not_spelled_out():

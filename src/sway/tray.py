@@ -57,11 +57,11 @@ class TrayState(StrEnum):
 #: without being clicked, so it carries the state in words as well as colour --
 #: colour alone is not something every user can read.
 _TOOLTIPS: dict[TrayState, str] = {
-    TrayState.IDLE: "Sway — ready",
-    TrayState.LISTENING: "Sway — listening",
-    TrayState.PROCESSING: "Sway — transcribing",
-    TrayState.ERROR: "Sway — last dictation failed",
-    TrayState.DISABLED: "Sway — paused",
+    TrayState.IDLE: "Sway · ready",
+    TrayState.LISTENING: "Sway · listening",
+    TrayState.PROCESSING: "Sway · transcribing",
+    TrayState.ERROR: "Sway · last dictation failed",
+    TrayState.DISABLED: "Sway · paused",
 }
 
 

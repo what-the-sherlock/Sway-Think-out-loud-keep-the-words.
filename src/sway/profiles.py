@@ -99,6 +99,58 @@ _PROFILE_BY_PROCESS: dict[str, CleanupStyle] = {
 }
 
 
+class AppCategory(StrEnum):
+    """What kind of app a process is, from the same lists that pick its style.
+
+    Shown on the dashboard (Style page, Insights' "Where you use Sway") so the
+    grouping the user sees is the grouping cleanup actually applies.
+    """
+
+    CHAT = "chat"
+    MAIL = "mail"
+    TERMINAL = "terminal"
+    CODE = "code"
+    OTHER = "other"
+
+
+_CATEGORY_APPS: dict[AppCategory, frozenset[str]] = {
+    AppCategory.CHAT: _CHAT_APPS,
+    AppCategory.MAIL: _MAIL_CLIENTS,
+    AppCategory.TERMINAL: _TERMINALS,
+    AppCategory.CODE: _CODE_EDITORS,
+}
+
+
+def category_for_process(process_name: str | None) -> AppCategory:
+    """Which built-in group a process belongs to; ``OTHER`` when none."""
+    if not process_name:
+        return AppCategory.OTHER
+    name = process_name.strip().lower()
+    for category, apps in _CATEGORY_APPS.items():
+        if name in apps:
+            return category
+    return AppCategory.OTHER
+
+
+def default_groups() -> list[dict[str, object]]:
+    """The built-in app groups and the style each gets, for the Style page.
+
+    Derived from the same sets :func:`style_for_process` reads, so the page
+    can never describe a default the engine does not apply. ``OTHER`` has no
+    app list: it is everything not named above.
+    """
+    groups: list[dict[str, object]] = [
+        {
+            "category": category.value,
+            "style": style_for_process(next(iter(apps))).value,
+            "apps": sorted(apps),
+        }
+        for category, apps in _CATEGORY_APPS.items()
+    ]
+    groups.append({"category": AppCategory.OTHER.value, "style": DEFAULT_STYLE.value, "apps": []})
+    return groups
+
+
 def style_for_process(process_name: str | None) -> CleanupStyle:
     """Pick a cleanup style from a focused-window process name.
 
@@ -113,4 +165,11 @@ def style_for_process(process_name: str | None) -> CleanupStyle:
     return _PROFILE_BY_PROCESS.get(process_name.strip().lower(), DEFAULT_STYLE)
 
 
-__all__ = ["DEFAULT_STYLE", "CleanupStyle", "style_for_process"]
+__all__ = [
+    "DEFAULT_STYLE",
+    "AppCategory",
+    "CleanupStyle",
+    "category_for_process",
+    "default_groups",
+    "style_for_process",
+]

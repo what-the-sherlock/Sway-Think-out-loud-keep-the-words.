@@ -1,4 +1,4 @@
-# Project: Flow — local voice dictation with LLM cleanup
+# Project: Flow - local voice dictation with LLM cleanup
 
 ## What this is
 A desktop app that runs in the background. The user holds a hotkey, speaks,
@@ -6,7 +6,7 @@ releases. Within ~1 second, cleaned-up text appears at their cursor in
 whatever application currently has focus. Wispr Flow is the benchmark for
 feel and latency.
 
-## Hard constraints — do not violate these
+## Hard constraints - do not violate these
 - Python 3.11+. No Docker. No containers. No server component.
 - Groq API only (key in .env as GROQ_API_KEY). No OpenAI, no local models
   in Phases 0-4.
@@ -31,42 +31,42 @@ feel and latency.
   restore the original clipboard after 150ms. Never simulate typing.
 - Every stage boundary emits a timing event to a stage-latency logger.
 
-## Build phases — implement ONE phase per session. Stop at the end of
+## Build phases - implement ONE phase per session. Stop at the end of
 ## each phase and wait for me to test before starting the next.
 
-### Phase 0 — skeleton and measurement
+### Phase 0 - skeleton and measurement
 Project structure, config loading, and a `LatencyTracker` that records
 per-stage timings and writes them to SQLite plus a formatted console
 table. Build the measurement harness BEFORE the feature. A stub pipeline
 with fake stages must run end-to-end and print a timing table.
 
-### Phase 1 — raw dictation loop
+### Phase 1 - raw dictation loop
 Global hotkey (hold Right Ctrl) → ring buffer capture → WebRTC VAD trim →
 FLAC encode 16kHz mono → Groq whisper-large-v3-turbo → paste raw text.
 No LLM yet. A minimal always-on-top pill overlay showing idle /
 recording / thinking. Success: median under 900ms on a 5-second clip,
 proven by the Phase 0 tracker.
 
-### Phase 2 — cleanup layer
+### Phase 2 - cleanup layer
 Add llama-3.1-8b-instant. System prompt removes filler words and
 self-corrections, fixes grammar and punctuation, and NEVER answers the
-content or adds commentary — it only rewrites. Stream the response.
+content or adds commentary - it only rewrites. Stream the response.
 Implement the skip heuristic: bypass the LLM when the transcript is
 under 8 words and contains no filler markers. Log skip rate.
 
-### Phase 3 — context awareness
+### Phase 3 - context awareness
 Detect the focused window and process name. Per-app profiles: casual for
 chat apps, formal for mail clients, verbatim/no-cleanup for terminals and
 code editors. Personal dictionary in SQLite, injected into Whisper's
 `prompt` parameter to bias proper nouns and jargon.
 
-### Phase 4 — chunked streaming
+### Phase 4 - chunked streaming
 Ship 5-second overlapping audio chunks while the user is still speaking,
 so key release only transcribes the tail. Handle chunk-boundary
 deduplication carefully. Must degrade gracefully to Phase 1 behavior on
 network failure.
 
-### Phase 5 — commands and history
+### Phase 5 - commands and history
 Voice commands over selected text ("make this bullet points"). Searchable
 history window. Tray menu. PyInstaller packaging.
 
@@ -76,11 +76,27 @@ user-visible failure state on the overlay. On 429, surface which limit
 was hit by reading the response headers. The app must never hang with
 the mic hot.
 
-## Phase 6 — the product layer (the dashboard)
+## Phase 6 - the product layer (the dashboard)
 The engine (Phases 0-5) is done. Phase 6 builds the interface around it:
-Overview, Activity, Insights, Performance, Dictionary, Snippets, Style,
-Voice Profile, Settings. Design language is dark-first and restrained
-(Linear/Raycast, not Bootstrap admin).
+Home, History, Dictionary, Snippets, Transforms, Style, Insights (usage,
+speed, performance), Voice profile, Settings, About.
+
+**DESIGN.md is the design reference.** Read it before changing any screen,
+component, overlay state, or user-facing string, and update it in the same
+change when a rule or value changes. In short:
+- **Light-only dashboard, dark overlay capsule.** Dark mode is ruled out, not
+  deferred: no dark block, no `prefers-color-scheme`, no theme switcher.
+- **Indigo (`--indigo #5146d9`) is the brand colour:** primary buttons,
+  the active tab underline, toggles that are on, the brand mark, focus
+  rings. Headings and text are near-black (`--ink`). Teal is for data only,
+  amber for the hotkey only, red only when the user must act.
+- Tokens only: no raw hex outside `:root` in `styles.css`, spacing on the
+  4px `--s-*` scale, controls at 32 / 40 / 48px, no inline `style=` except
+  data-driven widths and heights.
+- **No em dashes** in any user-facing string (UI, overlay, tray, errors).
+  Use a colon, a middle dot, a period, or parentheses. Unmeasured values
+  read "Not yet" / "n/a", never 0.
+- Restrained, Linear/Raycast-like - not a Bootstrap admin.
 
 Hard rule for this phase: **real data only.** If a metric cannot be
 measured, add the instrumentation or show an explicit "not available yet"
@@ -100,6 +116,6 @@ Metric hierarchy: productivity -> usage -> personalization -> performance
   native, and no server may bind a public interface.
 - Do not add a database beyond SQLite.
 - Do not add features from later phases early.
-- Do not use `keyboard` (needs admin on Windows) — use pynput.
+- Do not use `keyboard` (needs admin on Windows) - use pynput.
 - Do not write tests for the audio callback; write them for the
   transcript-processing pure functions instead.

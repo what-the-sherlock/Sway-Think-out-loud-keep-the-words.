@@ -9,12 +9,10 @@
      thing that could carry it off the machine -- which is what default-src
      'none' and connect-src 'self' exist to stop.
 
-     style-src carries 'unsafe-inline' deliberately. The UI is rendered by
-     building markup in app.js, and layout values that depend on data (a
-     progress width, a bar height) arrive as style attributes; without this
-     every one of them is silently dropped and the page renders subtly and
-     confusingly wrong. It costs little here: CSS-based exfiltration needs an
-     external URL to send to, and default-src 'none' already forbids one.
+     style-src carries 'unsafe-inline' deliberately. Layout values that depend
+     on data (a bar's height, a progress width) arrive as style attributes;
+     without this every one of them is silently dropped. CSS-based
+     exfiltration needs an external URL, which default-src 'none' forbids.
      script-src stays strict, which is the directive that matters. -->
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'none'; base-uri 'none'">
@@ -23,74 +21,97 @@
 </head>
 <body>
 
-<!-- Icon sprite. Line icons, per PRODUCTION_BRIEF D2's "no emoji-as-icons". -->
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<!-- Icon sprite (DESIGN.md §7 Icons): 20×20, one 1.5px stroke, round caps
+     and joins, currentColor. The brand mark is the one exception: it is a
+     logo, drawn at 2px. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" draggable="false">
   <defs>
-    <g id="i-mark"><path d="M3 14V6M8 18V2M13 15V5M18 12V8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" fill="none"/></g>
-    <g id="i-home"><path d="M3 8.5 10 3l7 5.5V16a1 1 0 0 1-1 1h-4v-5H8v5H4a1 1 0 0 1-1-1z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></g>
-    <g id="i-history"><circle cx="10" cy="10" r="7.2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M10 5.6V10l3 1.8" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
-    <g id="i-book"><path d="M4 3.5h5a2.5 2.5 0 0 1 2.5 2.5v10A2 2 0 0 0 10 15H4z M16 3.5h-3.5A2.5 2.5 0 0 0 10 6v10a2 2 0 0 1 1.5-1H16z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linejoin="round"/></g>
-    <g id="i-chart"><path d="M3.5 16.5V11M8 16.5V4.5M12.5 16.5V8M17 16.5v-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/></g>
-    <g id="i-gear"><circle cx="10" cy="10" r="2.6" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M10 2.5v2M10 15.5v2M17.5 10h-2M4.5 10h-2M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4M15.3 15.3l-1.4-1.4M6.1 6.1 4.7 4.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></g>
-    <g id="i-info"><circle cx="10" cy="10" r="7.2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M10 9v4.5M10 6.4v.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></g>
-    <g id="i-search"><circle cx="8.8" cy="8.8" r="5.4" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="m12.8 12.8 3.6 3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></g>
-    <g id="i-copy"><rect x="7" y="7" width="9.5" height="9.5" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M13 4.5H5.5a1.5 1.5 0 0 0-1.5 1.5V13" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
-    <g id="i-trash"><path d="M4.5 5.5h11M8.2 5.5V4a1 1 0 0 1 1-1h1.6a1 1 0 0 1 1 1v1.5M6 5.5l.7 10a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-10" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
-    <g id="i-edit"><path d="M13.2 3.9a1.9 1.9 0 0 1 2.7 2.7L7.4 15.1l-3.6.9.9-3.6z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></g>
-    <g id="i-wand"><path d="M4 16 14.5 5.5M12.5 3.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7zM16.5 9.5l.5 1.2 1.2.5-1.2.5-.5 1.2-.5-1.2-1.2-.5 1.2-.5z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
-    <g id="i-snippet"><path d="M6 3.5h8a1.5 1.5 0 0 1 1.5 1.5v11.5l-5.5-3.4-5.5 3.4V5A1.5 1.5 0 0 1 6 3.5z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linejoin="round"/></g>
-    <g id="i-plus"><path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/></g>
-    <g id="i-back"><path d="M15 10H5M9 5l-5 5 5 5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
-    <g id="i-check"><path d="M4.5 10.5 8 14l7.5-8" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round" stroke-linejoin="round"/></g>
-    <g id="i-x"><path d="M5 5l10 10M15 5 5 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></g>
+    <g id="i-mark" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 13V7M7 17V3M11 15V5M15 12.5v-5M18.5 11V9"/></g>
+    <g id="i-home" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5 10 3.5l6.5 5V16a1 1 0 0 1-1 1H12v-4.5H8V17H4.5a1 1 0 0 1-1-1z"/></g>
+    <g id="i-history" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l2.8 1.7"/></g>
+    <g id="i-book" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 3.5h9a1 1 0 0 1 1 1v12h-10a1.5 1.5 0 0 1 0-3h10M4 15V5a1.5 1.5 0 0 1 1.5-1.5"/><path d="M8 7h4.5"/></g>
+    <g id="i-snippet" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="6" r="2.2"/><circle cx="5.5" cy="14" r="2.2"/><path d="M7.4 7.2 16.5 15M7.4 12.8 16.5 5"/></g>
+    <g id="i-wand" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 16.5 13 7M11.5 5.5l3 3M15 2.8v2.4M13.8 4h2.4M17 9.3v1.8M16.1 10.2h1.8M8 3v1.8M7.1 3.9h1.8"/></g>
+    <g id="i-style" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 16 7.5 4h1L13 16M4.6 12h6.8M13.5 10.5c.5-1 1.4-1.5 2.4-1.5 1.3 0 2.1.8 2.1 2.1V16M18 13.2c-.6-.4-1.5-.6-2.4-.5-1.3.1-2.1.8-2.1 1.7 0 .9.7 1.6 1.8 1.6 1.4 0 2.7-.9 2.7-2.3"/></g>
+    <g id="i-chart" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5v13h13"/><path d="M7 13.5v-4M10.5 13.5V6.5M14 13.5v-6"/></g>
+    <g id="i-voice" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7.5" y="2.5" width="5" height="9.5" rx="2.5"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5M7 17.5h6"/></g>
+    <g id="i-gear" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="2.5"/><path d="M10 2.5v2M10 15.5v2M17.5 10h-2M4.5 10h-2M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4M15.3 15.3l-1.4-1.4M6.1 6.1 4.7 4.7"/></g>
+    <g id="i-info" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 9.2v4.3M10 6.6v.1"/></g>
+    <g id="i-alert" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 6.3v4.4M10 13.4v.1"/></g>
+    <g id="i-search" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.8" cy="8.8" r="5.3"/><path d="m12.8 12.8 3.7 3.7"/></g>
+    <g id="i-copy" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="9.5" height="9.5" rx="2"/><path d="M13 4.5H5.5A1.5 1.5 0 0 0 4 6v7.5"/></g>
+    <g id="i-trash" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 5.5h11M8.2 5.5V4a1 1 0 0 1 1-1h1.6a1 1 0 0 1 1 1v1.5M6 5.5l.7 10a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-10"/></g>
+    <g id="i-edit" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 3.9a1.9 1.9 0 0 1 2.7 2.7L7.4 15.1l-3.6.9.9-3.6z"/></g>
+    <g id="i-plus" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4.5v11M4.5 10h11"/></g>
+    <g id="i-back" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 10h-11M9 5l-5 5 5 5"/></g>
+    <g id="i-reset" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10a6 6 0 1 0 1.8-4.3M4 3.5v3h3"/></g>
+    <g id="i-arrow" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10h12M11.5 5.5 16 10l-4.5 4.5"/></g>
+    <g id="i-chevron" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m7.5 5 5 5-5 5"/></g>
+    <g id="i-check" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.5 8 14l7.5-8"/></g>
+    <g id="i-x" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l10 10M15 5 5 15"/></g>
+    <g id="i-pin" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2.8 12.2 7.3l5 .7-3.6 3.5.8 5L10 14.2l-4.4 2.3.8-5L2.8 8l5-.7z"/></g>
+    <g id="i-sidebar" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="14" height="12" rx="2"/><path d="M8 4v12"/></g>
+    <g id="i-folder" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6a1.5 1.5 0 0 1 1.5-1.5H8l1.5 2h6A1.5 1.5 0 0 1 17 8v6.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5z"/></g>
+    <g id="i-trend" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m3 13.5 4.5-4.5 3 3L17 5.5M12.5 5.5H17V10"/></g>
+    <g id="i-chat" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 9.5a6.5 6 0 0 1-9.3 5.4L3.5 16l1.1-3.3A6 6 0 0 1 3.5 9.5a6.5 6 0 0 1 13 0z"/></g>
+    <g id="i-mail" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="14" height="11" rx="2"/><path d="m3.5 6 6.5 5 6.5-5"/></g>
+    <g id="i-terminal" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="m6 8 2.5 2L6 12M10.5 12.5H14"/></g>
+    <g id="i-code" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 6 3 10l4 4M13 6l4 4-4 4M11.2 4.5 8.8 15.5"/></g>
+    <g id="i-doc" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 2.5h6l3 3v11a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-13a1 1 0 0 1 1-1z"/><path d="M11.5 2.5v3h3M7.5 10h5M7.5 13h5"/></g>
+    <g id="i-globe" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M3 10h14M10 3c2 2 2.8 4.4 2.8 7S12 15 10 17c-2-2-2.8-4.4-2.8-7S8 5 10 3z"/></g>
+    <g id="i-eye" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10S5 4.5 10 4.5 17.5 10 17.5 10 15 15.5 10 15.5 2.5 10 2.5 10z"/><circle cx="10" cy="10" r="2.5"/></g>
+    <g id="i-clock" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 6v4h3"/></g>
   </defs>
 </svg>
 
 <a class="skip-link" href="#page">Skip to content</a>
 
 <div class="app" id="app">
-  <nav class="sidebar">
+  <nav class="sidebar" aria-label="Main">
     <div class="brand">
-      <svg viewBox="0 0 20 20"><use href="#i-mark"/></svg>
+      <svg class="brand-mark" viewBox="0 0 20 20" draggable="false"><use href="#i-mark"/></svg>
       <span class="brand-name">Sway</span>
+      <button class="icon-btn" id="sidebar-toggle" aria-label="Collapse sidebar" data-tip="Collapse sidebar"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-sidebar"/></svg></button>
     </div>
 
-    <button class="nav-item" data-view="home"><svg viewBox="0 0 20 20"><use href="#i-home"/></svg> Home</button>
-    <button class="nav-item" data-view="history"><svg viewBox="0 0 20 20"><use href="#i-history"/></svg> History</button>
-    <button class="nav-item" data-view="dictionary"><svg viewBox="0 0 20 20"><use href="#i-book"/></svg> Dictionary</button>
-    <button class="nav-item" data-view="snippets">
-      <svg viewBox="0 0 20 20"><use href="#i-snippet"/></svg> Snippets
+    <button class="nav-item" data-view="home" data-tip="Home" data-key="1"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-home"/></svg><span class="label">Home</span></button>
+    <button class="nav-item" data-view="history" data-tip="History" data-key="2"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-history"/></svg><span class="label">History</span></button>
+    <button class="nav-item" data-view="dictionary" data-tip="Dictionary" data-key="3"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-book"/></svg><span class="label">Dictionary</span></button>
+    <button class="nav-item" data-view="snippets" data-tip="Snippets" data-key="4">
+      <svg viewBox="0 0 20 20" draggable="false"><use href="#i-snippet"/></svg><span class="label">Snippets</span>
       <span class="count" id="snippets-count"></span>
     </button>
-    <button class="nav-item" data-view="transforms">
-      <svg viewBox="0 0 20 20"><use href="#i-wand"/></svg> Transforms
+    <button class="nav-item" data-view="transforms" data-tip="Transforms" data-key="5">
+      <svg viewBox="0 0 20 20" draggable="false"><use href="#i-wand"/></svg><span class="label">Transforms</span>
       <span class="count" id="transforms-count"></span>
     </button>
-    <button class="nav-item" data-view="insights"><svg viewBox="0 0 20 20"><use href="#i-chart"/></svg> Insights</button>
+    <button class="nav-item" data-view="style" data-tip="Style" data-key="6"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-style"/></svg><span class="label">Style</span></button>
+    <button class="nav-item" data-view="insights" data-tip="Insights" data-key="7"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-chart"/></svg><span class="label">Insights</span></button>
+    <button class="nav-item" data-view="voice" data-tip="Voice profile" data-key="8"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-voice"/></svg><span class="label">Voice profile</span></button>
 
     <div class="nav-spacer"></div>
     <div class="nav-divider"></div>
 
-    <button class="nav-item" data-view="settings">
-      <svg viewBox="0 0 20 20"><use href="#i-gear"/></svg> Settings
+    <button class="nav-item" data-view="settings" data-tip="Settings">
+      <svg viewBox="0 0 20 20" draggable="false"><use href="#i-gear"/></svg><span class="label">Settings</span>
       <span class="count" id="settings-count"></span>
     </button>
-    <button class="nav-item" data-view="about"><svg viewBox="0 0 20 20"><use href="#i-info"/></svg> About</button>
+    <button class="nav-item" data-view="about" data-tip="About"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-info"/></svg><span class="label">About</span></button>
   </nav>
 
   <main class="main" id="main">
-    <div class="page" id="page"></div>
+    <div class="page" id="page" tabindex="-1"></div>
   </main>
 </div>
 
 <div class="scrim" id="scrim"></div>
-<aside class="drawer" id="drawer" aria-label="Dictation detail">
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
   <div class="drawer-head">
-    <div class="grow" style="flex:1">
-      <div class="page-title" style="font-size:20px" id="drawer-title">Dictation</div>
+    <div class="grow">
+      <div class="drawer-title" id="drawer-title">Dictation</div>
       <div class="small muted" id="drawer-sub"></div>
     </div>
-    <button class="icon-btn" id="drawer-close" aria-label="Close"><svg viewBox="0 0 20 20"><use href="#i-x"/></svg></button>
+    <button class="icon-btn" id="drawer-close" aria-label="Close" data-tip="Close"><svg viewBox="0 0 20 20" draggable="false"><use href="#i-x"/></svg></button>
   </div>
   <div class="drawer-body" id="drawer-body"></div>
 </aside>
@@ -108,7 +129,8 @@
   <div class="onboard-body" id="onboard-body"></div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="tooltip" id="tooltip" role="tooltip"></div>
 
 <script src="/app.js"></script>
 </body>

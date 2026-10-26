@@ -96,12 +96,12 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
     except SwayError as exc:
         # Expected, user-facing failures (bad config, unopenable database):
         # the message is already written for a human, so show it as-is.
-        platform.show_message(f"{APP_NAME} — error", str(exc), error=True)
+        platform.show_message(f"{APP_NAME}: error", str(exc), error=True)
         return 1
     except Exception:
         detail = traceback.format_exc(limit=3)
         platform.show_message(
-            f"{APP_NAME} — unexpected error",
+            f"{APP_NAME}: unexpected error",
             f"Sway hit an unexpected problem and stopped.\n\n{detail}\n{_log_hint()}",
             error=True,
         )
@@ -111,7 +111,7 @@ def main_windowed(argv: Sequence[str] | None = None) -> int:
         # cli_main handled it and wrote why to a stderr that does not exist
         # here, so the log file is the only place that detail survives.
         platform.show_message(
-            f"{APP_NAME} — error",
+            f"{APP_NAME}: error",
             f"Sway could not start (exit code {code}).\n\n{_log_hint()}",
             error=True,
         )

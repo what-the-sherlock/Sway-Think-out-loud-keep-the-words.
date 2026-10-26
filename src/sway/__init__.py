@@ -1,4 +1,4 @@
-"""Sway — local voice dictation with LLM cleanup."""
+"""Sway: local voice dictation with LLM cleanup."""
 
 from __future__ import annotations
 

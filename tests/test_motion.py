@@ -302,3 +302,41 @@ def test_arm_rejects_a_negative_delay():
     timer = Timer(clock=clock)
     timer.arm(-5.0)
     assert timer.elapsed()
+
+
+# -- DESIGN.md §10.1: the three curves, shared with styles.css --------------
+
+import pytest  # noqa: E402
+
+from sway.motion import cubic_bezier, ease_enter, ease_exit, ease_standard  # noqa: E402
+
+
+@pytest.mark.parametrize("ease", [ease_standard, ease_enter, ease_exit])
+def test_curves_hit_their_endpoints_exactly(ease):
+    assert ease(0.0) == 0.0
+    assert ease(1.0) == 1.0
+    assert ease(-0.5) == 0.0 and ease(1.5) == 1.0
+
+
+@pytest.mark.parametrize("ease", [ease_standard, ease_enter, ease_exit])
+def test_curves_are_monotonic(ease):
+    samples = [ease(i / 200) for i in range(201)]
+    assert all(b >= a - 1e-9 for a, b in zip(samples, samples[1:]))
+
+
+def test_linear_bezier_is_identity():
+    linear = cubic_bezier(0.0, 0.0, 1.0, 1.0)
+    for t in (0.1, 0.25, 0.5, 0.75, 0.9):
+        assert linear(t) == pytest.approx(t, abs=1e-4)
+
+
+def test_enter_front_loads_and_exit_back_loads():
+    """Arriving things move most at the start; leaving things at the end."""
+    assert ease_enter(0.3) > 0.7
+    assert ease_exit(0.3) < 0.15
+    assert ease_standard(0.5) > 0.8
+
+
+def test_matches_css_reference_point():
+    """CSS `ease` is cubic-bezier(.25, .1, .25, 1); at t=0.5 browsers give ~0.8024."""
+    assert cubic_bezier(0.25, 0.1, 0.25, 1.0)(0.5) == pytest.approx(0.8024, abs=1e-3)

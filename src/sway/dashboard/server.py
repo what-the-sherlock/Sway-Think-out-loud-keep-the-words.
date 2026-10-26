@@ -41,10 +41,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from sway import languages
+from sway import languages, profiles
 from sway.dashboard import actions
 from sway.dashboard.actions import ActionError
-from sway.dashboard.queries import DashboardQueries, DashboardQueryError, start_of_today
+from sway.dashboard.queries import (
+    TARGET_P50_MS,
+    DashboardQueries,
+    DashboardQueryError,
+    start_of_today,
+)
 from sway.errors import SwayError
 from sway.settings import (
     CLEANUP_STYLES as _CLEANUP_STYLES,
@@ -61,6 +66,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 #: Windows the UI offers. ``None`` means all time.
 RANGE_DAYS: dict[str, int | None] = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+
+#: 26 weeks for the consistency heatmap, independent of the chosen range.
+HEATMAP_DAYS = 182
 
 #: Cap on a single Activity page, so a pathological ``limit`` cannot make the
 #: server materialise the entire history in memory.
@@ -290,7 +298,14 @@ class DashboardServer:
                 }
                 perf["range"] = _one(params, "range", "30d")
                 perf["understanding"] = q.understanding(since=since)
+                perf["target_ms"] = TARGET_P50_MS
                 return perf
+            if path == "/api/voice":
+                voice = q.voice_profile()
+                # Corrections live on run metadata, not history rows; all
+                # time, like the rest of the profile.
+                voice["understanding"] = q.understanding()
+                return voice
             if path == "/api/status":
                 return self.status()
             if path == "/api/home":
@@ -360,6 +375,9 @@ class DashboardServer:
             "key": actions.key_status().as_dict(),
             "overlay_positions": list(_OVERLAY_POSITIONS),
             "cleanup_styles": list(_CLEANUP_STYLES),
+            # The built-in app groups and their styles, from sway.profiles, so
+            # the Style page describes the defaults the engine really applies.
+            "style_groups": profiles.default_groups(),
             "trigger_types": list(_TRIGGER_TYPES),
             "context_modes": list(_CONTEXT_MODES),
             # Served rather than hardcoded in app.js, which used to keep its
@@ -420,6 +438,13 @@ class DashboardServer:
                 for bucket in buckets
             ],
             "apps": q.app_usage(since=since),
+            # The consistency heatmap always spans 26 weeks, whatever the
+            # range: a 7-day heatmap is one column and says nothing. Real
+            # day buckets, empty days included (see daily_buckets).
+            "heatmap": [
+                {"day": bucket.day.isoformat(), "words": bucket.words, "sessions": bucket.sessions}
+                for bucket in q.daily_buckets(HEATMAP_DAYS)
+            ],
             "typing_wpm": self._typing_wpm,
             "has_data": q.session_count() > 0,
         }

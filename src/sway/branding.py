@@ -26,6 +26,10 @@ MARK_PATH = ASSETS_DIR / "logo_mask.png"
 INK = (235, 236, 240)
 SURFACE = (26, 27, 32)
 SURFACE_RAISED = (38, 40, 47)
+#: Hover on raised controls: one step up the ladder, not a colour (DESIGN §7).
+SURFACE_HOVER = (48, 50, 58)
+#: Secondary capsule text (timer, word count) -- DESIGN §3.2.
+INK_MUTED = (150, 153, 165)
 
 #: Accents. Four tokens, each with exactly one job -- the discipline recorded
 #: in docs/ui-reference-analysis.md §5, with Sway's own hue rather than the
@@ -40,7 +44,8 @@ SURFACE_RAISED = (38, 40, 47)
 #: An earlier palette spent red on *recording* -- the most frequent, most
 #: benign state -- which left no colour meaning "act on this", and gave the
 #: hotkey no colour at all.
-ACCENT_BRAND = (79, 70, 229)
+#: #5146d9, the dashboard's --indigo (DESIGN §3.1), so the two surfaces share one.
+ACCENT_BRAND = (81, 70, 217)
 ACCENT_RECORDING = (255, 184, 77)
 ACCENT_ERROR = (229, 72, 77)
 ACCENT_IDLE = (108, 111, 125)
@@ -129,8 +134,10 @@ __all__ = [
     "ACCENT_RECORDING",
     "ACCENT_THINKING",
     "INK",
+    "INK_MUTED",
     "MARK_PATH",
     "SURFACE",
+    "SURFACE_HOVER",
     "SURFACE_RAISED",
     "app_badge_image",
     "mark_image",

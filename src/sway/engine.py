@@ -132,7 +132,7 @@ from sway.transforms import Transform, build_directive_block, expectation_for
 from sway.triggers import apply_triggers
 from sway.streaming import ChunkSessionResult, ChunkStreamer, max_overlap_words, stitch_transcripts
 from sway.tray import TrayIcon, TrayState
-from sway.window import AppWindow
+from sway.window import WINDOW_STATE_FILENAME, AppWindow
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +268,7 @@ def _describe_failure(exc: Exception) -> dict[str, Any]:
             "kind": "paste_blocked",
             "headline": "Couldn't paste into that window",
             # Not a loss: the injector still put the text on the clipboard.
-            "detail": "Your text is on the clipboard — press Ctrl+V to place it.",
+            "detail": "Your text is on the clipboard. Press Ctrl+V to place it.",
             "actionable": False,
         }
     if isinstance(exc, ClipboardError):
@@ -397,6 +397,41 @@ class PendingTransformResult:
     #: than discarding the result the way it would on an auto-paste path.
     guardrail_reason: str = ""
     applied: bool = False
+
+
+#: How long a clean shutdown is given before it is taken by force. Generous:
+#: closing the Groq client alone is allowed five seconds, and a forced exit
+#: skips flushing anything still in progress, so this must only ever fire for a
+#: shutdown that is genuinely stuck.
+SHUTDOWN_DEADLINE_S = 20.0
+
+
+def arm_exit_watchdog(deadline_s: float = SHUTDOWN_DEADLINE_S) -> threading.Thread:
+    """Guarantee the process exits, even if shutdown wedges.
+
+    ``os._exit`` rather than ``sys.exit``: the point is to be immune to
+    whatever is stuck, and a non-daemon thread or a blocked native call would
+    both survive a normal exit. Everything that must be durable (history,
+    settings, latency records) is committed at write time, so a forced exit
+    costs at most the current in-flight dictation.
+
+    Armed the moment the user asks to quit, not only once the UI loop has
+    returned: a UI loop that never returns is exactly the hang this guards.
+    """
+
+    def force() -> None:
+        logger.error(
+            "shutdown did not finish within %.0fs; exiting by force so no hotkey "
+            "hook outlives this process",
+            deadline_s,
+        )
+        os._exit(0)
+
+    watchdog = threading.Timer(deadline_s, force)
+    watchdog.name = "flow-exit-watchdog"
+    watchdog.daemon = True
+    watchdog.start()
+    return watchdog
 
 
 class Engine:
@@ -570,6 +605,12 @@ class Engine:
         self._command_started_via_chord = False
         self._activation_timer: threading.Thread | None = None
         self._stopping = False
+        #: stop() can be reached from two threads at once (the quit thread and
+        #: the main thread unwinding after the window closes). The lock makes
+        #: the second caller wait for the first instead of tearing down the
+        #: same resources concurrently.
+        self._stop_lock = threading.Lock()
+        self._stopped = False
         #: One user intention, one execution. Every press mints a token here
         #: and every release claims it, so a second release with no press
         #: behind it cannot re-dispatch the same audio. See sway.activation.
@@ -605,7 +646,10 @@ class Engine:
                 on_open_dashboard=self._open_dashboard,
                 on_open_settings=self._open_settings,
                 on_view_logs=self._open_logs,
-                on_quit=self._bar.stop,
+                # The full shutdown, not just the bar: with a window, the
+                # main thread runs the webview loop, and stopping the bar
+                # alone left the process alive with its hotkey hooks armed.
+                on_quit=self._quit_from_tray,
                 is_listening=lambda: self.is_listening,
                 set_listening=self.set_listening,
             )
@@ -672,7 +716,7 @@ class Engine:
             logger.info("no Groq API key yet; transcription is unavailable until one is set")
             self._record_error(
                 kind="no_key",
-                headline="Paused — no API key",
+                headline="Paused: no API key",
                 detail="Sway cannot transcribe until a Groq key is set.",
                 actionable=True,
             )
@@ -782,15 +826,26 @@ class Engine:
         server = self._ensure_dashboard()
         if server is None:
             return None
-        window = AppWindow(server.url, title=APP_NAME)
+        window = AppWindow(
+            server.url,
+            title=APP_NAME,
+            state_path=self._config.data_dir / WINDOW_STATE_FILENAME,
+        )
         if not window.prepare():
             return None
         self._window = window
         return window
 
     def stop(self) -> None:
-        """Idempotent; safe to call even if :meth:`start` only partly succeeded."""
+        """Idempotent and thread-safe; safe even if :meth:`start` only partly succeeded."""
         self._stopping = True
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stop_all()
+            self._stopped = True
+
+    def _stop_all(self) -> None:
         for label, action in (
             ("bindings", self._bindings.stop),
             ("tray", self._stop_tray),
@@ -1099,7 +1154,7 @@ class Engine:
         if repeated:
             text = f"Hold [[{key}]] down, speak, then let go"
         else:
-            text = f"Don't tap — hold [[{key}]] while you speak"
+            text = f"Don't tap. Hold [[{key}]] while you speak"
         try:
             self._bar.coach(text)
         except Exception:
@@ -1621,10 +1676,10 @@ class Engine:
             if exc.limit_type:
                 detail += f" ({exc.limit_type})"
             if exc.retry_after_s is not None:
-                detail += f" — retry in {exc.retry_after_s:.0f}s"
+                detail += f". Retry in {exc.retry_after_s:.0f}s"
             self._record_error(
                 kind="rate_limited",
-                headline=f"Rate limited — {exc.limit_type}" if exc.limit_type else "Rate limited",
+                headline=f"Rate limited: {exc.limit_type}" if exc.limit_type else "Rate limited",
                 detail="This resolves on its own. Nothing to do.",
                 actionable=False,
                 retry_after_s=exc.retry_after_s,
@@ -1714,7 +1769,7 @@ class Engine:
             # and offering the device picker, turns the most confusing
             # outcome in the product into the most actionable one.
             self._set_ui_state(
-                BarState.DONE, detail="Not captured — no speech detected", kind="no_speech"
+                BarState.DONE, detail="No speech detected", kind="no_speech"
             )
             return
 
@@ -1741,7 +1796,7 @@ class Engine:
                 skipped="hallucination_suspected" if hallucinated else "low_confidence_paste_suppressed"
             )
             self._set_ui_state(
-                BarState.DONE, detail="Not captured — didn't catch that", kind="low_confidence"
+                BarState.DONE, detail="Didn't catch that", kind="low_confidence"
             )
             return
 
@@ -1781,7 +1836,7 @@ class Engine:
         else:
             self._set_ui_state(
                 BarState.ERROR,
-                detail="elevated window — copied instead",
+                detail="Elevated window · copied instead",
                 kind="paste_blocked",
             )
 
@@ -2656,7 +2711,7 @@ class Engine:
         # part. Retitle so the bar reads as progressing rather than stuck on
         # whatever it said a second ago.
         if transform is not None:
-            self._set_ui_state(BarState.THINKING, detail=f"Rewriting — {transform.name}")
+            self._set_ui_state(BarState.THINKING, detail=f"Rewriting · {transform.name}")
 
         # A transform supplies its instruction from storage, so there is
         # nothing to transcribe and this path makes one network call where a
@@ -2679,7 +2734,7 @@ class Engine:
                     skipped="hallucination_suspected" if spoken_hallucinated else "low_confidence_paste_suppressed"
                 )
                 self._set_ui_state(
-                    BarState.DONE, detail="Not captured — didn't catch that", kind="low_confidence"
+                    BarState.DONE, detail="Didn't catch that", kind="low_confidence"
                 )
                 return
             instruction_text = spoken.text
@@ -2745,7 +2800,7 @@ class Engine:
             run.annotate(skipped="command_guardrail")
             self._set_ui_state(
                 BarState.ERROR,
-                detail="Nothing came back — try again",
+                detail="Nothing came back. Try again",
                 kind="command_guardrail",
             )
             return
@@ -3584,7 +3639,7 @@ class Engine:
                 return
             self._transform_running = True
 
-        self._set_ui_state(BarState.THINKING, detail=f"Reading selection — {transform.name}")
+        self._set_ui_state(BarState.THINKING, detail=f"Reading selection · {transform.name}")
         selection_ready = threading.Event()
         self._selected_text = ""
         focused = self._platform.focused_process_name()
@@ -3676,7 +3731,7 @@ class Engine:
             self._auto_capture_example(transform, original, transformed)
         parts = word_diff(original, transformed)
         run.annotate(transform_changes=change_count(parts))
-        self._set_ui_state(BarState.DONE, detail=f"{transform_name} — see changes")
+        self._set_ui_state(BarState.DONE, detail=f"{transform_name} · see changes")
         self._bar.run_on_ui_thread(lambda root: self._show_transform_panel(root))
 
     def _auto_capture_example(self, transform: Transform, original: str, transformed: str) -> None:
@@ -3765,7 +3820,7 @@ class Engine:
             pasted = self._inject_with_fallback(pending.transformed, run, pending.activation)
             if not pasted:
                 self._set_ui_state(
-                    BarState.ERROR, detail="elevated window — copied instead", kind="paste_blocked"
+                    BarState.ERROR, detail="Elevated window · copied instead", kind="paste_blocked"
                 )
                 return
             pending.applied = True
@@ -3887,7 +3942,7 @@ class Engine:
                 if self._pending_transform is pending:
                     self._set_ui_state(
                         BarState.ERROR,
-                        detail="Retry came back empty — the previous result is still here",
+                        detail="Retry came back empty. The previous result is still here",
                         kind="command_guardrail",
                     )
                 return
@@ -3911,7 +3966,7 @@ class Engine:
             pasted = self._inject_with_fallback(pending.original, run, None)
             if not pasted:
                 self._set_ui_state(
-                    BarState.ERROR, detail="elevated window — copied instead", kind="paste_blocked"
+                    BarState.ERROR, detail="Elevated window · copied instead", kind="paste_blocked"
                 )
                 return
             pending.applied = False
@@ -3944,6 +3999,21 @@ class Engine:
         short-lived thread rather than performed inline.
         """
         logger.info("quit requested from the window")
+        self._begin_quit()
+
+    def _quit_from_tray(self) -> None:
+        """Quit from the tray menu.
+
+        Runs on the tray's own thread, and the shutdown joins that thread
+        (``TrayIcon.stop``), so it cannot run inline here either.
+        """
+        logger.info("quit requested from the tray")
+        self._begin_quit()
+
+    def _begin_quit(self) -> None:
+        # Armed before anything else, so even a shutdown that wedges (or a
+        # UI loop that refuses to return) still ends the process.
+        arm_exit_watchdog()
         threading.Thread(target=self._shutdown_everything, name="flow-quit", daemon=True).start()
 
     def _shutdown_everything(self) -> None:

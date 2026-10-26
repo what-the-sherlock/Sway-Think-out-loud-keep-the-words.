@@ -944,16 +944,16 @@ def guardrail_family(reason: str) -> str:
 #: entity via the ``{value}`` placeholder filled in by :func:`advisory_note`.
 _ADVISORY_NOTES: dict[str, str] = {
     "empty": "The model returned nothing.",
-    "shrank": "This is much shorter than the text you selected — check nothing was dropped.",
-    "grew": "This is much longer than the text you selected — check nothing was invented.",
+    "shrank": "This is much shorter than the text you selected. Check nothing was dropped.",
+    "grew": "This is much longer than the text you selected. Check nothing was invented.",
     "assistant_voice": "This starts as a reply to you rather than as a rewrite of your text.",
     "markdown": "This added list or heading formatting that wasn't in your text.",
     "answered_question": "This reads as an answer to your text rather than a rewrite of it.",
     "language_changed": (
-        "This dropped a script your text was written in — it may have been translated."
+        "This dropped a script your text was written in. It may have been translated."
     ),
     "wrong_target_language": (
-        "This isn't in the language you asked for — the model may have ignored the request."
+        "This isn't in the language you asked for. The model may have ignored the request."
     ),
     "unexpected_script": (
         "This contains a writing system neither your text nor your chosen language uses."
@@ -963,7 +963,7 @@ _ADVISORY_NOTES: dict[str, str] = {
 
 #: A future guardrail token must never render a blank note -- see
 #: :func:`advisory_note`.
-_ADVISORY_FALLBACK = "Something about this result looked unusual — read it before applying."
+_ADVISORY_FALLBACK = "Something about this result looked unusual. Read it before applying."
 
 
 def advisory_note(reason: str) -> str:

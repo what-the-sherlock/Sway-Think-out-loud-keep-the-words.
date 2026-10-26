@@ -1045,7 +1045,7 @@ def set_key(payload: Mapping[str, Any]) -> dict[str, Any]:
         "warning": (
             None
             if credentials.looks_like_key(cleaned)
-            else "That does not look like a Groq key — they usually start with gsk_."
+            else "That does not look like a Groq key. They usually start with gsk_."
         ),
     }
 

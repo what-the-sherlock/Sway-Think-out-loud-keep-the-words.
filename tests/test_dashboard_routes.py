@@ -275,3 +275,27 @@ def test_dictionary_reports_unavailable_without_a_database(tmp_path):
         assert body["terms"] == []
     finally:
         instance.stop()
+
+
+def test_voice_profile_route(server):
+    _, body = get(server, "/api/voice")
+    assert body["dictations"] == 1
+    assert len(body["hours"]) == 24
+    assert "understanding" in body
+
+
+def test_settings_serve_the_style_groups(server):
+    _, body = get(server, "/api/settings")
+    assert [g["category"] for g in body["style_groups"]] == ["chat", "mail", "terminal", "code", "other"]
+
+
+def test_performance_carries_the_latency_target(server):
+    _, body = get(server, "/api/performance")
+    assert body["target_ms"] == 1000.0
+
+
+def test_overview_heatmap_spans_26_weeks_whatever_the_range(server):
+    _, body = get(server, "/api/overview?range=7d")
+    assert len(body["heatmap"]) == 182
+    assert len(body["daily"]) == 7
+    assert sum(day["sessions"] for day in body["heatmap"]) == 1

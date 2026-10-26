@@ -248,7 +248,8 @@ zombie process.
   position configurable (cursor-adjacent or bottom-center), and fade it out
   after inject. Keep the existing queue-based `set_state` threading contract —
   Tk objects are touched only on the Tk thread.
-- Design: dark-first, one accent color, system font stack, generous spacing,
+- Design: light-only dashboard, dark overlay capsule (DESIGN.md §2 — dark
+  mode is ruled out, not deferred), system font stack, generous spacing,
   no framework default look, no emoji-as-icons.
 - Native Windows notifications for bad API key, offline, and rate limited.
 

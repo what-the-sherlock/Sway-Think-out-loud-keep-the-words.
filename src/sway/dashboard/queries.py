@@ -32,9 +32,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
 
+from sway import languages
 from sway.analytics import DEFAULT_TYPING_WPM, time_saved_seconds
 from sway.cleanup import guardrail_family
 from sway.errors import SwayError
+from sway.profiles import category_for_process
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +55,28 @@ PIPELINE_STAGES = (
     "inject",
 )
 
+#: How each recorded stage relates to the felt latency (release -> pasted),
+#: so the Performance chart stacks only spans that run one after another:
+#:   "pipeline" -- sequential after the key is released; these add up
+#:   "within"   -- a sub-span of a pipeline stage (adding it would double-count)
+#:   "hold"     -- how long the key was held, i.e. the user speaking
+#: Anything unknown is "other" and is listed, never summed.
+STAGE_PARTS: dict[str, str] = {
+    "dispatch": "pipeline",
+    **dict.fromkeys(PIPELINE_STAGES, "pipeline"),
+    "stt_first_byte": "within",
+    "llm_first_token": "within",
+    "hotkey_hold": "hold",
+}
+
 #: Above this, a dictation stops feeling instant. CLAUDE.md targets <1000ms
 #: p50; this is the p95 line where the experience is visibly degraded rather
 #: than merely off-target.
 SLOW_P95_MS = 2_000.0
+
+#: CLAUDE.md's target: hotkey release to text pasted, p50. Drawn as the
+#: budget line on the Performance chart.
+TARGET_P50_MS = 1_000.0
 
 #: Columns schema v2 introduced. Every query here assumes them, so their
 #: absence means the database has not been migrated yet.
@@ -426,6 +446,9 @@ class DashboardQueries:
         return [
             {
                 "app": row["app"],
+                # The same grouping cleanup uses to pick a style, so the
+                # chart's icons agree with the Style page.
+                "category": category_for_process(row["app"]).value,
                 "sessions": int(row["sessions"]),
                 "words": int(row["words"]),
                 "share": int(row["sessions"]) / total,
@@ -525,6 +548,7 @@ class DashboardQueries:
                 detail["stages"] = [
                     {
                         "stage": s["stage"],
+                        "part": STAGE_PARTS.get(s["stage"], "other"),
                         "seq": int(s["seq"]),
                         "started_at": float(s["started_at"]),
                         "duration_ms": float(s["duration_ms"]),
@@ -604,6 +628,7 @@ class DashboardQueries:
             "stages": [
                 {
                     "stage": s.stage,
+                    "part": STAGE_PARTS.get(s.stage, "other"),
                     "median_ms": s.median_ms,
                     "p95_ms": s.p95_ms,
                     "share": s.share,
@@ -762,6 +787,100 @@ class DashboardQueries:
             f"Performance is normal across the last {recent['total']} dictations.{trend}",
         )
 
+    # -- voice profile -----------------------------------------------------
+
+    def voice_profile(self) -> dict[str, Any]:
+        """How this user speaks, measured from their own dictations.
+
+        All time, dictations only (a voice command has no transcript of its
+        own to describe). Every figure is counted from stored rows; anything
+        a row did not record is left out of that figure rather than guessed,
+        and each figure carries how many dictations it actually covers.
+        """
+        empty: dict[str, Any] = {
+            "dictations": 0,
+            "words": 0,
+            "wpm": {"avg": None, "best": None, "measured": 0},
+            "length": {"median_words": None, "median_seconds": None, "measured": 0},
+            "fillers": {"removed": 0, "per_100_words": None, "counted": 0, "top": []},
+            "languages": [],
+            "hours": [0] * 24,
+        }
+        if not self.has_history:
+            return empty
+        rows = self._select(
+            "SELECT created_at, text, raw_text, word_count, speech_ms, wpm, language"
+            " FROM history_entries WHERE kind = 'dictation'"
+        )
+        if not rows:
+            return empty
+
+        wpms = [float(r["wpm"]) for r in rows if r["wpm"] is not None]
+        word_counts = [float(r["word_count"]) for r in rows if r["word_count"] is not None]
+        seconds = [float(r["speech_ms"]) / 1000 for r in rows if r["speech_ms"] is not None]
+
+        hours = [0] * 24
+        by_language: dict[str, int] = {}
+        removed = 0
+        raw_words = 0
+        counted = 0
+        per_filler: dict[str, int] = {}
+        for row in rows:
+            hours[datetime.fromtimestamp(float(row["created_at"])).hour] += 1
+            code = languages.normalize(row["language"]) or (row["language"] or "").strip().lower()
+            by_language[code] = by_language.get(code, 0) + 1
+            found = fillers_removed(row["raw_text"] or "", row["text"] or "", row["language"])
+            if found is None:
+                continue
+            counted += 1
+            raw_words += len((row["raw_text"] or "").split())
+            for filler, n in found.items():
+                removed += n
+                per_filler[filler] = per_filler.get(filler, 0) + n
+
+        total = len(rows)
+        return {
+            "dictations": total,
+            "words": int(sum(word_counts)),
+            "wpm": {
+                "avg": _mean(wpms),
+                "best": max(wpms) if wpms else None,
+                "measured": len(wpms),
+            },
+            "length": {
+                "median_words": percentile(word_counts, 0.5),
+                "median_seconds": percentile(seconds, 0.5),
+                "measured": len(seconds),
+            },
+            "fillers": {
+                "removed": removed,
+                "per_100_words": (removed / raw_words * 100) if raw_words else None,
+                "counted": counted,
+                "top": [
+                    {"filler": name, "count": n}
+                    for name, n in sorted(per_filler.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+                ],
+            },
+            "languages": [
+                {
+                    "code": code or None,
+                    # Rows from before language was recorded say so, rather
+                    # than being folded into a guess.
+                    # A language outside the catalogue arrives as Whisper's
+                    # English name ("arabic"); show it as a name, not a code.
+                    "label": (
+                        languages.label(code)
+                        if languages.get(code)
+                        else code.title()
+                    ) if code else "Not recorded",
+                    "dictations": n,
+                    "share": n / total,
+                }
+                for code, n in sorted(by_language.items(), key=lambda kv: (-kv[1], kv[0]))
+            ],
+            "hours": hours,
+        }
+
     # -- vocabulary --------------------------------------------------------
 
     def frequent_corrections(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -867,6 +986,29 @@ def _was_skipped(raw: Any) -> bool:
     """Whether a run bailed out before transcribing anything (empty capture,
     or a hold containing no detected speech)."""
     return bool(_metadata_dict(raw).get("skipped"))
+
+
+def fillers_removed(raw_text: str, text: str, language: str | None) -> dict[str, int] | None:
+    """Filler words that were in what was said but not in what was pasted.
+
+    Per filler, ``max(0, said - kept)``, keyed by the filler as written in
+    lower case. ``None`` when the language is unknown or has no filler list:
+    that dictation cannot be counted, which is different from counting zero.
+    """
+    pattern = languages.filler_pattern(language)
+    if pattern is None:
+        return None
+    said: dict[str, int] = {}
+    for match in pattern.finditer(raw_text):
+        key = match.group(0).lower()
+        said[key] = said.get(key, 0) + 1
+    if not said:
+        return {}
+    kept: dict[str, int] = {}
+    for match in pattern.finditer(text):
+        key = match.group(0).lower()
+        kept[key] = kept.get(key, 0) + 1
+    return {key: n - kept.get(key, 0) for key, n in said.items() if n > kept.get(key, 0)}
 
 
 def _escape_like(text: str) -> str:

@@ -27,11 +27,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 __all__ = [
+    "ACCENT_S",
     "BUTTON_FILL_S",
     "COLLAPSE_S",
     "DOT_HOVER_S",
     "DOT_UNHOVER_S",
     "FADE_OUT_S",
+    "LABEL_FADE_S",
     "LEVEL_S",
     "PANEL_CLOSE_S",
     "PANEL_OPEN_S",
@@ -44,10 +46,14 @@ __all__ = [
     "Motion",
     "Timer",
     "Tween",
+    "cubic_bezier",
+    "ease_enter",
+    "ease_exit",
     "ease_in_out_cubic",
     "ease_linear",
     "ease_out_back",
     "ease_out_cubic",
+    "ease_standard",
     "lerp",
     "lerp_rgb",
     "pulse",
@@ -82,6 +88,64 @@ TOOLTIP_S = 0.12
 #: that deliberately pausing feels answered.
 TOOLTIP_DELAY_S = 0.6
 SHAKE_S = 0.24
+#: Accent colour cross-fade between states (DESIGN.md §8.2, §10.2).
+ACCENT_S = 0.15
+#: State-label cross-fade (DESIGN.md §10.2). Named here so the bar and the
+#: dashboard (styles.css) share one table.
+LABEL_FADE_S = 0.12
+
+
+# ---------------------------------------------------------------------------
+# The three curves (DESIGN.md §10.1)
+# ---------------------------------------------------------------------------
+#
+# The same cubic-beziers styles.css uses as --ease-standard / --ease-enter /
+# --ease-exit, so the bar and the dashboard move with one character.
+
+
+def cubic_bezier(x1: float, y1: float, x2: float, y2: float) -> Callable[[float], float]:
+    """An easing function equal to CSS ``cubic-bezier(x1, y1, x2, y2)``.
+
+    Solves the curve's x(s) = t for s (Newton steps, bisection fallback), then
+    returns y(s). Endpoints are exact: f(0) == 0 and f(1) == 1.
+    """
+
+    def bez(a: float, b: float, s: float) -> float:
+        return 3 * a * (1 - s) ** 2 * s + 3 * b * (1 - s) * s * s + s ** 3
+
+    def bez_dx(s: float) -> float:
+        return 3 * x1 * (1 - s) ** 2 + 6 * (x2 - x1) * (1 - s) * s + 3 * (1 - x2) * s * s
+
+    def ease(t: float) -> float:
+        if t <= 0.0:
+            return 0.0
+        if t >= 1.0:
+            return 1.0
+        s = t
+        for _ in range(8):
+            dx = bez_dx(s)
+            if abs(dx) < 1e-6:
+                break
+            s -= (bez(x1, x2, s) - t) / dx
+        if not 0.0 <= s <= 1.0 or abs(bez(x1, x2, s) - t) > 1e-5:
+            lo, hi = 0.0, 1.0
+            for _ in range(40):
+                s = (lo + hi) / 2
+                if bez(x1, x2, s) < t:
+                    lo = s
+                else:
+                    hi = s
+        return bez(y1, y2, s)
+
+    return ease
+
+
+#: State changes on screen: colours, toggles, widths.
+ease_standard = cubic_bezier(0.2, 0.0, 0.0, 1.0)
+#: Things arriving: menus, popovers.
+ease_enter = cubic_bezier(0.16, 1.0, 0.3, 1.0)
+#: Things leaving. Always shorter than the matching enter.
+ease_exit = cubic_bezier(0.4, 0.0, 1.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
